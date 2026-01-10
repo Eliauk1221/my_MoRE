@@ -51,10 +51,6 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         self.last_last_feet_contact_force = torch.zeros(self.num_envs, 2, 3, dtype=torch.float, device=self.device, requires_grad=False)
         self.feet_indicator_offset = torch.tensor(self.cfg.asset.feet_indicator_offset, dtype=torch.float, device=self.device, requires_grad=False)
         self.feet_indicator_pos = torch.zeros(self.num_envs, len(self.feet_indices), *self.feet_indicator_offset.shape,dtype=torch.float, device=self.device, requires_grad=False)
-        
-        # ========== 落足点引导注意力相关 ==========
-        # 存储策略网络预测的落足点 [num_envs, 4] (左脚dx,dy + 右脚dx,dy)
-        self.pred_foothold = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device, requires_grad=False)
 
     def reset_idx(self, env_ids):
         super().reset_idx(env_ids)
@@ -62,7 +58,6 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         self.last_last_actions[env_ids] = 0.
         self.last_feet_contact_force[env_ids] = 0.
         self.last_last_feet_contact_force[env_ids] = 0.
-        self.pred_foothold[env_ids] = 0.  # 重置预测落足点
 
     def _draw_foot_indicator(self):
         self.gym.clear_lines(self.viewer)
@@ -470,149 +465,3 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
     def _reward_y_offset_pen(self):
         pen = torch.abs(self.root_states[:, 1] - self.origin_y) * torch.logical_and(self.env_class != 0, self.env_class != 1)
         return pen
-    
-    # ========== 落足点引导注意力奖励 ==========
-    def set_pred_foothold(self, pred_foothold):
-        """
-        从策略网络接收预测的落足点
-        
-        Args:
-            pred_foothold: [num_envs, 4] 预测的落足点偏移 (左脚dx,dy + 右脚dx,dy)
-        """
-        if pred_foothold is not None:
-            self.pred_foothold[:] = pred_foothold.detach()
-    
-    def _reward_foothold_sampling(self):
-        """
-        BeamDojo风格的采样落足点奖励
-        
-        评估策略网络预测的落足点位置是否安全（地形平坦、非边缘）
-        只在脚即将落地时给予奖励
-        
-        思路：
-        1. 将预测落足点从身体坐标系转换到世界坐标系
-        2. 采样预测位置的地形高度
-        3. 评估该位置的地形质量（平坦度和边缘惩罚）
-        4. 只在脚处于摆动相且即将着地时计算奖励
-        
-        Returns:
-            reward: [num_envs] 落足点质量奖励
-        """
-        # 提前返回：如果没有地形高度测量
-        if not self.cfg.terrain.measure_heights:
-            return torch.zeros(self.num_envs, device=self.device)
-        
-        # ========== 1. 计算预测落足点在世界坐标系的位置 ==========
-        # pred_foothold: [num_envs, 4] -> 左脚(dx,dy), 右脚(dx,dy)
-        # 需要将其转换到世界坐标系
-        
-        # 预测是相对于机器人身体中心的偏移
-        pred_left_xy = self.pred_foothold[:, :2]   # [num_envs, 2]
-        pred_right_xy = self.pred_foothold[:, 2:4]  # [num_envs, 2]
-        
-        # 补充z坐标（使用当前脚的高度）
-        pred_left_z = self.feet_pos[:, 0, 2].unsqueeze(-1)   # [num_envs, 1]
-        pred_right_z = self.feet_pos[:, 1, 2].unsqueeze(-1)  # [num_envs, 1]
-        
-        pred_left_3d = torch.cat([pred_left_xy, pred_left_z], dim=-1)   # [num_envs, 3]
-        pred_right_3d = torch.cat([pred_right_xy, pred_right_z], dim=-1) # [num_envs, 3]
-        
-        # 从身体坐标系转换到世界坐标系
-        pred_left_world = quat_apply(self.base_quat, pred_left_3d) + self.root_states[:, 0:3]
-        pred_right_world = quat_apply(self.base_quat, pred_right_3d) + self.root_states[:, 0:3]
-        
-        # ========== 2. 计算预测位置在地形网格中的索引 ==========
-        # 地形分辨率
-        h_scale = self.cfg.terrain.horizontal_scale  # 默认0.1
-        border_size = self.terrain.cfg.border_size if hasattr(self.terrain, 'cfg') else 0
-        
-        # 转换到网格坐标
-        pred_left_grid = ((pred_left_world[:, :2] + border_size) / h_scale).round().long()
-        pred_right_grid = ((pred_right_world[:, :2] + border_size) / h_scale).round().long()
-        
-        # 限制在有效范围内
-        max_x = self.x_edge_mask.shape[0] - 1
-        max_y = self.x_edge_mask.shape[1] - 1
-        
-        pred_left_grid[:, 0] = torch.clip(pred_left_grid[:, 0], 0, max_x)
-        pred_left_grid[:, 1] = torch.clip(pred_left_grid[:, 1], 0, max_y)
-        pred_right_grid[:, 0] = torch.clip(pred_right_grid[:, 0], 0, max_x)
-        pred_right_grid[:, 1] = torch.clip(pred_right_grid[:, 1], 0, max_y)
-        
-        # ========== 3. 检查预测位置是否在边缘（危险区域） ==========
-        left_at_edge = self.x_edge_mask[pred_left_grid[:, 0], pred_left_grid[:, 1]]
-        right_at_edge = self.x_edge_mask[pred_right_grid[:, 0], pred_right_grid[:, 1]]
-        
-        # 边缘惩罚
-        edge_penalty = left_at_edge.float() + right_at_edge.float()
-        
-        # ========== 4. 采样预测位置的地形高度 ==========
-        # 使用 measured_heights 进行评估
-        # measured_heights 是一个 17x11 的网格，共187个点
-        # 我们需要将预测的落足点位置映射到这个网格
-        
-        # 获取机器人局部坐标系下的预测位置
-        local_left = pred_left_3d[:, :2]   # [num_envs, 2] - 相对于机器人的xy偏移
-        local_right = pred_right_3d[:, :2]  # [num_envs, 2]
-        
-        # measured_heights 的采样范围 (需要从配置获取)
-        # 假设采样范围 x: [-0.8, 0.8], y: [-0.5, 0.5]
-        mh_x_range = 1.6  # 17 points over ~1.6m
-        mh_y_range = 1.0  # 11 points over ~1.0m
-        
-        # 归一化到 [0, 1] 范围
-        norm_left_x = (local_left[:, 0] + mh_x_range/2) / mh_x_range
-        norm_left_y = (local_left[:, 1] + mh_y_range/2) / mh_y_range
-        norm_right_x = (local_right[:, 0] + mh_x_range/2) / mh_x_range
-        norm_right_y = (local_right[:, 1] + mh_y_range/2) / mh_y_range
-        
-        # 转换到网格索引 (17x11)
-        mh_grid_left_x = (norm_left_x * 16).round().long().clamp(0, 16)
-        mh_grid_left_y = (norm_left_y * 10).round().long().clamp(0, 10)
-        mh_grid_right_x = (norm_right_x * 16).round().long().clamp(0, 16)
-        mh_grid_right_y = (norm_right_y * 10).round().long().clamp(0, 10)
-        
-        # 计算线性索引
-        mh_idx_left = mh_grid_left_x * 11 + mh_grid_left_y
-        mh_idx_right = mh_grid_right_x * 11 + mh_grid_right_y
-        
-        # 安全裁剪索引
-        mh_idx_left = mh_idx_left.clamp(0, 186)
-        mh_idx_right = mh_idx_right.clamp(0, 186)
-        
-        # 采样高度（需要在update之后使用measured_heights）
-        # measured_heights: [num_envs, 187]
-        batch_indices = torch.arange(self.num_envs, device=self.device)
-        
-        height_left = self.measured_heights[batch_indices, mh_idx_left]
-        height_right = self.measured_heights[batch_indices, mh_idx_right]
-        
-        # ========== 5. 计算高度变化作为平坦度指标 ==========
-        # 对相邻点进行采样评估地形平坦度
-        # 简化：使用当前点与机器人高度的差异
-        base_height = self.root_states[:, 2]
-        
-        # 高度差异（越小越好）
-        height_diff_left = torch.abs(height_left - (base_height - self.cfg.normalization.base_height))
-        height_diff_right = torch.abs(height_right - (base_height - self.cfg.normalization.base_height))
-        
-        flatness_penalty = height_diff_left + height_diff_right
-        
-        # ========== 6. 只在脚摆动时给奖励 ==========
-        # 使用接触检测判断哪只脚正在摆动
-        is_left_swing = ~self.contact_filt[:, 0]   # 左脚摆动
-        is_right_swing = ~self.contact_filt[:, 1]  # 右脚摆动
-        
-        # 综合奖励
-        # 负数：惩罚边缘位置和不平坦地形
-        reward = torch.zeros(self.num_envs, device=self.device)
-        
-        # 左脚摆动时评估左脚落足点
-        reward += is_left_swing.float() * (-edge_penalty * 0.5 - flatness_penalty * 0.5)
-        # 右脚摆动时评估右脚落足点
-        reward += is_right_swing.float() * (-edge_penalty * 0.5 - flatness_penalty * 0.5)
-        
-        # 归一化和裁剪
-        reward = torch.clamp(reward, -2.0, 0.5)
-        
-        return reward

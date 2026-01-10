@@ -12,10 +12,10 @@ def play(args):
     env_cfg.env.episode_length_s = 100
     env_cfg.env.num_envs = 1
     env_cfg.terrain.num_rows = 5
-    env_cfg.terrain.num_cols = 10
+    env_cfg.terrain.num_cols = 5
     env_cfg.terrain.curriculum = False
     env_cfg.terrain.max_difficulty = True
-    env_cfg.terrain.difficulty_level = 1.0
+    env_cfg.terrain.difficulty_level = 0.3
     env_cfg.noise.add_noise = True
     env_cfg.domain_rand.randomize_friction = False
     env_cfg.domain_rand.randomize_base_mass = False
@@ -56,10 +56,10 @@ def play(args):
     env_cfg.commands.heading_command = False
     env_cfg.commands.resampling_time = 100
 
-    env_cfg.terrain.terrain_dict = {"roughness": 0., 
-                                    "slope": 0.,
-                                    "pit": 0,
-                                    "gap": 0,
+    env_cfg.terrain.terrain_dict = {"stepping_stones": 1, 
+                                    "parkour": 1,
+                                    "pit": 1,
+                                    "gap": 1,
                                     "stair": 1,}
     env_cfg.terrain.terrain_proportions = list(env_cfg.terrain.terrain_dict.values())
     # prepare environment

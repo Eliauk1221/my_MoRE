@@ -1,0 +1,29 @@
+conda-forge/linux-64                                        Using cache
+conda-forge/noarch                                          Using cache
+https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/linux-64          Using cache
+https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/noarch          Using cache
+https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/linux-64          Using cache
+https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/noarch          Using cache
+https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r/linux-64          Using cache
+https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r/noarch          Using cache
+pytorch/linux-64                                            Using cache
+pytorch/noarch                                              Using cache
+conda-forge/linux-64                                        Using cache
+conda-forge/noarch                                          Using cache
+
+Pinned packages:
+
+  - python=3.8
+
+
+Transaction
+
+  Prefix: /ssd/conda_envs/more
+
+  All requested packages already installed
+
+
+Transaction starting
+
+Transaction finished
+

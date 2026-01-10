@@ -151,32 +151,13 @@ class Terrain:
                                 vertical_scale=self.cfg.vertical_scale,
                                 horizontal_scale=self.cfg.horizontal_scale)
         if choice < self.proportions[0]:
-            # stepping_stones 地形（从 extreme-parkour 迁移）
             idx = 0
-            stepping_stones_terrain(terrain, 
-                                    stone_size=0.5 - 0.15*difficulty, 
-                                    stone_distance=0.08 + 0.3*difficulty,
-                                    pad_height=0)
-            self.add_roughness(terrain)
+            self.add_roughness(terrain, 0.3 * difficulty)
         elif choice < self.proportions[1]:
-            # parkour 地形（从 extreme-parkour 迁移）
             idx = 1
-            x_range = [-0.1, 0.1 + 0.3*difficulty]
-            y_range = [0.2, 0.3 + 0.1*difficulty]
-            stone_len = [0.9 - 0.3*difficulty, 1 - 0.2*difficulty]
-            incline_height = 0.25*difficulty
-            last_incline_height = incline_height + 0.1 - 0.1*difficulty
-            parkour_terrain(terrain,
-                            num_stones=8,
-                            x_range=x_range, 
-                            y_range=y_range,
-                            incline_height=incline_height,
-                            stone_len=stone_len,
-                            stone_width=1.0, 
-                            last_incline_height=last_incline_height,
-                            pad_height=0,
-                            pit_depth=[0.2, 1])
-            self.add_roughness(terrain)
+            slope = 0.3*difficulty
+            multi_sloped_long_terrain(terrain, slope=slope)
+            self.add_roughness(terrain, difficulty=0)
         elif choice < self.proportions[2]:
             idx = 2
             parkour_pit_terrain(terrain,
@@ -466,171 +447,6 @@ def pit_terrain(terrain, depth, platform_size=1.):
     y1 = terrain.width // 2 - platform_size
     y2 = terrain.width // 2 + platform_size
     terrain.height_field_raw[x1:x2, y1:y2] = -depth
-
-def stepping_stones_terrain(terrain,
-                            stone_size, 
-                            stone_distance,
-                            num_cols=8,
-                            platform_len=2.5,
-                            platform_height=0.,
-                            pit_depth=1.0,
-                            pad_width=0.1,
-                            pad_height=0.5):
-    """
-    生成 stepping stones 地形（从 extreme-parkour 迁移，移除 goals 设置）
-    
-    Args:
-        terrain: 地形对象
-        stone_size: 石块边长 (米)
-        stone_distance: 石块间距 (米)
-        num_cols: 固定列数 (x 方向)，默认 6 列
-        platform_len: 起始/终点平台长度 (米)
-        platform_height: 平台高度 (米)
-        pit_depth: 深坑深度 (米)
-        pad_width: 边缘填充宽度 (米)
-        pad_height: 边缘填充高度 (米)
-    """
-    # 将整个地形填充为深坑
-    terrain.height_field_raw[:] = -round(pit_depth / terrain.vertical_scale)
-    
-    # 将所有米制参数转换为离散单位
-    stone_size = round(stone_size / terrain.horizontal_scale)
-    stone_distance = round(stone_distance / terrain.horizontal_scale)
-    platform_len = round(platform_len / terrain.horizontal_scale)
-    platform_height = round(platform_height / terrain.vertical_scale)
-    pad_width = int(pad_width // terrain.horizontal_scale)
-    pad_height = int(pad_height // terrain.vertical_scale)
-
-    # 计算中轴线（y 方向）
-    mid_y = terrain.length // 2 
-
-    # 生成起始平台
-    terrain.height_field_raw[0:platform_len, :] = platform_height
-
-    # 确定石块区域范围
-    stone_region_start = platform_len
-    # 根据固定列数计算石块区域结束位置
-    stone_region_end = stone_region_start + num_cols * (stone_size + stone_distance)
-    
-    # 行数根据 terrain.length 自动计算
-    num_rows = terrain.length // (stone_size + stone_distance)
-
-    # 生成石块网络
-    for col in range(num_cols):
-        for row in range(num_rows):
-            # 第 col 列石块的 x 中心
-            center_x = stone_region_start + col * (stone_size + stone_distance) + stone_size // 2
-            # 第 row 行石块的 y 中心（从 y=0 开始，均匀分布）
-            center_y = row * (stone_size + stone_distance) + stone_size // 2
-            # 填充石块区域（从石块中心开始反推边界）
-            x_start = center_x - stone_size // 2
-            x_end = x_start + stone_size
-            y_start = center_y - stone_size // 2
-            y_end = y_start + stone_size
-
-            terrain.height_field_raw[x_start:x_end, y_start:y_end] = platform_height
-
-    # 生成终点平台（柱子区域结束后全部设为平台）
-    terrain.height_field_raw[stone_region_end:, :] = platform_height
-
-    # pad edges
-    terrain.height_field_raw[:, :pad_width] = pad_height
-    terrain.height_field_raw[:, -pad_width:] = pad_height
-    terrain.height_field_raw[:pad_width, :] = pad_height
-    terrain.height_field_raw[-pad_width:, :] = pad_height
-
-def parkour_terrain(terrain, 
-                    platform_len=2.5, 
-                    platform_height=0., 
-                    num_stones=8, 
-                    x_range=[1.8, 1.9], 
-                    y_range=[0., 0.1], 
-                    z_range=[-0.2, 0.2],
-                    stone_len=1.0,
-                    stone_width=0.6,
-                    pad_width=0.1,
-                    pad_height=0.5,
-                    incline_height=0.1,
-                    last_incline_height=0.6,
-                    last_stone_len=1.6,
-                    pit_depth=[0.5, 1.]):
-    """
-    生成 parkour 地形（从 extreme-parkour 迁移，移除 goals 设置）
-    左右交替的倾斜平台跳跃
-    
-    Args:
-        terrain: 地形对象
-        platform_len: 起始平台长度 (米)
-        platform_height: 平台高度 (米)
-        num_stones: 石块数量
-        x_range: x 方向间距范围 [min, max] (米)
-        y_range: y 方向偏移范围 [min, max] (米)
-        z_range: z 方向高度范围 [min, max] (米)
-        stone_len: 石块长度或范围 (米)
-        stone_width: 石块宽度 (米)
-        pad_width: 边缘填充宽度 (米)
-        pad_height: 边缘填充高度 (米)
-        incline_height: 倾斜高度 (米)
-        last_incline_height: 最后石块倾斜高度 (米)
-        last_stone_len: 最后石块长度 (米)
-        pit_depth: 深坑深度范围 [min, max] (米)
-    """
-    # 填充深坑
-    terrain.height_field_raw[:] = -round(np.random.uniform(pit_depth[0], pit_depth[1]) / terrain.vertical_scale)
-    
-    mid_y = terrain.length // 2  # length is actually y width
-    
-    # 处理 stone_len 参数（可能是单值或范围）
-    if isinstance(stone_len, (list, tuple)):
-        stone_len = np.random.uniform(*stone_len)
-    stone_len = 2 * round(stone_len / 2.0, 1)
-    stone_len = round(stone_len / terrain.horizontal_scale)
-    
-    dis_x_min = stone_len + round(x_range[0] / terrain.horizontal_scale)
-    dis_x_max = stone_len + round(x_range[1] / terrain.horizontal_scale)
-    dis_y_min = round(y_range[0] / terrain.horizontal_scale)
-    dis_y_max = round(y_range[1] / terrain.horizontal_scale)
-    dis_z_min = round(z_range[0] / terrain.vertical_scale)
-    dis_z_max = round(z_range[1] / terrain.vertical_scale)
-
-    platform_len = round(platform_len / terrain.horizontal_scale)
-    platform_height = round(platform_height / terrain.vertical_scale)
-    terrain.height_field_raw[0:platform_len, :] = platform_height
-
-    stone_width = round(stone_width / terrain.horizontal_scale)
-    last_stone_len = round(last_stone_len / terrain.horizontal_scale)
-
-    incline_height = round(incline_height / terrain.vertical_scale)
-    last_incline_height = round(last_incline_height / terrain.vertical_scale)
-
-    dis_x = platform_len - np.random.randint(dis_x_min, dis_x_max) + stone_len // 2
-    left_right_flag = np.random.randint(0, 2)
-    dis_z = 0
-    
-    for i in range(num_stones):
-        dis_x += np.random.randint(dis_x_min, dis_x_max)
-        pos_neg = round(2*(left_right_flag - 0.5))
-        dis_y = mid_y + pos_neg * np.random.randint(dis_y_min, dis_y_max)
-        if i == num_stones - 1:
-            dis_x += last_stone_len // 4
-            heights = np.tile(np.linspace(-last_incline_height, last_incline_height, stone_width), (last_stone_len, 1)) * pos_neg
-            terrain.height_field_raw[dis_x-last_stone_len//2:dis_x+last_stone_len//2, dis_y-stone_width//2: dis_y+stone_width//2] = heights.astype(int) + dis_z
-        else:
-            heights = np.tile(np.linspace(-incline_height, incline_height, stone_width), (stone_len, 1)) * pos_neg
-            terrain.height_field_raw[dis_x-stone_len//2:dis_x+stone_len//2, dis_y-stone_width//2: dis_y+stone_width//2] = heights.astype(int) + dis_z
-
-        left_right_flag = 1 - left_right_flag
-    
-    final_platform_start = dis_x + last_stone_len // 2 + round(0.05 // terrain.horizontal_scale)
-    terrain.height_field_raw[final_platform_start:, :] = platform_height
-    
-    # pad edges
-    pad_width = int(pad_width // terrain.horizontal_scale)
-    pad_height = int(pad_height // terrain.vertical_scale)
-    terrain.height_field_raw[:, :pad_width] = pad_height
-    terrain.height_field_raw[:, -pad_width:] = pad_height
-    terrain.height_field_raw[:pad_width, :] = pad_height
-    terrain.height_field_raw[-pad_width:, :] = pad_height
 
 def multi_sloped_long_terrain(terrain, slope=1, platform_size=1.0, num_slopes=2, slope_size=4.0):
     """
