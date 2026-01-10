@@ -502,6 +502,35 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         if pred_foothold is not None:
             self.pred_foothold[:] = pred_foothold.detach()
     
+    def _sample_terrain_height(self, world_xy):
+        """
+        从地形高度图采样指定世界xy位置的高度
+        
+        对于台阶、坑洞等有高度变化的地形，这个函数可以获取预测落足点位置的真实地形高度，
+        避免使用当前脚高度导致的坐标转换误差。
+        
+        Args:
+            world_xy: [num_envs, 2] 世界坐标系的xy位置
+        
+        Returns:
+            heights: [num_envs] 该位置的地形高度 (米)
+        """
+        h_scale = self.cfg.terrain.horizontal_scale
+        v_scale = self.cfg.terrain.vertical_scale
+        border_size = self.terrain.cfg.border_size if hasattr(self.terrain, 'cfg') else 0
+        
+        # 转换到网格坐标
+        grid_xy = ((world_xy + border_size) / h_scale).long()
+        
+        # 限制在有效范围内
+        px = torch.clip(grid_xy[:, 0], 0, self.height_samples.shape[0] - 1)
+        py = torch.clip(grid_xy[:, 1], 0, self.height_samples.shape[1] - 1)
+        
+        # 采样高度并转换为米
+        heights = self.height_samples[px, py] * v_scale
+        
+        return heights
+    
     def _reward_foothold_sampling(self):
         """
         BeamDojo风格的采样落足点奖励
@@ -534,14 +563,29 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         pred_left_xy = self.pred_foothold[:, :2]   # [num_envs, 2]
         pred_right_xy = self.pred_foothold[:, 2:4]  # [num_envs, 2]
         
-        # 补充z坐标（使用当前脚的高度）
-        pred_left_z = self.feet_pos[:, 0, 2].unsqueeze(-1)   # [num_envs, 1]
-        pred_right_z = self.feet_pos[:, 1, 2].unsqueeze(-1)  # [num_envs, 1]
+        # === 改进的z坐标处理：使用地形高度图而非当前脚高度 ===
+        # 对于台阶、坑洞等有高度变化的地形，直接使用当前脚高度会导致坐标转换误差
+        # 步骤1：先用xy（z=0）进行旋转，得到粗略的世界xy位置
+        pred_left_xy_3d = torch.cat([pred_left_xy, torch.zeros(self.num_envs, 1, device=self.device)], dim=-1)
+        pred_right_xy_3d = torch.cat([pred_right_xy, torch.zeros(self.num_envs, 1, device=self.device)], dim=-1)
         
-        pred_left_3d = torch.cat([pred_left_xy, pred_left_z], dim=-1)   # [num_envs, 3]
-        pred_right_3d = torch.cat([pred_right_xy, pred_right_z], dim=-1) # [num_envs, 3]
+        pred_left_world_rough = quat_apply(self.base_quat, pred_left_xy_3d) + self.root_states[:, 0:3]
+        pred_right_world_rough = quat_apply(self.base_quat, pred_right_xy_3d) + self.root_states[:, 0:3]
         
-        # 从身体坐标系转换到世界坐标系
+        # 步骤2：从地形高度图采样该位置的真实高度
+        pred_left_z = self._sample_terrain_height(pred_left_world_rough[:, :2])
+        pred_right_z = self._sample_terrain_height(pred_right_world_rough[:, :2])
+        
+        # 步骤3：使用真实地形高度重新进行坐标转换
+        # 计算预测点相对于机器人的z偏移（地形高度 - 机器人高度）
+        robot_height = self.root_states[:, 2]
+        pred_left_dz = (pred_left_z - robot_height).unsqueeze(-1)   # [num_envs, 1]
+        pred_right_dz = (pred_right_z - robot_height).unsqueeze(-1)  # [num_envs, 1]
+        
+        pred_left_3d = torch.cat([pred_left_xy, pred_left_dz], dim=-1)   # [num_envs, 3]
+        pred_right_3d = torch.cat([pred_right_xy, pred_right_dz], dim=-1) # [num_envs, 3]
+        
+        # 从身体坐标系转换到世界坐标系（使用正确的z坐标）
         pred_left_world = quat_apply(self.base_quat, pred_left_3d) + self.root_states[:, 0:3]
         pred_right_world = quat_apply(self.base_quat, pred_right_3d) + self.root_states[:, 0:3]
         

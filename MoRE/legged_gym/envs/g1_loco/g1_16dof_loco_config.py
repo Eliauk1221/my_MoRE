@@ -80,7 +80,7 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         test_mode = False
         
     class env(LeggedRobotCfg.env):
-        num_envs = 4096
+        num_envs = 3072
         num_observations = 57
         num_actions = 16
         amp_motion_files = './resources/g1_amp_data/lafan_walk+run_50FPS' 
