@@ -522,6 +522,10 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         if not self.cfg.terrain.measure_heights:
             return torch.zeros(self.num_envs, device=self.device)
         
+        # 提前返回：如果 measured_heights 尚未初始化（第一次 reset 时）
+        if not isinstance(self.measured_heights, torch.Tensor):
+            return torch.zeros(self.num_envs, device=self.device)
+        
         # ========== 1. 计算预测落足点在世界坐标系的位置 ==========
         # pred_foothold: [num_envs, 4] -> 左脚(dx,dy), 右脚(dx,dy)
         # 需要将其转换到世界坐标系
