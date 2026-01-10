@@ -390,13 +390,33 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         return is_jump.float()
     
     def _reward_feet_lateral_distance(self):
-        # Penalize feet lateral distance
+        # Penalize feet lateral distance (too narrow)
         cur_footpos_translated = self.feet_pos - self.root_states[:, 0:3].unsqueeze(1)
         footpos_in_body_frame = torch.zeros(self.num_envs, len(self.feet_indices), 3, device=self.device)
         for i in range(len(self.feet_indices)):
             footpos_in_body_frame[:, i, :] = quat_rotate_inverse(self.base_quat, cur_footpos_translated[:, i, :])
         rew = (footpos_in_body_frame[:, 0, 1] - footpos_in_body_frame[:, 1, 1]) - self.cfg.rewards.feet_min_lateral_distance_target
         return rew
+    
+    def _reward_feet_lateral_distance_max(self):
+        """
+        惩罚两脚横向距离过大（防止劈叉站姿）
+        
+        使用软边界惩罚，只惩罚超出最大距离的部分
+        """
+        cur_footpos_translated = self.feet_pos - self.root_states[:, 0:3].unsqueeze(1)
+        footpos_in_body_frame = torch.zeros(self.num_envs, len(self.feet_indices), 3, device=self.device)
+        for i in range(len(self.feet_indices)):
+            footpos_in_body_frame[:, i, :] = quat_rotate_inverse(self.base_quat, cur_footpos_translated[:, i, :])
+        
+        # 计算两脚横向距离（左脚y - 右脚y）
+        lateral_distance = footpos_in_body_frame[:, 0, 1] - footpos_in_body_frame[:, 1, 1]
+        
+        # 软边界惩罚：只惩罚超出最大距离的部分
+        max_distance = self.cfg.rewards.feet_max_lateral_distance_target
+        penalty = F.relu(lateral_distance - max_distance)
+        
+        return penalty
     
     def _reward_feet_slippage(self):
         return torch.sum(torch.norm(self.feet_vel, dim=-1) * (torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) > 1.), dim=1)

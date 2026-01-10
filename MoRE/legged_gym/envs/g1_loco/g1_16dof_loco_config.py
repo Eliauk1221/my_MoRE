@@ -250,6 +250,7 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
     class rewards( LeggedRobotCfg.rewards ):
         soft_dof_pos_limit = 0.9
         feet_min_lateral_distance_target = 0.14
+        feet_max_lateral_distance_target = 0.32  # 最大脚间距 32cm，防止劈叉
         clearance_height_target = -0.6
         class scales:
             tracking_lin_vel = 2
@@ -273,6 +274,7 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
             torque_limits = -1.0
             no_fly = 0.25
             feet_lateral_distance = 0.5
+            feet_lateral_distance_max = -1.0  # 惩罚脚间距过大
             feet_slippage = -0.25
             feet_contact_force = -2.5e-4
             feet_force_rate = -2.5e-4
