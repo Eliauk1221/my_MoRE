@@ -72,6 +72,10 @@ def play(args):
     train_cfg.runner.load_delta_policy = False
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args, train_cfg=train_cfg)
     policy = ppo_runner.get_inference_policy(device=env.device)
+    
+    # 获取 actor_critic 模型引用，用于获取注意力权重
+    actor_critic = ppo_runner.alg.actor_critic
+    use_foothold_attention = hasattr(actor_critic, 'use_foothold_attention') and actor_critic.use_foothold_attention
 
     # process trajectory history
     num_gait = env.cfg.env.num_gait if hasattr(env.cfg.env, 'num_gait') else 0
@@ -101,10 +105,31 @@ def play(args):
         if env.cfg.depth.warp_camera or env.cfg.depth.use_camera:
             obs = (obs, depth_image)
 
+        # 准备落足点注意力所需的额外输入
+        foot_pos = None
+        terrain_heights = None
+        if use_foothold_attention:
+            # foot_pos: [num_envs, 6] 左右脚在身体坐标系下的xyz位置
+            foot_pos = env.footpos_in_body_frame.reshape(env.num_envs, -1)
+            # terrain_heights: [num_envs, 187] 采样点高度
+            if hasattr(env, 'measured_heights') and isinstance(env.measured_heights, torch.Tensor):
+                terrain_heights = env.measured_heights
+
         if isinstance(obs, tuple):
-            actions = policy(obs[0].detach(), trajectory_history.detach(), obs[1][:, :2, ...].detach())
+            # 使用深度图的模型，支持落足点注意力
+            actions = policy(obs[0].detach(), trajectory_history.detach(), obs[1][:, :2, ...].detach(),
+                           foot_pos=foot_pos, terrain_heights=terrain_heights)
         else:
+            # 不使用深度图的模型，不支持落足点注意力
             actions = policy(obs.detach(), trajectory_history)
+        
+        # 获取并传递注意力权重和预测落脚点给环境（用于可视化）
+        if use_foothold_attention:
+            pred_foothold = actor_critic.get_pred_foothold()
+            attn_weights = actor_critic.get_attention_weights()
+            env.set_pred_foothold(pred_foothold)
+            env.set_attention_weights(attn_weights)
+        
         obs, _, _, dones, infos, *_= env.step(actions.detach())
 
         # process trajectory history
