@@ -243,7 +243,7 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         resampling_time = 10. # time before command are changed[s]
         heading_command = True  # if true: compute ang vel command from heading error
         class ranges(LeggedRobotCfg.commands.ranges):
-            lin_vel_x = [-0.5, 1.0] # min max [m/s]
+            lin_vel_x = [0.0, 1.3] # min max [m/s]  # 提高最大速度，使跨越动作更自然
             lin_vel_y = [-1.0, 1.0]   # min max [m/s]
             ang_vel_yaw = [-1, 1]    # min max [rad/s]
             heading = [-3.14, 3.14]

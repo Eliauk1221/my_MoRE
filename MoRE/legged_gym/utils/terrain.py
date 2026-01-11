@@ -515,20 +515,24 @@ def stepping_stones_terrain(terrain,
     # 行数根据 terrain.length 自动计算
     num_rows = terrain.length // (stone_size + stone_distance)
 
-    # 生成石块网络
+    # 生成石块网络（以 mid_y 为中心对称分布）
     for col in range(num_cols):
         for row in range(num_rows):
             # 第 col 列石块的 x 中心
             center_x = stone_region_start + col * (stone_size + stone_distance) + stone_size // 2
-            # 第 row 行石块的 y 中心（从 y=0 开始，均匀分布）
-            center_y = row * (stone_size + stone_distance) + stone_size // 2
+            # 第 row 行石块的 y 中心（以 mid_y 为中心对称分布）
+            # row=0 时偏移为 -(num_rows//2)，确保中心行在 mid_y 上
+            offset = (row - num_rows // 2) * (stone_size + stone_distance)
+            center_y = mid_y + offset
             # 填充石块区域（从石块中心开始反推边界）
             x_start = center_x - stone_size // 2
             x_end = x_start + stone_size
             y_start = center_y - stone_size // 2
             y_end = y_start + stone_size
-
-            terrain.height_field_raw[x_start:x_end, y_start:y_end] = platform_height
+            
+            # 边界检查，确保不超出地形范围
+            if y_start >= 0 and y_end <= terrain.length:
+                terrain.height_field_raw[x_start:x_end, y_start:y_end] = platform_height
 
     # 生成终点平台（柱子区域结束后全部设为平台）
     terrain.height_field_raw[stone_region_end:, :] = platform_height

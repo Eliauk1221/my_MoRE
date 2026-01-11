@@ -141,7 +141,7 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         robot_pos = self.root_states[env_id, :3]  # [3]
         
         # 旋转采样点到世界坐标系
-        from isaacgym.torch_utils import quat_apply_yaw
+        from legged_gym.utils.math import quat_apply_yaw
         quat_expanded = base_quat.unsqueeze(0).repeat(len(point_indices), 1)  # [num_filtered, 4]
         world_points_xy = quat_apply_yaw(quat_expanded, filtered_local_points) + robot_pos
         
@@ -361,6 +361,11 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1000., dim=1)
         self.reset_buf |= torch.logical_or(torch.abs(self.rpy[:,1])>1.0, torch.abs(self.rpy[:,0])>0.8)
         self.reset_buf |= (self._get_base_heights() < 0.4)
+        
+        # 绝对高度终止条件（防止深坑中继续行走）
+        # 当机器人z坐标低于-0.3m时直接终止（深坑底部约-1.0m）
+        absolute_height_cutoff = self.root_states[:, 2] < -0.3
+        self.reset_buf |= absolute_height_cutoff
 
         if self.cfg.terrain.mesh_type == "trimesh":
             offset_y = torch.abs(self.root_states[:, 1] - self.origin_y)

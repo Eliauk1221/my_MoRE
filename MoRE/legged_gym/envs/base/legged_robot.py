@@ -630,8 +630,16 @@ class LeggedRobot(BaseTask):
         if self.custom_origins:
             self.root_states[env_ids] = self.base_init_state
             self.root_states[env_ids, :3] += self.env_origins[env_ids]
-            self.root_states[env_ids, :1] += torch_rand_float(-0.5, 0.2, (len(env_ids), 1), device=self.device) # xy position within 1m of the center
-            self.root_states[env_ids, 1:2] += torch_rand_float(-0.5, 0.5, (len(env_ids), 1), device=self.device) # xy position within 1m of the center
+            self.root_states[env_ids, :1] += torch_rand_float(-0.5, 0.2, (len(env_ids), 1), device=self.device) # x position
+            
+            # 根据地形类型调整y方向随机偏移
+            # stepping_stones (idx=0) 和 parkour (idx=1) 使用更小的偏移，确保机器人初始位置在中轴线附近
+            is_precision_terrain = (self.env_class[env_ids] == 0) | (self.env_class[env_ids] == 1)
+            y_offset_small = torch_rand_float(-0.15, 0.15, (len(env_ids), 1), device=self.device)
+            y_offset_normal = torch_rand_float(-0.5, 0.5, (len(env_ids), 1), device=self.device)
+            y_offset = torch.where(is_precision_terrain.unsqueeze(1), y_offset_small, y_offset_normal)
+            self.root_states[env_ids, 1:2] += y_offset
+            
             self.origin_y[env_ids] = self.root_states[env_ids, 1].clone()
         else:
             self.root_states[env_ids] = self.base_init_state
