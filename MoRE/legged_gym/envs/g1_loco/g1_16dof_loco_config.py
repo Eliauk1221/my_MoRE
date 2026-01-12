@@ -243,7 +243,7 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         resampling_time = 10. # time before command are changed[s]
         heading_command = True  # if true: compute ang vel command from heading error
         class ranges(LeggedRobotCfg.commands.ranges):
-            lin_vel_x = [0.0, 1.3] # min max [m/s]  # 提高最大速度，使跨越动作更自然
+            lin_vel_x = [-0.5, 1.3] # min max [m/s]  # 提高最大速度，使跨越动作更自然
             lin_vel_y = [-1.0, 1.0]   # min max [m/s]
             ang_vel_yaw = [-1, 1]    # min max [rad/s]
             heading = [-3.14, 3.14]
@@ -305,7 +305,7 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         his_latent_dim = 64
         
         # ========== 落足点引导注意力参数 ==========
-        use_foothold_attention = False           # 是否启用落足点引导注意力
+        use_foothold_attention = True           # 是否启用落足点引导注意力
         foothold_predictor_hidden = [256, 128]  # 落足点预测器隐藏层维度
         attention_hidden_dim = 128              # 注意力模块隐藏维度
         attention_heads = 4                     # 注意力头数
@@ -321,6 +321,7 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         amp_loader_class_name = "G1_AMPLoader"
         
         entropy_coef = 0.01
+        num_mini_batches = 8  # 从默认的4改为16，mini batch大小变为 2048*24/8=6144
         policy_learning_rate = 5e-4
 
     class runner( LeggedRobotCfgPPO.runner ):

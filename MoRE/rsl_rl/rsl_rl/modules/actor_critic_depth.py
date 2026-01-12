@@ -512,6 +512,46 @@ class ActorCriticDepth(nn.Module):
             return self.foothold_attention.last_attn_weights
         return None
     
+    def get_attention_stats(self):
+        """
+        获取注意力统计量，用于tensorboard记录
+        
+        返回:
+            dict: 包含以下指标:
+                - entropy: 注意力分布熵 (越低说明注意力越集中)
+                - peak_value: 注意力最大值 (越高说明有明确的关注焦点)
+                - sparsity: 注意力稀疏度 (top-10%占总注意力的比例)
+        """
+        if not self.use_foothold_attention or self.foothold_attention is None:
+            return None
+        
+        attn_weights = self.foothold_attention.last_attn_weights  # [B, 17, 11]
+        if attn_weights is None:
+            return None
+        
+        with torch.no_grad():
+            # 展平为 [B, 187]
+            attn_flat = attn_weights.view(attn_weights.shape[0], -1)
+            
+            # 1. 注意力熵: 衡量分布集中程度
+            # H = -sum(p * log(p)), 最大值为 log(187) ≈ 5.23 (均匀分布)
+            attn_probs = attn_flat + 1e-8  # 防止log(0)
+            entropy = -torch.sum(attn_probs * torch.log(attn_probs), dim=-1).mean()
+            
+            # 2. 注意力峰值: 最大注意力值
+            peak_value = attn_flat.max(dim=-1)[0].mean()
+            
+            # 3. 注意力稀疏度: top-10的注意力占总注意力的比例
+            # 如果注意力集中在少数点上，这个值接近1
+            topk_values, _ = torch.topk(attn_flat, k=min(10, attn_flat.shape[-1]), dim=-1)
+            sparsity = (topk_values.sum(dim=-1) / attn_flat.sum(dim=-1)).mean()
+            
+            return {
+                'entropy': entropy.item(),
+                'peak_value': peak_value.item(),
+                'sparsity': sparsity.item(),
+            }
+    
     def evaluate(self, critic_observations, history, **kwargs):
         history = history.flatten(1)
         his_feature = self.history_encoder(history)

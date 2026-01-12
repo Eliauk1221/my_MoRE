@@ -278,6 +278,12 @@ class AMPOnPolicyRunnerMulti:
                         cur_episode_length[new_ids] = 0
                         cur_single_step_disc_rew[new_ids] = 0
 
+                # ========== 新增：收集注意力统计量 ==========
+                attention_stats = None
+                if self.use_foothold_attention:
+                    attention_stats = self.alg.get_attention_stats()
+                # ==============================================
+
                 stop = time.time()
                 collection_time = stop - start
 
@@ -337,6 +343,14 @@ class AMPOnPolicyRunnerMulti:
             self.writer.add_scalar('Train/mean_disc_reward', statistics.mean(locs['discrewbuffer']), locs['it'])
             self.writer.add_scalar('Train/mean_step_disc_reward', statistics.mean(locs['step_discrewbuffer']), locs['it'])
             self.writer.add_scalar('Train/mean_episode_length', statistics.mean(locs['lenbuffer']), locs['it'])
+        
+        # ========== 新增：记录注意力统计量到tensorboard ==========
+        attention_stats = locs.get('attention_stats', None)
+        if attention_stats is not None:
+            self.writer.add_scalar('Attention/entropy', attention_stats['entropy'], locs['it'])
+            self.writer.add_scalar('Attention/peak_value', attention_stats['peak_value'], locs['it'])
+            self.writer.add_scalar('Attention/sparsity', attention_stats['sparsity'], locs['it'])
+        # ==========================================================
 
         str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "
 
@@ -366,6 +380,14 @@ class AMPOnPolicyRunnerMulti:
                           f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                           f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
                           f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n""")
+        
+        # ========== 新增：在控制台输出注意力统计量 ==========
+        attention_stats = locs.get('attention_stats', None)
+        if attention_stats is not None:
+            log_string += (f"""{'Attention entropy:':>{pad}} {attention_stats['entropy']:.4f}\n"""
+                           f"""{'Attention peak:':>{pad}} {attention_stats['peak_value']:.4f}\n"""
+                           f"""{'Attention sparsity:':>{pad}} {attention_stats['sparsity']:.4f}\n""")
+        # =====================================================
 
         log_string += ep_string
         log_string += (f"""{'-' * width}\n"""

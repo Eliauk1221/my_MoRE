@@ -183,6 +183,18 @@ class AMPPPOMulti:
     def get_pred_foothold(self):
         """获取策略网络预测的落足点，供环境计算奖励使用"""
         return self.actor_critic.get_pred_foothold()
+    
+    def get_attention_stats(self):
+        """获取注意力统计量，用于tensorboard记录"""
+        if hasattr(self.actor_critic, 'get_attention_stats'):
+            return self.actor_critic.get_attention_stats()
+        return None
+    
+    def get_attention_weights(self):
+        """获取注意力权重，用于可视化"""
+        if hasattr(self.actor_critic, 'get_attention_weights'):
+            return self.actor_critic.get_attention_weights()
+        return None
         
     def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs, amp_obs_frames=None, **kwargs):
         self.transition.rewards = rewards.clone()
