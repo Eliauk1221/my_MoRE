@@ -64,6 +64,10 @@ class AMPPPOMulti:
                  use_amp=False,
                  use_depth=False,
                  default_pos=None,
+                 # ========== 落足点预测辅助任务参数 ==========
+                 use_foothold_predictor=False,    # 是否启用落足点预测辅助任务
+                 aux_foothold_coef=1.0,           # 辅助损失系数
+                 # ===========================================
                  **kwargs
                  ):
         self.use_amp = use_amp
@@ -71,6 +75,13 @@ class AMPPPOMulti:
         self.num_amp_frames = num_amp_frames
         self.use_depth = use_depth
         self.device = device
+        
+        # ========== 落足点预测辅助任务 ==========
+        self.use_foothold_predictor = use_foothold_predictor
+        self.aux_foothold_coef = aux_foothold_coef
+        if use_foothold_predictor:
+            print(f"========== Foothold Predictor Aux Loss ENABLED, coef={aux_foothold_coef} ==========")
+        # ========================================
         if default_pos is not None: 
             self.default_pos = torch.tensor(default_pos, device=self.device)
 
@@ -116,7 +127,8 @@ class AMPPPOMulti:
 
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, history_len, history_dim, depth_shape=None, depth_buffer_len=None):
         self.storage = RolloutStorage(
-            num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device, history_len, history_dim, depth_shape, depth_buffer_len)
+            num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device, history_len, history_dim, depth_shape, depth_buffer_len,
+            use_foothold_predictor=self.use_foothold_predictor)
 
     def test_mode(self):
         self.actor_critic.test()
@@ -172,6 +184,16 @@ class AMPPPOMulti:
         self.transition.history = history
         self.transition.critic_observations = critic_obs
         self.transition.cmd_vel = cmd_vel
+        
+        # ========== 保存预测的落足点修正量（用于后续存储） ==========
+        if self.use_foothold_predictor:
+            pred_footholds = self.actor_critic.get_pred_footholds()
+            if pred_footholds is not None:
+                self.transition.pred_footholds = pred_footholds.detach()
+            else:
+                self.transition.pred_footholds = None
+        # =========================================================
+        
         return self.transition.actions
     
     def get_nominal_foothold(self):
@@ -190,11 +212,18 @@ class AMPPPOMulti:
             return self.actor_critic.get_attention_weights()
         return None
         
-    def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs, amp_obs_frames=None, **kwargs):
+    def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs, amp_obs_frames=None, 
+                         target_footholds=None, foothold_mask=None, **kwargs):
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
         self.transition.next_observations = next_obs
         self.transition.next_critic_observations = next_critic_obs
+        
+        # ========== 落足点预测辅助任务真值 ==========
+        if self.use_foothold_predictor:
+            self.transition.target_footholds = target_footholds
+            self.transition.foothold_mask = foothold_mask
+        # =========================================
         # Bootstrapping on time outs
         if 'time_outs' in infos:
             self.transition.rewards += self.gamma * torch.squeeze(self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device), 1)
@@ -238,6 +267,7 @@ class AMPPPOMulti:
         mean_expert_pred = 0
         mean_agent_acc = 0
         mean_demo_acc = 0
+        mean_foothold_loss = 0  # 落足点预测辅助损失
         
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -305,7 +335,8 @@ class AMPPPOMulti:
                 mean_demo_acc += demo_acc.mean().item()
         
         for obs_batch, critic_obs_batch, actions_batch, next_obs_batch, next_critic_observations_batch, history_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
-            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, depth_image_batch, *_ in generator:
+            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, depth_image_batch, \
+            pred_footholds_batch, target_footholds_batch, foothold_mask_batch in generator:
 
             aug_obs_batch, history_batch = obs_batch.detach(), history_batch.detach()
             
@@ -382,12 +413,43 @@ class AMPPPOMulti:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
             
+            # ========== 落足点预测辅助损失 ==========
+            # 梯度流说明:
+            #   loss_foot.backward() 会产生梯度:
+            #   loss_foot → FootholdPredictor → context_vector → SpatialAttentionEncoder
+            #   → feature_map → feature_proj → DepthEncoder
+            #   
+            #   这会强迫整个视觉编码管道学习地形几何特征，
+            #   因为只有从 Feature Map 中才能获取"红点附近哪里可踩"的信息。
+            foothold_loss = torch.tensor(0.0, device=self.device)
+            if self.use_foothold_predictor and pred_footholds_batch is not None and target_footholds_batch is not None:
+                # 获取当前前向传播的预测值（需要保留梯度）
+                current_pred_footholds = self.actor_critic.get_pred_footholds()  # [B, 2, 3]
+                
+                if current_pred_footholds is not None:
+                    # 计算 MSE，然后应用掩码
+                    # pred: [B, 2, 3], target: [B, 2, 3], mask: [B, 2]
+                    mse_per_leg = ((current_pred_footholds - target_footholds_batch) ** 2).mean(dim=-1)  # [B, 2]
+                    
+                    if foothold_mask_batch is not None:
+                        # 只对 Swing Leg 计算 loss
+                        # mask[b, i] = 1 表示 Leg i 是 Swing Leg，需要预测
+                        # mask[b, i] = 0 表示 Leg i 是 Stance Leg，忽略
+                        masked_mse = mse_per_leg * foothold_mask_batch  # [B, 2]
+                        foothold_loss = masked_mse.sum() / (foothold_mask_batch.sum() + 1e-6)
+                    else:
+                        # 没有掩码时，对所有腿计算 loss
+                        foothold_loss = mse_per_leg.mean()
+            # ===========================================
+
             # Compute total loss.
             loss = (
                 0 * b_loss +
                 surrogate_loss +
                 self.value_loss_coef * value_loss -
-                self.entropy_coef * entropy_batch.mean())
+                self.entropy_coef * entropy_batch.mean() +
+                self.aux_foothold_coef * foothold_loss  # 添加落足点预测辅助损失
+            )
 
             # Gradient step
             self.optimizer.zero_grad()
@@ -408,6 +470,7 @@ class AMPPPOMulti:
             
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
+            mean_foothold_loss += foothold_loss.item() if isinstance(foothold_loss, torch.Tensor) else foothold_loss
                 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
@@ -418,8 +481,9 @@ class AMPPPOMulti:
         mean_expert_pred /= num_updates
         mean_agent_acc /= num_updates
         mean_demo_acc /= num_updates
+        mean_foothold_loss /= num_updates
         
         self.storage.clear()
 
         return mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss, mean_policy_pred, mean_expert_pred,  \
-                mean_agent_acc, mean_demo_acc
+                mean_agent_acc, mean_demo_acc, mean_foothold_loss

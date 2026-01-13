@@ -57,6 +57,23 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         self.pred_foothold = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device, requires_grad=False)
         # 存储注意力权重 [num_envs, 17, 11] 用于可视化
         self.attention_weights = torch.zeros(self.num_envs, 17, 11, dtype=torch.float, device=self.device, requires_grad=False)
+        
+        # ========== 落足点预测辅助任务相关 ==========
+        # 存储名义落足点 (Raibert Heuristic) [num_envs, 2] - 来自策略网络
+        self.nominal_foothold = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False)
+        # 存储 Oracle 计算的目标落足点修正量 [num_envs, 2, 3] (左右腿, xyz)
+        self.target_footholds = torch.zeros(self.num_envs, 2, 3, dtype=torch.float, device=self.device, requires_grad=False)
+        # Swing leg 掩码 [num_envs, 2]
+        self.foothold_mask = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False)
+        # Hip 偏移量 (用于计算两腿的 Raibert 点)
+        self.hip_offset = torch.tensor([
+            [0.0, 0.1, 0.0],   # 左腿 hip (y 正方向)
+            [0.0, -0.1, 0.0],  # 右腿 hip (y 负方向)
+        ], dtype=torch.float, device=self.device)
+        # Oracle 搜索参数
+        self.foothold_search_radius = 0.15  # 搜索半径 (米)
+        self.foothold_search_resolution = 0.03  # 搜索分辨率 (米)
+        # =============================================
 
     def reset_idx(self, env_ids):
         super().reset_idx(env_ids)
@@ -66,6 +83,9 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         self.last_last_feet_contact_force[env_ids] = 0.
         self.pred_foothold[env_ids] = 0.  # 重置预测落足点
         self.attention_weights[env_ids] = 0.  # 重置注意力权重
+        self.nominal_foothold[env_ids] = 0.  # 重置名义落足点
+        self.target_footholds[env_ids] = 0.  # 重置目标落足点
+        self.foothold_mask[env_ids] = 0.  # 重置 swing mask
 
     def set_attention_weights(self, attn_weights):
         """
@@ -76,6 +96,21 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         """
         if attn_weights is not None:
             self.attention_weights[:] = attn_weights.detach()
+    
+    def set_nominal_foothold(self, nominal_foothold):
+        """
+        从策略网络接收名义落足点 (Raibert Heuristic)
+        
+        这个名义落足点是基于 cmd_vel 计算的"理想"落足位置，
+        用于计算 Oracle 搜索的目标修正量。
+        
+        Args:
+            nominal_foothold: [num_envs, 2] 名义落足点 (x, y) 相对于 base
+        """
+        if nominal_foothold is not None:
+            self.nominal_foothold[:] = nominal_foothold.detach()
+            # 更新 Oracle 目标落足点
+            self._compute_target_footholds()
 
     def _draw_foot_indicator(self):
         self.gym.clear_lines(self.viewer)
@@ -864,3 +899,192 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         reward = torch.clamp(reward, -2.0, 0.5)
         
         return reward
+    
+    # ========== 落足点预测辅助任务接口 ==========
+    
+    def _compute_target_footholds(self):
+        """
+        使用 Oracle 地形搜索计算最优落足点
+        
+        对于每条腿，在 Raibert 名义点附近搜索最安全的落足位置：
+        1. 基于 Raibert 公式计算每条腿的名义落足点
+        2. 在名义点周围进行网格搜索
+        3. 评估每个候选点的"安全性" (非边缘、平坦)
+        4. 返回最安全点相对于名义点的修正量
+        
+        target_footholds = P_oracle - P_raibert
+        """
+        if not self.cfg.terrain.measure_heights:
+            return
+        
+        # 检查 measured_heights 是否已初始化
+        if not isinstance(self.measured_heights, torch.Tensor):
+            return
+        
+        # ========== 1. 计算每条腿的 Raibert 名义落足点 ==========
+        # nominal_foothold 是单点 [num_envs, 2]，需要分别为左右腿添加 hip offset
+        # 左腿名义点 = nominal_foothold + hip_offset[0, :2]
+        # 右腿名义点 = nominal_foothold + hip_offset[1, :2]
+        
+        raibert_left = self.nominal_foothold + self.hip_offset[0, :2]   # [num_envs, 2]
+        raibert_right = self.nominal_foothold + self.hip_offset[1, :2]  # [num_envs, 2]
+        
+        # ========== 2. Oracle 搜索最优落足点 ==========
+        oracle_left = self._oracle_search_foothold(raibert_left, leg_idx=0)   # [num_envs, 3]
+        oracle_right = self._oracle_search_foothold(raibert_right, leg_idx=1)  # [num_envs, 3]
+        
+        # ========== 3. 计算修正量 (target = oracle - raibert) ==========
+        # 左腿
+        self.target_footholds[:, 0, 0] = oracle_left[:, 0] - raibert_left[:, 0]  # Δx
+        self.target_footholds[:, 0, 1] = oracle_left[:, 1] - raibert_left[:, 1]  # Δy
+        self.target_footholds[:, 0, 2] = oracle_left[:, 2]  # Δz (直接使用地形高度差)
+        
+        # 右腿
+        self.target_footholds[:, 1, 0] = oracle_right[:, 0] - raibert_right[:, 0]  # Δx
+        self.target_footholds[:, 1, 1] = oracle_right[:, 1] - raibert_right[:, 1]  # Δy
+        self.target_footholds[:, 1, 2] = oracle_right[:, 2]  # Δz
+        
+        # ========== 4. 更新 Swing Leg 掩码 ==========
+        # 只对摆动腿计算 loss
+        # contact_filt: True 表示脚在地面上
+        self.foothold_mask[:, 0] = (~self.contact_filt[:, 0]).float()  # 左腿摆动时 mask=1
+        self.foothold_mask[:, 1] = (~self.contact_filt[:, 1]).float()  # 右腿摆动时 mask=1
+    
+    def _oracle_search_foothold(self, raibert_point, leg_idx):
+        """
+        Oracle 地形搜索：在 Raibert 点附近找到最安全的落足位置
+        
+        搜索策略：
+        1. 在 Raibert 点周围生成候选点网格
+        2. 将候选点转换到世界坐标系
+        3. 查询每个候选点的地形特性 (高度、边缘)
+        4. 评分并选择最佳点
+        
+        Args:
+            raibert_point: [num_envs, 2] 身体坐标系下的 Raibert 名义点 (x, y)
+            leg_idx: 0=左腿, 1=右腿
+            
+        Returns:
+            best_point: [num_envs, 3] 最优落足点 (x, y, z_offset) 身体坐标系
+        """
+        num_envs = self.num_envs
+        device = self.device
+        
+        # ========== 1. 生成搜索网格 ==========
+        radius = self.foothold_search_radius
+        resolution = self.foothold_search_resolution
+        
+        # 创建相对偏移网格
+        offsets_1d = torch.arange(-radius, radius + resolution, resolution, device=device)
+        num_samples = len(offsets_1d)
+        
+        # 创建 2D 网格
+        offset_x, offset_y = torch.meshgrid(offsets_1d, offsets_1d, indexing='ij')
+        offsets = torch.stack([offset_x.flatten(), offset_y.flatten()], dim=-1)  # [N, 2]
+        num_candidates = offsets.shape[0]
+        
+        # ========== 2. 生成所有候选点 ==========
+        # raibert_point: [num_envs, 2]
+        # offsets: [num_candidates, 2]
+        # candidates: [num_envs, num_candidates, 2]
+        candidates_local = raibert_point.unsqueeze(1) + offsets.unsqueeze(0)  # [num_envs, N, 2]
+        
+        # 添加 z=0 形成 3D 点
+        candidates_local_3d = torch.cat([
+            candidates_local,
+            torch.zeros(num_envs, num_candidates, 1, device=device)
+        ], dim=-1)  # [num_envs, N, 3]
+        
+        # ========== 3. 转换到世界坐标系 ==========
+        # 批量旋转
+        base_quat_expanded = self.base_quat.unsqueeze(1).expand(-1, num_candidates, -1)  # [num_envs, N, 4]
+        robot_pos_expanded = self.root_states[:, :3].unsqueeze(1).expand(-1, num_candidates, -1)  # [num_envs, N, 3]
+        
+        candidates_world = quat_apply(
+            base_quat_expanded.reshape(-1, 4),
+            candidates_local_3d.reshape(-1, 3)
+        ).reshape(num_envs, num_candidates, 3) + robot_pos_expanded  # [num_envs, N, 3]
+        
+        # ========== 4. 查询地形特性 ==========
+        # 4.1 查询地形高度
+        h_scale = self.cfg.terrain.horizontal_scale
+        v_scale = self.cfg.terrain.vertical_scale
+        border_size = self.terrain.cfg.border_size if hasattr(self.terrain, 'cfg') else 0
+        
+        # 转换到网格坐标
+        grid_xy = ((candidates_world[:, :, :2] + border_size) / h_scale).long()  # [num_envs, N, 2]
+        
+        # 限制在有效范围内
+        grid_x = torch.clip(grid_xy[:, :, 0], 0, self.height_samples.shape[0] - 1)
+        grid_y = torch.clip(grid_xy[:, :, 1], 0, self.height_samples.shape[1] - 1)
+        
+        # 采样高度
+        terrain_heights = self.height_samples[grid_x, grid_y] * v_scale  # [num_envs, N]
+        
+        # 4.2 查询边缘掩码
+        edge_grid_x = torch.clip(grid_xy[:, :, 0], 0, self.x_edge_mask.shape[0] - 1)
+        edge_grid_y = torch.clip(grid_xy[:, :, 1], 0, self.x_edge_mask.shape[1] - 1)
+        is_edge = self.x_edge_mask[edge_grid_x, edge_grid_y]  # [num_envs, N]
+        
+        # ========== 5. 计算每个候选点的评分 ==========
+        # 评分 = -边缘惩罚 - 高度变化惩罚 - 距离惩罚
+        
+        # 5.1 边缘惩罚 (边缘处给大的负分)
+        edge_penalty = is_edge.float() * 10.0  # [num_envs, N]
+        
+        # 5.2 高度变化惩罚 (相对于机器人当前高度)
+        robot_ground_height = self.root_states[:, 2:3] - self.cfg.normalization.base_height
+        height_diff = torch.abs(terrain_heights - robot_ground_height)  # [num_envs, N]
+        height_penalty = height_diff * 2.0
+        
+        # 5.3 距离惩罚 (鼓励选择接近 Raibert 点的位置)
+        distances = torch.norm(offsets, dim=-1).unsqueeze(0).expand(num_envs, -1)  # [num_envs, N]
+        distance_penalty = distances * 1.0
+        
+        # 5.4 计算总评分 (越高越好)
+        scores = -edge_penalty - height_penalty - distance_penalty  # [num_envs, N]
+        
+        # ========== 6. 选择最佳候选点 ==========
+        best_indices = torch.argmax(scores, dim=1)  # [num_envs]
+        
+        # 提取最佳点的坐标
+        batch_indices = torch.arange(num_envs, device=device)
+        best_local_xy = candidates_local[batch_indices, best_indices]  # [num_envs, 2]
+        best_terrain_height = terrain_heights[batch_indices, best_indices]  # [num_envs]
+        
+        # 计算 z 偏移 (相对于机器人高度)
+        z_offset = best_terrain_height - (self.root_states[:, 2] - self.cfg.normalization.base_height)
+        
+        # 返回身体坐标系下的最佳点 [x, y, z_offset]
+        best_point = torch.stack([best_local_xy[:, 0], best_local_xy[:, 1], z_offset], dim=-1)
+        
+        return best_point
+    
+    def get_target_footholds(self):
+        """
+        获取 Oracle 搜索得到的目标落足点修正量
+        
+        返回:
+            target_footholds: [num_envs, 2, 3]
+                - dim 1: 0=Left leg, 1=Right leg
+                - dim 2: (Δx, Δy, Δz) = P_oracle - P_raibert
+                
+        用于计算落足点预测辅助损失:
+            loss_foot = masked_mse(pred_footholds, target_footholds)
+        """
+        return self.target_footholds
+    
+    def get_foothold_mask(self):
+        """
+        获取 Swing Leg 掩码
+        
+        返回:
+            mask: [num_envs, 2]
+                - mask[b, 0] = 1 如果 Left Leg 是 Swing Phase
+                - mask[b, 1] = 1 如果 Right Leg 是 Swing Phase
+                
+        用于 Loss Masking：只对摆动腿计算落足点预测损失
+        """
+        return self.foothold_mask
+    
+    # =============================================

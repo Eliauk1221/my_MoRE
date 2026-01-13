@@ -315,6 +315,11 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         T_stance = 0.25                         # Raibert 站立相时间 (秒)
         learnable_T_stance = True               # 是否让 T_stance 可学习
         # ==============================================================
+        
+        # ========== 落足点预测辅助任务参数 (Foothold Predictor) ==========
+        use_foothold_predictor = True           # 是否启用落足点预测辅助任务
+        foothold_predictor_hidden_dim = 256     # FootholdPredictor 隐藏层维度
+        # ================================================================
 
     class algorithm( LeggedRobotCfgPPO.algorithm ):
         use_amp = False
@@ -324,6 +329,11 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         entropy_coef = 0.01
         num_mini_batches = 8  # 从默认的4改为16，mini batch大小变为 2048*24/8=6144
         policy_learning_rate = 5e-4
+        
+        # ========== 落足点预测辅助任务参数 ==========
+        use_foothold_predictor = True           # 是否启用落足点预测辅助任务
+        aux_foothold_coef = 1.0                 # 辅助损失系数
+        # ==========================================
 
     class runner( LeggedRobotCfgPPO.runner ):
         num_amp_frames = 5

@@ -91,6 +91,59 @@ class StackDepthEncoder(nn.Module):
         return depth_latent
 
 
+class FootholdPredictor(nn.Module):
+    """
+    落足点预测辅助头 (Foothold Prediction Auxiliary Head)
+    
+    预测相对于 Raibert 启发式点的修正量 (Residual Prediction)。
+    
+    输入: context_vector [B, input_dim] - 来自 SpatialAttentionEncoder 的输出
+    输出: delta_footholds [B, 2, 3] - 左右腿的 (Δx, Δy, Δz) 修正量
+    
+    坐标系: Base Frame (基座坐标系)
+        - X: 机器人前方
+        - Y: 机器人左侧  
+        - Z: 垂直向上
+    
+    梯度流说明:
+        当 loss_foot.backward() 执行时:
+        loss_foot → FootholdPredictor → context_vector → SpatialAttentionEncoder 
+        → feature_map → DepthEncoder
+        
+        这会强迫整个视觉编码管道学习地形几何特征。
+    """
+    
+    def __init__(self, input_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 6)  # 2 legs * 3 coordinates = 6
+        )
+        
+        # 初始化最后一层为小值，使初始输出接近 0（即接近 Raibert 点）
+        nn.init.zeros_(self.mlp[-1].bias)
+        nn.init.normal_(self.mlp[-1].weight, std=0.01)
+    
+    def forward(self, context_vector: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        
+        Args:
+            context_vector: [B, input_dim] 来自 SpatialAttentionEncoder 的输出
+            
+        Returns:
+            delta_footholds: [B, 2, 3] 落足点修正量
+                - dim 1: 0=Left leg, 1=Right leg
+                - dim 2: (Δx, Δy, Δz) in base frame
+        """
+        delta = self.mlp(context_vector)  # [B, 6]
+        return delta.view(-1, 2, 3)  # [B, 2, 3]
+
+
 class SpatialAttentionEncoder(nn.Module):
     """
     空间感知注意力编码器 (Spatially-Aware Query Attention Encoder)
@@ -340,6 +393,10 @@ class ActorCriticDepth(nn.Module):
                         T_stance=0.25,                      # Raibert站立相时间 (秒)
                         learnable_T_stance=True,            # 是否让T_stance可学习
                         # ==========================================
+                        # ========== 落足点预测辅助任务参数 ==========
+                        use_foothold_predictor=False,       # 是否启用落足点预测辅助任务
+                        foothold_predictor_hidden_dim=256,  # FootholdPredictor 隐藏层维度
+                        # ==========================================
                         **kwargs):
         if kwargs:
             print("ActorCriticEst.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()]))
@@ -349,6 +406,7 @@ class ActorCriticDepth(nn.Module):
         self.his_latent_dim = his_latent_dim
         self.max_grad_norm = max_grad_norm
         self.use_spatial_attention = use_spatial_attention
+        self.use_foothold_predictor = use_foothold_predictor
         self.num_actor_obs = num_actor_obs
 
         # depth encoder
@@ -382,10 +440,24 @@ class ActorCriticDepth(nn.Module):
             # Actor输入维度: obs + history + depth + spatial_attention
             mlp_input_dim_a = num_actor_obs + his_latent_dim + self.depth_output_dim + attention_output_dim
             print(f"Actor输入维度 (带空间注意力): {mlp_input_dim_a}")
+            
+            # ========== 落足点预测辅助头 ==========
+            if use_foothold_predictor:
+                print("========== 落足点预测辅助任务 (Foothold Predictor) ENABLED ==========")
+                self.foothold_predictor = FootholdPredictor(
+                    input_dim=attention_output_dim,
+                    hidden_dim=foothold_predictor_hidden_dim
+                )
+                print(f"FootholdPredictor: input_dim={attention_output_dim}, hidden_dim={foothold_predictor_hidden_dim}, output=[B,2,3]")
+            else:
+                print("========== 落足点预测辅助任务 DISABLED ==========")
+                self.foothold_predictor = None
+            # =====================================
         else:
             print("========== 空间感知注意力 DISABLED ==========")
             self.spatial_attention = None
             self.feature_proj = None
+            self.foothold_predictor = None  # 没有空间注意力就没有落足点预测
             mlp_input_dim_a = num_actor_obs + his_latent_dim + self.depth_output_dim
             print(f"Actor输入维度 (无空间注意力): {mlp_input_dim_a}")
         # ============================================
@@ -394,6 +466,8 @@ class ActorCriticDepth(nn.Module):
         
         # 保存名义落足点，供环境计算奖励使用
         self.last_nominal_foothold = None
+        # 保存预测的落足点修正量，供训练时计算 Aux Loss 使用
+        self.last_pred_footholds = None
         
         # History Encoder
         encoder_layers = []
@@ -503,12 +577,22 @@ class ActorCriticDepth(nn.Module):
             )
             self.last_nominal_foothold = self.spatial_attention.get_nominal_foothold()
             
+            # ========== 落足点预测辅助任务 ==========
+            # 从 attn_feature (context_vector) 预测落足点修正量
+            # 梯度流: loss_foot → FootholdPredictor → attn_feature → SpatialAttentionEncoder → feature_map → DepthEncoder
+            if self.foothold_predictor is not None:
+                self.last_pred_footholds = self.foothold_predictor(attn_feature)  # [B, 2, 3]
+            else:
+                self.last_pred_footholds = None
+            # =========================================
+            
             # 拼接所有特征
             actor_input = torch.cat((observations, his_feature, depth_feature, attn_feature), dim=-1)
         else:
             # 原始逻辑
             actor_input = torch.cat((observations, his_feature, depth_feature), dim=-1)
             self.last_nominal_foothold = None
+            self.last_pred_footholds = None
         
         self.update_distribution(actor_input)
         return self.distribution.sample()
@@ -548,10 +632,18 @@ class ActorCriticDepth(nn.Module):
             )
             self.last_nominal_foothold = self.spatial_attention.get_nominal_foothold()
             
+            # ========== 落足点预测（推理时也计算，用于可视化） ==========
+            if self.foothold_predictor is not None:
+                self.last_pred_footholds = self.foothold_predictor(attn_feature)  # [B, 2, 3]
+            else:
+                self.last_pred_footholds = None
+            # =========================================================
+            
             actor_input = torch.cat((observations, his_feature, depth_feature, attn_feature), dim=-1)
         else:
             actor_input = torch.cat((observations, his_feature, depth_feature), dim=-1)
             self.last_nominal_foothold = None
+            self.last_pred_footholds = None
         
         actions_mean = self.actor(actor_input)
         return actions_mean
@@ -559,6 +651,16 @@ class ActorCriticDepth(nn.Module):
     def get_nominal_foothold(self):
         """获取最近一次计算的名义落足点 (Raibert Heuristic)"""
         return self.last_nominal_foothold
+    
+    def get_pred_footholds(self):
+        """
+        获取最近一次预测的落足点修正量 [B, 2, 3]
+        
+        用于训练时计算 Aux Loss:
+            target_footholds = P_oracle - P_raibert  (来自环境的 Oracle 搜索)
+            loss_foot = masked_mse(pred_footholds, target_footholds)
+        """
+        return self.last_pred_footholds
     
     def get_attention_weights(self):
         """获取最近一次的注意力权重，用于可视化"""
