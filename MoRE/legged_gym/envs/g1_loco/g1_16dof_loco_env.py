@@ -146,12 +146,12 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         world_points_xy = quat_apply_yaw(quat_expanded, filtered_local_points) + robot_pos
         
         # 获取每个点的地形高度作为 z 坐标
+        # measured_heights 是地形的绝对高度（米），直接使用
         if hasattr(self, 'measured_heights') and isinstance(self.measured_heights, torch.Tensor):
             filtered_heights = self.measured_heights[env_id, point_indices]  # [num_filtered]
-            # measured_heights 是相对高度，需要加上地形基准
-            world_points_z = filtered_heights + (robot_pos[2] - self.cfg.normalization.base_height)
+            world_points_z = filtered_heights  # 地形绝对高度
         else:
-            world_points_z = torch.zeros(len(point_indices), device=self.device)
+            world_points_z = robot_pos[2] - self.cfg.normalization.base_height  # 默认使用地面高度
         
         world_points = world_points_xy.clone()
         world_points[:, 2] = world_points_z
@@ -199,6 +199,12 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
                 sphere_geom = gymutil.WireframeSphereGeometry(small_radius * 1.5, 8, 8, None, color=color)
                 pose = gymapi.Transform(gymapi.Vec3(point[0].item(), point[1].item(), point[2].item()), r=None)
                 gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[env_id], pose)
+        
+        # ========== 调试信息（每100帧打印一次） ==========
+        if self.common_step_counter % 100 == 0:
+            print(f"[Attention Debug] attn max={filtered_attn.max().item():.4f}, "
+                  f"threshold={threshold:.4f}, points_above={int((filtered_attn >= threshold).sum().item())}")
+            print(f"[Foothold Debug] pred_foothold={self.pred_foothold[env_id].cpu().numpy()}")
         
         # ========== 第三层：预测落脚点用大红点 ==========
         pred_foothold = self.pred_foothold[env_id]  # [4]: 左脚dx,dy + 右脚dx,dy
@@ -359,12 +365,17 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         """ Check if environments need to be reset
         """
         self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1000., dim=1)
-        self.reset_buf |= torch.logical_or(torch.abs(self.rpy[:,1])>1.0, torch.abs(self.rpy[:,0])>0.8)
-        self.reset_buf |= (self._get_base_heights() < 0.4)
+        
+        # 姿态终止条件（参考 extreme-parkour）
+        self.reset_buf |= torch.abs(self.rpy[:, 0]) > 1.5  # roll
+        self.reset_buf |= torch.abs(self.rpy[:, 1]) > 1.5  # pitch
+        
+        # 相对高度终止条件：机器人身体相对于脚下地形太低
+        self.reset_buf |= (self._get_base_heights() < 0.35)
         
         # 绝对高度终止条件（防止深坑中继续行走）
-        # 当机器人z坐标低于-0.3m时直接终止（深坑底部约-1.0m）
-        absolute_height_cutoff = self.root_states[:, 2] < -0.3
+        # stepping stones 间隙深度约1米，掉落后z应该很低
+        absolute_height_cutoff = self.root_states[:, 2] < -0.2
         self.reset_buf |= absolute_height_cutoff
 
         if self.cfg.terrain.mesh_type == "trimesh":
