@@ -124,7 +124,7 @@ class AMPPPOMulti:
     def train_mode(self):
         self.actor_critic.train()
 
-    def act(self, obs, critic_obs, history, terrain_heights=None, foot_pos=None):
+    def act(self, obs, critic_obs, history, cmd_vel=None):
         """
         根据观测计算动作
         
@@ -132,8 +132,7 @@ class AMPPPOMulti:
             obs: 观测 (可能是tuple: (obs, depth_image))
             critic_obs: critic使用的观测
             history: 历史观测序列
-            terrain_heights: 地形高度采样 [B, 187] (用于落足点引导注意力)
-            foot_pos: 当前脚位置 [B, 6] (用于落足点引导注意力)
+            cmd_vel: 指令速度 [B, 3] (用于空间感知注意力)
         
         返回:
             actions: 动作
@@ -145,13 +144,11 @@ class AMPPPOMulti:
         if isinstance(obs, tuple):
             # obs 是 tuple 时包含 (观测, 深度图像)
             aug_obs, depth_image, aug_critic_obs = obs[0].detach(), obs[1].detach(), critic_obs.detach()
-            # 将 terrain_heights 和 foot_pos 传递给 actor_critic.act()
             self.transition.actions = self.actor_critic.act(
                 aug_obs, 
                 history, 
                 depth_image[:, :2, ...],
-                foot_pos=foot_pos,                 # 落足点引导注意力需要
-                terrain_heights=terrain_heights    # 落足点引导注意力需要
+                cmd_vel=cmd_vel
             ).detach()
             self.transition.observations = obs[0]
             self.transition.depth_image = obs[1]
@@ -161,8 +158,7 @@ class AMPPPOMulti:
             self.transition.actions = self.actor_critic.act(
                 aug_obs, 
                 history,
-                foot_pos=foot_pos,
-                terrain_heights=terrain_heights
+                cmd_vel=cmd_vel
             ).detach()
             self.transition.observations = obs
         
@@ -175,14 +171,12 @@ class AMPPPOMulti:
         # need to record obs and critic_obs before env.step()
         self.transition.history = history
         self.transition.critic_observations = critic_obs
-        # 保存 terrain_heights 和 foot_pos 用于后续
-        self.transition.terrain_heights = terrain_heights
-        self.transition.foot_pos = foot_pos
+        self.transition.cmd_vel = cmd_vel
         return self.transition.actions
     
-    def get_pred_foothold(self):
-        """获取策略网络预测的落足点，供环境计算奖励使用"""
-        return self.actor_critic.get_pred_foothold()
+    def get_nominal_foothold(self):
+        """获取策略网络计算的名义落足点 (Raibert Heuristic)，供环境可视化使用"""
+        return self.actor_critic.get_nominal_foothold()
     
     def get_attention_stats(self):
         """获取注意力统计量，用于tensorboard记录"""
@@ -315,20 +309,12 @@ class AMPPPOMulti:
 
             aug_obs_batch, history_batch = obs_batch.detach(), history_batch.detach()
             
-            # ========== 新增：从 critic_obs 中提取 terrain_heights 和 foot_pos ==========
-            # terrain_heights 是 privileged_obs 的最后 187 维
-            # foot_pos 是 privileged_obs 的 60:66 维（假设 feet_info=True 时 12 维，取前 6 维）
-            # 只有在 actor_critic 使用落足点引导注意力时才需要
-            terrain_heights_batch = None
-            foot_pos_batch = None
-            if hasattr(self.actor_critic, 'use_foothold_attention') and self.actor_critic.use_foothold_attention:
-                # 提取最后 187 维作为 terrain heights
-                terrain_heights_batch = critic_obs_batch[:, -187:].detach()
-                # 提取脚位置（需要根据实际 privileged_obs 结构调整）
-                # privileged_obs 结构: base (60) + feet_info (12) + priv_info (38) + foot_force (6) + heights (187)
-                # feet_info 包含 footpos_in_body_frame (2*3=6) + footvel_in_body_frame (2*3=6)
-                # 我们需要 footpos_in_body_frame，位于 60:66
-                foot_pos_batch = critic_obs_batch[:, 60:66].detach()
+            # ========== 从 obs_batch 中提取 cmd_vel ==========
+            cmd_vel_batch = None
+            if hasattr(self.actor_critic, 'use_spatial_attention') and self.actor_critic.use_spatial_attention:
+                # G1 环境的观测结构:
+                # obs_buf: [cmd(3), ang_vel(3), gravity(3), dof_pos(16), dof_vel(16), actions(16)]
+                cmd_vel_batch = obs_batch[:, :3].detach()
             # ==============================================================
             
             if self.use_depth:
@@ -337,8 +323,7 @@ class AMPPPOMulti:
                     aug_obs_batch, 
                     history_batch, 
                     aug_depth_image_batch[:, :2, ...],
-                    foot_pos=foot_pos_batch,
-                    terrain_heights=terrain_heights_batch
+                    cmd_vel=cmd_vel_batch
                 )
             else:
                 self.actor_critic.act(
@@ -346,8 +331,7 @@ class AMPPPOMulti:
                     history_batch, 
                     masks=masks_batch, 
                     hidden_states=hid_states_batch[0],
-                    foot_pos=foot_pos_batch,
-                    terrain_heights=terrain_heights_batch
+                    cmd_vel=cmd_vel_batch
                 )
             
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)

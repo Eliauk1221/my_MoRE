@@ -180,11 +180,11 @@ class AMPOnPolicyRunnerMulti:
         infos = {}
         infos["depth"] = self.env.warp_depth_buffer.clone().to(self.device) if self.use_depth else None
 
-        # ========== 新增：检查是否启用落足点引导注意力 ==========
-        self.use_foothold_attention = hasattr(self.alg.actor_critic, 'use_foothold_attention') and \
-                                      self.alg.actor_critic.use_foothold_attention
-        if self.use_foothold_attention:
-            print("========== Runner: Foothold-Guided Attention ENABLED ==========")
+        # ========== 检查是否启用空间感知注意力 ==========
+        self.use_spatial_attention = hasattr(self.alg.actor_critic, 'use_spatial_attention') and \
+                                     self.alg.actor_critic.use_spatial_attention
+        if self.use_spatial_attention:
+            print("========== Runner: Spatial Attention ENABLED ==========")
         # ==============================================================
         
         for it in range(self.current_learning_iteration, tot_iter):
@@ -198,27 +198,24 @@ class AMPOnPolicyRunnerMulti:
                     if self.use_depth:
                         obs = (obs, depth_image)
 
-                    # ========== 新增：从 critic_obs 和环境提取落足点引导注意力需要的数据 ==========
-                    terrain_heights = None
-                    foot_pos = None
-                    if self.use_foothold_attention:
-                        # terrain_heights 是 privileged_obs 的最后 187 维（高度采样）
-                        terrain_heights = critic_obs[:, -187:]
-                        # foot_pos 是 privileged_obs 的 60:66 维（脚在身体坐标系下的位置）
-                        # privileged_obs 结构: base (60) + feet_info (12) + priv_info (38) + foot_force (6) + heights (187)
-                        # feet_info: footpos_in_body_frame (2*3=6) + footvel_in_body_frame (2*3=6)
-                        foot_pos = critic_obs[:, 60:66]
+                    # ========== 提取空间感知注意力需要的数据 ==========
+                    cmd_vel = None
+                    if self.use_spatial_attention:
+                        # G1 环境的观测结构:
+                        # obs_buf: [cmd(3), ang_vel(3), gravity(3), dof_pos(16), dof_vel(16), actions(16)] = 57 维
+                        
+                        # cmd_vel: 从 obs_buf 的前 3 维获取指令速度 [B, 3]
+                        obs_tensor = obs[0] if isinstance(obs, tuple) else obs
+                        cmd_vel = obs_tensor[:, :3]
                     # ==============================================================
 
-                    actions = self.alg.act(obs, critic_obs, history, 
-                                           terrain_heights=terrain_heights, 
-                                           foot_pos=foot_pos)
+                    actions = self.alg.act(obs, critic_obs, history, cmd_vel=cmd_vel)
                     
-                    # ========== 新增：获取预测落足点并传递给环境用于奖励计算 ==========
-                    if self.use_foothold_attention:
-                        pred_foothold = self.alg.get_pred_foothold()
-                        if hasattr(self.env, 'set_pred_foothold'):
-                            self.env.set_pred_foothold(pred_foothold)
+                    # ========== 获取名义落足点并传递给环境用于可视化/奖励计算 ==========
+                    if self.use_spatial_attention:
+                        nominal_foothold = self.alg.get_nominal_foothold()
+                        if hasattr(self.env, 'set_nominal_foothold'):
+                            self.env.set_nominal_foothold(nominal_foothold)
                     # ==============================================================
                     
                     obs, privileged_obs, rewards, dones, infos, _, terminal_amp_states, terminal_obs, terminal_critic_obs = self.env.step(actions)
@@ -278,9 +275,9 @@ class AMPOnPolicyRunnerMulti:
                         cur_episode_length[new_ids] = 0
                         cur_single_step_disc_rew[new_ids] = 0
 
-                # ========== 新增：收集注意力统计量 ==========
+                # ========== 收集注意力统计量 ==========
                 attention_stats = None
-                if self.use_foothold_attention:
+                if self.use_spatial_attention:
                     attention_stats = self.alg.get_attention_stats()
                 # ==============================================
 
@@ -344,12 +341,14 @@ class AMPOnPolicyRunnerMulti:
             self.writer.add_scalar('Train/mean_step_disc_reward', statistics.mean(locs['step_discrewbuffer']), locs['it'])
             self.writer.add_scalar('Train/mean_episode_length', statistics.mean(locs['lenbuffer']), locs['it'])
         
-        # ========== 新增：记录注意力统计量到tensorboard ==========
+        # ========== 记录注意力统计量到tensorboard ==========
         attention_stats = locs.get('attention_stats', None)
         if attention_stats is not None:
             self.writer.add_scalar('Attention/entropy', attention_stats['entropy'], locs['it'])
             self.writer.add_scalar('Attention/peak_value', attention_stats['peak_value'], locs['it'])
             self.writer.add_scalar('Attention/sparsity', attention_stats['sparsity'], locs['it'])
+            if 'T_stance' in attention_stats:
+                self.writer.add_scalar('Raibert/T_stance', attention_stats['T_stance'], locs['it'])
         # ==========================================================
 
         str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "
@@ -381,12 +380,14 @@ class AMPOnPolicyRunnerMulti:
                           f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
                           f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n""")
         
-        # ========== 新增：在控制台输出注意力统计量 ==========
+        # ========== 在控制台输出注意力统计量 ==========
         attention_stats = locs.get('attention_stats', None)
         if attention_stats is not None:
             log_string += (f"""{'Attention entropy:':>{pad}} {attention_stats['entropy']:.4f}\n"""
                            f"""{'Attention peak:':>{pad}} {attention_stats['peak_value']:.4f}\n"""
                            f"""{'Attention sparsity:':>{pad}} {attention_stats['sparsity']:.4f}\n""")
+            if 'T_stance' in attention_stats:
+                log_string += f"""{'Raibert T_stance:':>{pad}} {attention_stats['T_stance']:.4f}\n"""
         # =====================================================
 
         log_string += ep_string

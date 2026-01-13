@@ -304,16 +304,17 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         critic_hidden_dims = [512, 256, 128]
         his_latent_dim = 64
         
-        # ========== 落足点引导注意力参数 ==========
-        use_foothold_attention = True           # 是否启用落足点引导注意力
-        foothold_predictor_hidden = [256, 128]  # 落足点预测器隐藏层维度
-        attention_hidden_dim = 128              # 注意力模块隐藏维度
+        # ========== 空间感知注意力参数 (Spatial Attention) ==========
+        use_spatial_attention = True            # 是否启用空间感知注意力
+        spatial_feature_channels = 128          # 特征图通道数 (与 depth encoder 输出匹配)
+        spatial_feature_height = 5              # 特征图高度 (重塑后)
+        spatial_feature_width = 5               # 特征图宽度 (重塑后)
+        attention_hidden_dim = 128              # 注意力隐藏维度
         attention_heads = 4                     # 注意力头数
         attention_output_dim = 64               # 注意力输出维度
-        foothold_scale = 0.5                    # 落足点预测范围 (米)
-        terrain_dim = 187                       # 地形采样点数 (17x11)
-        foot_pos_dim = 6                        # 脚位置维度 (左脚xyz + 右脚xyz)
-        # ==========================================
+        T_stance = 0.25                         # Raibert 站立相时间 (秒)
+        learnable_T_stance = True               # 是否让 T_stance 可学习
+        # ==============================================================
 
     class algorithm( LeggedRobotCfgPPO.algorithm ):
         use_amp = False

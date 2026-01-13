@@ -91,125 +91,76 @@ class StackDepthEncoder(nn.Module):
         return depth_latent
 
 
-class FootholdPredictor(nn.Module):
+class SpatialAttentionEncoder(nn.Module):
     """
-    落足点预测器
+    空间感知注意力编码器 (Spatially-Aware Query Attention Encoder)
     
-    功能：根据本体感知和当前脚位置，预测下一步左右脚的落足点位置
-    
-    输入:
-        - obs: 本体感知 [B, obs_dim] (包含速度指令、关节状态等)
-        - foot_pos: 当前左右脚在身体坐标系下的位置 [B, 6] (左脚xyz + 右脚xyz)
-        
-    输出:
-        - pred_foothold: 预测的落足点偏移 [B, 4] (左脚dx,dy + 右脚dx,dy)
-          偏移是相对于机器人身体中心的坐标
-    """
-    def __init__(self, 
-                 obs_dim=57,                    # 本体感知维度
-                 foot_pos_dim=6,                # 脚位置维度 (左脚xyz + 右脚xyz)
-                 hidden_dims=[256, 128],        # 隐藏层维度
-                 output_dim=4,                  # 输出维度 (左脚dx,dy + 右脚dx,dy)
-                 foothold_scale=0.5):           # 落足点预测范围 (米)
-        super().__init__()
-        
-        self.foothold_scale = foothold_scale
-        input_dim = obs_dim + foot_pos_dim
-        
-        # 构建MLP网络
-        layers = []
-        layers.append(nn.Linear(input_dim, hidden_dims[0]))
-        layers.append(nn.ELU())
-        
-        for i in range(len(hidden_dims) - 1):
-            layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
-            layers.append(nn.ELU())
-        
-        # 输出层使用tanh限制范围
-        layers.append(nn.Linear(hidden_dims[-1], output_dim))
-        layers.append(nn.Tanh())
-        
-        self.mlp = nn.Sequential(*layers)
-        
-    def forward(self, obs, foot_pos):
-        """
-        前向传播
-        
-        Args:
-            obs: [B, obs_dim] 本体感知
-            foot_pos: [B, 6] 当前脚位置 (身体坐标系)
-            
-        Returns:
-            pred_foothold: [B, 4] 预测落足点 (左dx,dy, 右dx,dy)
-        """
-        # 拼接输入
-        x = torch.cat([obs, foot_pos], dim=-1)
-        
-        # 通过MLP预测
-        pred = self.mlp(x)
-        
-        # 缩放到实际物理范围
-        pred_foothold = pred * self.foothold_scale
-        
-        return pred_foothold
-
-
-class FootholdGuidedAttention(nn.Module):
-    """
-    落足点引导注意力机制
-    
-    创新点：使用 本体感知 + 预测落足点 作为Query，引导对地形的注意力
+    核心思想：基于 Raibert 启发式公式计算"名义落足点"作为空间先验，
+    结合本体感知信息生成 Query，主动查询地形特征图中相关区域。
     
     输入:
-        - obs: 本体感知 [B, obs_dim]
-        - pred_foothold: 预测的落足点 [B, 4]
-        - terrain_heights: 地形高度采样 [B, 187]
+        - feature_map: [B, C, H, W] 上游 CNN/Backbone 输出的地形特征图
+        - proprioception: [B, Proprio_Dim] 本体感知 (关节角、IMU等)
+        - cmd_vel: [B, 3] 用户指令速度
         
     输出:
-        - attended_feature: 注意力加权的地形特征 [B, output_dim]
-        - attn_weights: 注意力权重 [B, 17, 11] (用于可视化)
+        - context_vector: [B, output_dim] 注意力加权的地形特征
+        - attn_weights: [B, H, W] 注意力权重 (用于可视化)
+    
+    Raibert 公式 (简化版，部署友好):
+        p_nominal = (T_stance / 2) * v_cmd
     """
+    
     def __init__(self,
-                 obs_dim=57,                # 本体感知维度
-                 foothold_dim=4,            # 预测落足点维度
-                 terrain_dim=187,           # 地形采样点数 (17x11)
-                 hidden_dim=128,            # 隐藏层维度
-                 num_heads=4,               # 注意力头数
-                 output_dim=64):            # 输出特征维度
+                 feature_channels: int = 128,       # 特征图通道数 C
+                 feature_height: int = 5,           # 特征图高度 H (来自depth encoder)
+                 feature_width: int = 5,            # 特征图宽度 W
+                 proprio_dim: int = 57,             # 本体感知维度
+                 hidden_dim: int = 128,             # 隐藏层维度
+                 num_heads: int = 4,                # 注意力头数
+                 output_dim: int = 64,              # 输出特征维度
+                 T_stance: float = 0.25,            # 站立相时间 (秒)
+                 learnable_T_stance: bool = True):  # 是否让 T_stance 可学习
         super().__init__()
         
-        self.terrain_dim = terrain_dim
+        self.feature_channels = feature_channels
+        self.feature_height = feature_height
+        self.feature_width = feature_width
+        self.proprio_dim = proprio_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         
-        # ========== 1. Query生成器 ==========
-        # Query = 本体感知 + 预测落足点
-        query_input_dim = obs_dim + foothold_dim
-        self.query_net = nn.Sequential(
+        # ========== Raibert 参数 ==========
+        if learnable_T_stance:
+            self.T_stance = nn.Parameter(torch.tensor(T_stance))
+        else:
+            self.register_buffer('T_stance', torch.tensor(T_stance))
+        
+        # ========== Step B: Query 生成器 ==========
+        # Query = MLP(proprioception + p_nominal)
+        # p_nominal: [B, 2] (只用 x, y 两个维度)
+        query_input_dim = proprio_dim + 2  # proprio + nominal foothold (x, y)
+        self.query_mlp = nn.Sequential(
             nn.Linear(query_input_dim, hidden_dim),
             nn.ELU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
         
-        # ========== 2. 地形编码器 ==========
-        # 将每个高度点编码为高维特征
-        self.terrain_encoder = nn.Sequential(
-            nn.Linear(1, hidden_dim // 2),
-            nn.ELU(),
-            nn.Linear(hidden_dim // 2, hidden_dim)
+        # ========== Step C: 位置编码 + 特征融合 ==========
+        # 1x1 卷积将 (C + 2) 通道融合为 hidden_dim
+        self.coord_fusion = nn.Conv2d(
+            in_channels=feature_channels + 2,  # C + 2 (x, y 坐标)
+            out_channels=hidden_dim,
+            kernel_size=1,
+            stride=1,
+            padding=0
         )
         
-        # ========== 3. 可学习位置编码 ==========
-        # 让网络知道每个采样点的空间位置
-        self.position_encoding = nn.Parameter(
-            torch.randn(1, terrain_dim, hidden_dim) * 0.02
-        )
-        
-        # ========== 4. Key和Value投影 ==========
+        # ========== Step D: Key 和 Value 投影 ==========
         self.key_proj = nn.Linear(hidden_dim, hidden_dim)
         self.value_proj = nn.Linear(hidden_dim, hidden_dim)
         
-        # ========== 5. 多头交叉注意力 ==========
+        # ========== Step D: 多头交叉注意力 ==========
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
@@ -217,65 +168,152 @@ class FootholdGuidedAttention(nn.Module):
             dropout=0.1
         )
         
-        # ========== 6. 输出融合层 ==========
+        # ========== Step E: 输出融合层 ==========
         self.output_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),  # attended + global pooling
             nn.ELU(),
             nn.Linear(hidden_dim, output_dim)
         )
         
+        # 缓存：预生成坐标网格 (需要在 forward 时根据设备动态创建)
+        self._coord_grid = None
+        self._grid_shape = None
+        
         # 保存注意力权重用于可视化
         self.last_attn_weights = None
+        self.last_nominal_foothold = None
+    
+    def _get_coord_grid(self, H: int, W: int, device: torch.device) -> torch.Tensor:
+        """
+        生成归一化的 2D 坐标网格 [-1, 1]
         
-    def forward(self, obs, pred_foothold, terrain_heights):
+        Args:
+            H: 特征图高度
+            W: 特征图宽度
+            device: 目标设备
+            
+        Returns:
+            coord_grid: [1, 2, H, W] 坐标网格
+        """
+        # 检查缓存是否有效
+        if self._coord_grid is not None and self._grid_shape == (H, W) and self._coord_grid.device == device:
+            return self._coord_grid
+        
+        # 生成归一化坐标 [-1, 1]
+        # y 坐标: 从 -1 (顶部) 到 1 (底部)
+        # x 坐标: 从 -1 (左侧) 到 1 (右侧)
+        y_coords = torch.linspace(-1, 1, H, device=device)
+        x_coords = torch.linspace(-1, 1, W, device=device)
+        
+        # 创建网格 meshgrid
+        grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')  # [H, W], [H, W]
+        
+        # 堆叠为 [2, H, W] 并添加 batch 维度
+        coord_grid = torch.stack([grid_x, grid_y], dim=0).unsqueeze(0)  # [1, 2, H, W]
+        
+        # 缓存
+        self._coord_grid = coord_grid
+        self._grid_shape = (H, W)
+        
+        return coord_grid
+    
+    def compute_nominal_foothold(self, cmd_vel: torch.Tensor) -> torch.Tensor:
+        """
+        使用 Raibert 启发式公式计算名义落足点
+        
+        公式: p_nominal = (T_stance / 2) * v_cmd
+        
+        Args:
+            cmd_vel: [B, 3] 指令速度 (x, y, yaw)
+            
+        Returns:
+            p_nominal: [B, 2] 名义落足点位置 (x, y)
+        """
+        # 只使用 x, y 分量
+        v_cmd = cmd_vel[:, :2]  # [B, 2]
+        
+        # 根据指令速度计算期望落足点
+        p_nominal = (self.T_stance / 2.0) * v_cmd
+        
+        return p_nominal  # [B, 2]
+    
+    def forward(self, 
+                feature_map: torch.Tensor,
+                proprioception: torch.Tensor,
+                cmd_vel: torch.Tensor) -> tuple:
         """
         前向传播
         
         Args:
-            obs: [B, obs_dim] 本体感知
-            pred_foothold: [B, 4] 预测落足点
-            terrain_heights: [B, 187] 地形高度采样
+            feature_map: [B, C, H, W] 上游特征图
+            proprioception: [B, Proprio_Dim] 本体感知
+            cmd_vel: [B, 3] 指令速度
             
         Returns:
-            output: [B, output_dim] 注意力加权的地形特征
-            attn_weights: [B, 17, 11] 注意力权重热力图
+            context_vector: [B, output_dim] 注意力加权的地形特征
+            attn_weights: [B, H, W] 注意力权重热力图
         """
-        B = obs.shape[0]
+        B, C, H, W = feature_map.shape
+        device = feature_map.device
         
-        # Step 1: 生成Query (本体感知 + 预测落足点)
-        query_input = torch.cat([obs, pred_foothold], dim=-1)
-        query = self.query_net(query_input).unsqueeze(1)  # [B, 1, hidden_dim]
+        # ========== Step A: 计算名义落足点 (Raibert Heuristic) ==========
+        p_nominal = self.compute_nominal_foothold(cmd_vel)  # [B, 2]
+        self.last_nominal_foothold = p_nominal  # 保存用于可视化/奖励
         
-        # Step 2: 编码地形高度点
-        heights_expanded = terrain_heights.unsqueeze(-1)  # [B, 187, 1]
-        terrain_features = self.terrain_encoder(heights_expanded)  # [B, 187, hidden_dim]
+        # ========== Step B: 构建空间感知 Query ==========
+        # 拼接 proprioception 和 p_nominal
+        query_input = torch.cat([proprioception, p_nominal], dim=-1)  # [B, proprio_dim + 2]
+        query = self.query_mlp(query_input).unsqueeze(1)  # [B, 1, hidden_dim]
         
-        # Step 3: 添加位置编码
-        terrain_features = terrain_features + self.position_encoding
+        # ========== Step C: 构建包含位置信息的 Key 和 Value ==========
+        # C.1: 生成坐标网格
+        coord_grid = self._get_coord_grid(H, W, device)  # [1, 2, H, W]
+        coord_grid = coord_grid.expand(B, -1, -1, -1)    # [B, 2, H, W]
         
-        # Step 4: 生成Key和Value
-        keys = self.key_proj(terrain_features)    # [B, 187, hidden_dim]
-        values = self.value_proj(terrain_features)  # [B, 187, hidden_dim]
+        # C.2: 拼接特征图和坐标网格
+        feature_with_coords = torch.cat([feature_map, coord_grid], dim=1)  # [B, C+2, H, W]
         
-        # Step 5: 交叉注意力
+        # C.3: 通过 1x1 卷积融合坐标信息
+        fused_features = self.coord_fusion(feature_with_coords)  # [B, hidden_dim, H, W]
+        
+        # C.4: 展平并重排维度 [B, hidden_dim, H, W] -> [B, H*W, hidden_dim]
+        fused_features = fused_features.flatten(2).permute(0, 2, 1)  # [B, H*W, hidden_dim]
+        
+        # C.5: 生成 Key 和 Value
+        keys = self.key_proj(fused_features)    # [B, H*W, hidden_dim]
+        values = self.value_proj(fused_features)  # [B, H*W, hidden_dim]
+        
+        # ========== Step D: 多头注意力机制 ==========
+        # Query: [B, 1, hidden_dim]
+        # Keys:  [B, H*W, hidden_dim]
+        # Values: [B, H*W, hidden_dim]
         attended, attn_weights = self.cross_attention(
             query=query,
             key=keys,
             value=values
-        )  # attended: [B, 1, hidden_dim], attn_weights: [B, 1, 187]
+        )  # attended: [B, 1, hidden_dim], attn_weights: [B, 1, H*W]
         
-        # Step 6: 全局地形特征作为补充
-        global_terrain = terrain_features.mean(dim=1)  # [B, hidden_dim]
+        # ========== Step E: 输出融合 ==========
+        # E.1: 全局地形特征作为补充 (平均池化)
+        global_feature = fused_features.mean(dim=1)  # [B, hidden_dim]
         
-        # Step 7: 融合注意力输出和全局特征
+        # E.2: 融合注意力输出和全局特征
         attended = attended.squeeze(1)  # [B, hidden_dim]
-        fused = torch.cat([attended, global_terrain], dim=-1)  # [B, hidden_dim * 2]
-        output = self.output_mlp(fused)  # [B, output_dim]
+        fused_output = torch.cat([attended, global_feature], dim=-1)  # [B, hidden_dim * 2]
+        context_vector = self.output_mlp(fused_output)  # [B, output_dim]
         
-        # 保存并reshape注意力权重用于可视化
-        self.last_attn_weights = attn_weights.squeeze(1).view(B, 17, 11)
+        # E.3: 重塑注意力权重用于可视化 [B, 1, H*W] -> [B, H, W]
+        self.last_attn_weights = attn_weights.squeeze(1).view(B, H, W)
         
-        return output, self.last_attn_weights
+        return context_vector, self.last_attn_weights
+    
+    def get_nominal_foothold(self) -> torch.Tensor:
+        """获取最近一次计算的名义落足点"""
+        return self.last_nominal_foothold
+    
+    def get_attention_weights(self) -> torch.Tensor:
+        """获取最近一次的注意力权重，用于可视化"""
+        return self.last_attn_weights
 
 
 class ActorCriticDepth(nn.Module):
@@ -291,15 +329,16 @@ class ActorCriticDepth(nn.Module):
                         activation='elu',
                         init_noise_std=1.0,
                         max_grad_norm=10.0,
-                        # ========== 落足点引导注意力参数 ==========
-                        use_foothold_attention=False,       # 是否启用落足点引导注意力
-                        foothold_predictor_hidden=[256, 128],  # 落足点预测器隐藏层
+                        # ========== 空间感知注意力参数 ==========
+                        use_spatial_attention=False,        # 是否启用空间感知注意力
+                        spatial_feature_channels=128,       # 深度编码器输出通道数
+                        spatial_feature_height=5,           # 特征图高度 (根据depth encoder)
+                        spatial_feature_width=5,            # 特征图宽度
                         attention_hidden_dim=128,           # 注意力隐藏维度
                         attention_heads=4,                  # 注意力头数
                         attention_output_dim=64,            # 注意力输出维度
-                        foothold_scale=0.5,                 # 落足点预测范围 (米)
-                        terrain_dim=187,                    # 地形采样点数
-                        foot_pos_dim=6,                     # 脚位置维度
+                        T_stance=0.25,                      # Raibert站立相时间 (秒)
+                        learnable_T_stance=True,            # 是否让T_stance可学习
                         # ==========================================
                         **kwargs):
         if kwargs:
@@ -309,51 +348,52 @@ class ActorCriticDepth(nn.Module):
 
         self.his_latent_dim = his_latent_dim
         self.max_grad_norm = max_grad_norm
-        self.use_foothold_attention = use_foothold_attention
+        self.use_spatial_attention = use_spatial_attention
         self.num_actor_obs = num_actor_obs
 
         # depth encoder
         depth_backbone = DepthOnlyFCBackbone58x87(output_dim=128, output_activation=activation)
         self.depth_encoder = StackDepthEncoder(depth_backbone, buffer_len=2)
+        self.depth_output_dim = depth_backbone.output_dim  # 128
 
-        # ========== 落足点引导注意力模块 ==========
-        if use_foothold_attention:
-            print("========== 落足点引导注意力 ENABLED ==========")
+        # ========== 空间感知注意力模块 ==========
+        if use_spatial_attention:
+            print("========== 空间感知注意力 (Spatial Attention) ENABLED ==========")
             
-            # 落足点预测器
-            self.foothold_predictor = FootholdPredictor(
-                obs_dim=num_actor_obs,
-                foot_pos_dim=foot_pos_dim,
-                hidden_dims=foothold_predictor_hidden,
-                output_dim=4,  # 左脚dx,dy + 右脚dx,dy
-                foothold_scale=foothold_scale
-            )
-            
-            # 落足点引导注意力
-            self.foothold_attention = FootholdGuidedAttention(
-                obs_dim=num_actor_obs,
-                foothold_dim=4,
-                terrain_dim=terrain_dim,
+            # 空间感知注意力编码器
+            self.spatial_attention = SpatialAttentionEncoder(
+                feature_channels=spatial_feature_channels,
+                feature_height=spatial_feature_height,
+                feature_width=spatial_feature_width,
+                proprio_dim=num_actor_obs,
                 hidden_dim=attention_hidden_dim,
                 num_heads=attention_heads,
-                output_dim=attention_output_dim
+                output_dim=attention_output_dim,
+                T_stance=T_stance,
+                learnable_T_stance=learnable_T_stance
             )
             
-            # Actor输入维度: obs + history + depth + attention
-            mlp_input_dim_a = num_actor_obs + his_latent_dim + depth_backbone.output_dim + attention_output_dim
-            print(f"Actor输入维度 (带注意力): {mlp_input_dim_a}")
+            # 特征图投影层：将 depth_encoder 的 1D 输出重塑为 2D 特征图
+            # depth_encoder 输出 128 维，需要投影到 [C, H, W] = [128, 5, 5]
+            self.feature_reshape_dim = spatial_feature_channels * spatial_feature_height * spatial_feature_width
+            self.feature_proj = nn.Linear(self.depth_output_dim, self.feature_reshape_dim)
+            self.spatial_feature_shape = (spatial_feature_channels, spatial_feature_height, spatial_feature_width)
+            
+            # Actor输入维度: obs + history + depth + spatial_attention
+            mlp_input_dim_a = num_actor_obs + his_latent_dim + self.depth_output_dim + attention_output_dim
+            print(f"Actor输入维度 (带空间注意力): {mlp_input_dim_a}")
         else:
-            print("========== 落足点引导注意力 DISABLED ==========")
-            self.foothold_predictor = None
-            self.foothold_attention = None
-            mlp_input_dim_a = num_actor_obs + his_latent_dim + depth_backbone.output_dim
-            print(f"Actor输入维度 (无注意力): {mlp_input_dim_a}")
+            print("========== 空间感知注意力 DISABLED ==========")
+            self.spatial_attention = None
+            self.feature_proj = None
+            mlp_input_dim_a = num_actor_obs + his_latent_dim + self.depth_output_dim
+            print(f"Actor输入维度 (无空间注意力): {mlp_input_dim_a}")
         # ============================================
         
         mlp_input_dim_c = num_critic_obs + his_latent_dim
         
-        # 保存预测的落足点，供环境计算奖励使用
-        self.last_pred_foothold = None
+        # 保存名义落足点，供环境计算奖励使用
+        self.last_nominal_foothold = None
         
         # History Encoder
         encoder_layers = []
@@ -428,7 +468,7 @@ class ActorCriticDepth(nn.Module):
         mean = self.actor(observations)
         self.distribution = Normal(mean, mean*0. + self.std)
 
-    def act(self, observations, history, depth, foot_pos=None, terrain_heights=None, **kwargs):
+    def act(self, observations, history, depth, cmd_vel=None, **kwargs):
         """
         根据观测生成动作
         
@@ -436,8 +476,7 @@ class ActorCriticDepth(nn.Module):
             observations: [B, obs_dim] 本体感知
             history: [B, history_len, obs_dim] 历史观测
             depth: [B, buffer_len, H, W] 深度图像
-            foot_pos: [B, 6] 当前脚位置 (启用注意力时需要)
-            terrain_heights: [B, 187] 地形高度采样 (启用注意力时需要)
+            cmd_vel: [B, 3] 指令速度 (启用空间注意力时必须)
             
         Returns:
             actions: [B, num_actions] 采样的动作
@@ -447,23 +486,29 @@ class ActorCriticDepth(nn.Module):
         his_feature = self.history_encoder(history)
         
         # 编码深度图像
-        depth_feature = self.depth_encoder(depth)
+        depth_feature = self.depth_encoder(depth)  # [B, 128]
         
-        # 落足点引导注意力
-        if self.use_foothold_attention and foot_pos is not None and terrain_heights is not None:
-            # 预测落足点
-            pred_foothold = self.foothold_predictor(observations, foot_pos)
-            self.last_pred_foothold = pred_foothold  # 保存供环境计算奖励
+        # 空间感知注意力
+        if self.use_spatial_attention and cmd_vel is not None:
+            # 将深度特征投影并重塑为 2D 特征图
+            feature_flat = self.feature_proj(depth_feature)  # [B, C*H*W]
+            B = feature_flat.shape[0]
+            feature_map = feature_flat.view(B, *self.spatial_feature_shape)  # [B, C, H, W]
             
-            # 使用落足点引导注意力
-            attn_feature, _ = self.foothold_attention(observations, pred_foothold, terrain_heights)
+            # 使用空间感知注意力
+            attn_feature, _ = self.spatial_attention(
+                feature_map=feature_map,
+                proprioception=observations,
+                cmd_vel=cmd_vel
+            )
+            self.last_nominal_foothold = self.spatial_attention.get_nominal_foothold()
             
             # 拼接所有特征
             actor_input = torch.cat((observations, his_feature, depth_feature, attn_feature), dim=-1)
         else:
             # 原始逻辑
             actor_input = torch.cat((observations, his_feature, depth_feature), dim=-1)
-            self.last_pred_foothold = None
+            self.last_nominal_foothold = None
         
         self.update_distribution(actor_input)
         return self.distribution.sample()
@@ -471,7 +516,7 @@ class ActorCriticDepth(nn.Module):
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
-    def act_inference(self, observations, history, depth, foot_pos=None, terrain_heights=None, **kwargs):
+    def act_inference(self, observations, history, depth, cmd_vel=None, **kwargs):
         """
         推理时生成动作（无采样噪声）
         
@@ -479,37 +524,46 @@ class ActorCriticDepth(nn.Module):
             observations: [B, obs_dim] 本体感知
             history: [B, history_len, obs_dim] 历史观测
             depth: [B, buffer_len, H, W] 深度图像
-            foot_pos: [B, 6] 当前脚位置
-            terrain_heights: [B, 187] 地形高度采样
+            cmd_vel: [B, 3] 指令速度
             
         Returns:
             actions_mean: [B, num_actions] 动作均值
         """
         history = history.flatten(1)
         his_feature = self.history_encoder(history)
-        depth_feature = self.depth_encoder(depth)
+        depth_feature = self.depth_encoder(depth)  # [B, 128]
         
-        # 落足点引导注意力
-        if self.use_foothold_attention and foot_pos is not None and terrain_heights is not None:
-            pred_foothold = self.foothold_predictor(observations, foot_pos)
-            self.last_pred_foothold = pred_foothold
-            attn_feature, _ = self.foothold_attention(observations, pred_foothold, terrain_heights)
+        # 空间感知注意力
+        if self.use_spatial_attention and cmd_vel is not None:
+            # 将深度特征投影并重塑为 2D 特征图
+            feature_flat = self.feature_proj(depth_feature)  # [B, C*H*W]
+            B = feature_flat.shape[0]
+            feature_map = feature_flat.view(B, *self.spatial_feature_shape)  # [B, C, H, W]
+            
+            # 使用空间感知注意力
+            attn_feature, _ = self.spatial_attention(
+                feature_map=feature_map,
+                proprioception=observations,
+                cmd_vel=cmd_vel
+            )
+            self.last_nominal_foothold = self.spatial_attention.get_nominal_foothold()
+            
             actor_input = torch.cat((observations, his_feature, depth_feature, attn_feature), dim=-1)
         else:
             actor_input = torch.cat((observations, his_feature, depth_feature), dim=-1)
-            self.last_pred_foothold = None
+            self.last_nominal_foothold = None
         
         actions_mean = self.actor(actor_input)
         return actions_mean
     
-    def get_pred_foothold(self):
-        """获取最近一次预测的落足点"""
-        return self.last_pred_foothold
+    def get_nominal_foothold(self):
+        """获取最近一次计算的名义落足点 (Raibert Heuristic)"""
+        return self.last_nominal_foothold
     
     def get_attention_weights(self):
         """获取最近一次的注意力权重，用于可视化"""
-        if self.use_foothold_attention and self.foothold_attention is not None:
-            return self.foothold_attention.last_attn_weights
+        if self.use_spatial_attention and self.spatial_attention is not None:
+            return self.spatial_attention.get_attention_weights()
         return None
     
     def get_attention_stats(self):
@@ -520,36 +574,41 @@ class ActorCriticDepth(nn.Module):
             dict: 包含以下指标:
                 - entropy: 注意力分布熵 (越低说明注意力越集中)
                 - peak_value: 注意力最大值 (越高说明有明确的关注焦点)
-                - sparsity: 注意力稀疏度 (top-10%占总注意力的比例)
+                - sparsity: 注意力稀疏度 (top-k占总注意力的比例)
+                - T_stance: 当前的站立相时间参数
         """
-        if not self.use_foothold_attention or self.foothold_attention is None:
+        if not self.use_spatial_attention or self.spatial_attention is None:
             return None
         
-        attn_weights = self.foothold_attention.last_attn_weights  # [B, 17, 11]
+        attn_weights = self.spatial_attention.last_attn_weights  # [B, H, W]
         if attn_weights is None:
             return None
         
         with torch.no_grad():
-            # 展平为 [B, 187]
+            # 展平为 [B, H*W]
             attn_flat = attn_weights.view(attn_weights.shape[0], -1)
+            num_elements = attn_flat.shape[-1]
             
             # 1. 注意力熵: 衡量分布集中程度
-            # H = -sum(p * log(p)), 最大值为 log(187) ≈ 5.23 (均匀分布)
             attn_probs = attn_flat + 1e-8  # 防止log(0)
             entropy = -torch.sum(attn_probs * torch.log(attn_probs), dim=-1).mean()
             
             # 2. 注意力峰值: 最大注意力值
             peak_value = attn_flat.max(dim=-1)[0].mean()
             
-            # 3. 注意力稀疏度: top-10的注意力占总注意力的比例
-            # 如果注意力集中在少数点上，这个值接近1
-            topk_values, _ = torch.topk(attn_flat, k=min(10, attn_flat.shape[-1]), dim=-1)
-            sparsity = (topk_values.sum(dim=-1) / attn_flat.sum(dim=-1)).mean()
+            # 3. 注意力稀疏度: top-k的注意力占总注意力的比例
+            k = min(5, num_elements)  # 对于小特征图，使用 top-5
+            topk_values, _ = torch.topk(attn_flat, k=k, dim=-1)
+            sparsity = (topk_values.sum(dim=-1) / (attn_flat.sum(dim=-1) + 1e-8)).mean()
+            
+            # 4. T_stance 参数
+            T_stance = self.spatial_attention.T_stance.item()
             
             return {
                 'entropy': entropy.item(),
                 'peak_value': peak_value.item(),
                 'sparsity': sparsity.item(),
+                'T_stance': T_stance,
             }
     
     def evaluate(self, critic_observations, history, **kwargs):

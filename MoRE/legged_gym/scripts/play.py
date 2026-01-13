@@ -75,7 +75,7 @@ def play(args):
     
     # 获取 actor_critic 模型引用，用于获取注意力权重
     actor_critic = ppo_runner.alg.actor_critic
-    use_foothold_attention = hasattr(actor_critic, 'use_foothold_attention') and actor_critic.use_foothold_attention
+    use_spatial_attention = hasattr(actor_critic, 'use_spatial_attention') and actor_critic.use_spatial_attention
 
     # process trajectory history
     num_gait = env.cfg.env.num_gait if hasattr(env.cfg.env, 'num_gait') else 0
@@ -105,30 +105,32 @@ def play(args):
         if env.cfg.depth.warp_camera or env.cfg.depth.use_camera:
             obs = (obs, depth_image)
 
-        # 准备落足点注意力所需的额外输入
-        foot_pos = None
-        terrain_heights = None
-        if use_foothold_attention:
-            # foot_pos: [num_envs, 6] 左右脚在身体坐标系下的xyz位置
-            foot_pos = env.footpos_in_body_frame.reshape(env.num_envs, -1)
-            # terrain_heights: [num_envs, 187] 采样点高度
-            if hasattr(env, 'measured_heights') and isinstance(env.measured_heights, torch.Tensor):
-                terrain_heights = env.measured_heights
+        # 准备空间感知注意力所需的额外输入
+        cmd_vel = None
+        if use_spatial_attention:
+            # G1 环境的 obs_buf 结构:
+            # [cmd(3), ang_vel(3), gravity(3), dof_pos(16), dof_vel(16), actions(16)] = 57 维
+            
+            # cmd_vel: 从 obs 的前 3 维获取指令速度 [num_envs, 3]
+            obs_tensor = obs[0] if isinstance(obs, tuple) else obs
+            cmd_vel = obs_tensor[:, :3]
 
         if isinstance(obs, tuple):
-            # 使用深度图的模型，支持落足点注意力
+            # 使用深度图的模型，支持空间感知注意力
             actions = policy(obs[0].detach(), trajectory_history.detach(), obs[1][:, :2, ...].detach(),
-                           foot_pos=foot_pos, terrain_heights=terrain_heights)
+                           cmd_vel=cmd_vel)
         else:
-            # 不使用深度图的模型，不支持落足点注意力
+            # 不使用深度图的模型
             actions = policy(obs.detach(), trajectory_history)
         
-        # 获取并传递注意力权重和预测落脚点给环境（用于可视化）
-        if use_foothold_attention:
-            pred_foothold = actor_critic.get_pred_foothold()
+        # 获取并传递注意力权重和名义落足点给环境（用于可视化）
+        if use_spatial_attention:
+            nominal_foothold = actor_critic.get_nominal_foothold()
             attn_weights = actor_critic.get_attention_weights()
-            env.set_pred_foothold(pred_foothold)
-            env.set_attention_weights(attn_weights)
+            if hasattr(env, 'set_nominal_foothold'):
+                env.set_nominal_foothold(nominal_foothold)
+            if hasattr(env, 'set_attention_weights'):
+                env.set_attention_weights(attn_weights)
         
         obs, _, _, dones, infos, *_= env.step(actions.detach())
 
