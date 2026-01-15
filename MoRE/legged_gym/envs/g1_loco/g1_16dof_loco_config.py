@@ -244,9 +244,9 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         heading_command = True  # if true: compute ang vel command from heading error
         class ranges(LeggedRobotCfg.commands.ranges):
             lin_vel_x = [-0.5, 1.3] # min max [m/s]  # 提高最大速度，使跨越动作更自然
-            lin_vel_y = [-1.0, 1.0]   # min max [m/s]
-            ang_vel_yaw = [-1, 1]    # min max [rad/s]
-            heading = [-3.14, 3.14]
+            lin_vel_y = [-0.5, 0.5]   # min max [m/s]  # 减小侧向速度，避免偏离直线
+            ang_vel_yaw = [-0.3, 0.3]    # min max [rad/s]  # 减小角速度，大多数地形需要直行
+            heading = [-0.5, 0.5]  # 约 ±30度，限制转向范围
 
     class rewards( LeggedRobotCfg.rewards ):
         soft_dof_pos_limit = 0.9
