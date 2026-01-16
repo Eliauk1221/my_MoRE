@@ -40,7 +40,11 @@ import wandb
 
 from rsl_rl.algorithms.amp_ppo_multi import AMPPPOMulti
 from rsl_rl.modules.actor_critic import ActorCritic
-from rsl_rl.modules.actor_critic_depth import ActorCriticDepth
+from rsl_rl.modules.actor_critic_depth import (
+    ActorCriticDepth,           # 默认（高度点方案）
+    ActorCriticDepthImage,      # 深度图像方案
+    ActorCriticDepthHeightPoint,  # 高度点方案（显式名称）
+)
 from rsl_rl.env import VecEnv
 from rsl_rl.algorithms.amp_discriminator_multi import AMPDiscriminatorMulti
 from legged_gym.datasets.motion_loader_g1 import G1_AMPLoader
@@ -80,7 +84,24 @@ class AMPOnPolicyRunnerMulti:
         else:
             num_critic_obs = self.env.num_obs
         num_actor_obs = self.env.num_obs
-        actor_critic_class = eval(self.cfg["policy_class_name"]) # ActorCritic
+        
+        # ========== 根据 attention_type 自动选择 ActorCritic 类 ==========
+        policy_class_name = self.cfg["policy_class_name"]
+        attention_type = self.policy_cfg.get("attention_type", "heightpoint")
+        use_spatial_attention = self.policy_cfg.get("use_spatial_attention", False)
+        
+        # 只有当启用空间注意力且类名是通用的 ActorCriticDepth 时才自动选择
+        if use_spatial_attention and policy_class_name == "ActorCriticDepth":
+            if attention_type == "image":
+                actor_critic_class = ActorCriticDepthImage
+                print(f"[Runner] 自动选择深度图像方案 (attention_type={attention_type})")
+            else:  # "heightpoint" 或其他
+                actor_critic_class = ActorCriticDepthHeightPoint
+                print(f"[Runner] 自动选择高度点方案 (attention_type={attention_type})")
+        else:
+            actor_critic_class = eval(policy_class_name)
+        # ================================================================
+        
         actor_critic: ActorCritic = actor_critic_class( num_actor_obs=num_actor_obs,
                                                         num_critic_obs=num_critic_obs,
                                                         num_actions=self.env.num_actions,
@@ -123,6 +144,11 @@ class AMPOnPolicyRunnerMulti:
         self.num_amp_frames = train_cfg['runner']['num_amp_frames']
 
         # init storage and model
+        # 获取空间注意力参数
+        _use_spatial_attention = self.policy_cfg.get("use_spatial_attention", False)
+        _num_points_x = self.policy_cfg.get("num_points_x", 17)
+        _num_points_y = self.policy_cfg.get("num_points_y", 11)
+        
         self.alg.init_storage(self.env.num_envs, 
                               self.num_steps_per_env, 
                               [num_actor_obs], 
@@ -131,7 +157,10 @@ class AMPOnPolicyRunnerMulti:
                               self.obs_history_len, 
                               self.env.num_obs,
                               depth_shape=self.depth_shape if self.use_depth else None,
-                              depth_buffer_len=self.env.cfg.depth.buffer_len if self.use_depth else None)
+                              depth_buffer_len=self.env.cfg.depth.buffer_len if self.use_depth else None,
+                              use_spatial_attention=_use_spatial_attention,
+                              num_points_x=_num_points_x,
+                              num_points_y=_num_points_y)
 
         # Log
         self.log_dir = log_dir
@@ -213,6 +242,8 @@ class AMPOnPolicyRunnerMulti:
 
                     # ========== 提取空间感知注意力需要的数据 ==========
                     cmd_vel = None
+                    height_points = None
+                    v_current = None
                     if self.use_spatial_attention:
                         # G1 环境的观测结构:
                         # obs_buf: [cmd(3), ang_vel(3), gravity(3), dof_pos(16), dof_vel(16), actions(16)] = 57 维
@@ -220,9 +251,17 @@ class AMPOnPolicyRunnerMulti:
                         # cmd_vel: 从 obs_buf 的前 3 维获取指令速度 [B, 3]
                         obs_tensor = obs[0] if isinstance(obs, tuple) else obs
                         cmd_vel = obs_tensor[:, :3]
+                        
+                        # height_points: 获取带高度的地形采样点 [B, 17, 11, 3]
+                        if hasattr(self.env, 'get_height_points_with_heights'):
+                            height_points = self.env.get_height_points_with_heights()
+                        
+                        # v_current: 当前基座速度 [B, 3]，用于完整版 Raibert 公式
+                        if hasattr(self.env, 'base_lin_vel'):
+                            v_current = self.env.base_lin_vel.clone()
                     # ==============================================================
 
-                    actions = self.alg.act(obs, critic_obs, history, cmd_vel=cmd_vel)
+                    actions = self.alg.act(obs, critic_obs, history, height_points=height_points, cmd_vel=cmd_vel, v_current=v_current)
                     
                     # ========== 获取名义落足点并传递给环境用于可视化/奖励计算 ==========
                     if self.use_spatial_attention:

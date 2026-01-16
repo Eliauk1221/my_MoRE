@@ -125,10 +125,12 @@ class AMPPPOMulti:
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
 
-    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, history_len, history_dim, depth_shape=None, depth_buffer_len=None):
+    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, history_len, history_dim, depth_shape=None, depth_buffer_len=None,
+                     use_spatial_attention=False, num_points_x=17, num_points_y=11):
         self.storage = RolloutStorage(
             num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device, history_len, history_dim, depth_shape, depth_buffer_len,
-            use_foothold_predictor=self.use_foothold_predictor)
+            use_foothold_predictor=self.use_foothold_predictor,
+            use_spatial_attention=use_spatial_attention, num_points_x=num_points_x, num_points_y=num_points_y)
 
     def test_mode(self):
         self.actor_critic.test()
@@ -136,7 +138,7 @@ class AMPPPOMulti:
     def train_mode(self):
         self.actor_critic.train()
 
-    def act(self, obs, critic_obs, history, cmd_vel=None):
+    def act(self, obs, critic_obs, history, height_points=None, cmd_vel=None, v_current=None):
         """
         根据观测计算动作
         
@@ -144,7 +146,9 @@ class AMPPPOMulti:
             obs: 观测 (可能是tuple: (obs, depth_image))
             critic_obs: critic使用的观测
             history: 历史观测序列
+            height_points: 地形高度采样点 [B, 17, 11, 3] (用于基于高度点的空间感知注意力)
             cmd_vel: 指令速度 [B, 3] (用于空间感知注意力)
+            v_current: 当前速度 [B, 3] (用于完整版 Raibert 公式)
         
         返回:
             actions: 动作
@@ -160,7 +164,9 @@ class AMPPPOMulti:
                 aug_obs, 
                 history, 
                 depth_image[:, :2, ...],
-                cmd_vel=cmd_vel
+                height_points=height_points,
+                cmd_vel=cmd_vel,
+                v_current=v_current
             ).detach()
             self.transition.observations = obs[0]
             self.transition.depth_image = obs[1]
@@ -170,7 +176,9 @@ class AMPPPOMulti:
             self.transition.actions = self.actor_critic.act(
                 aug_obs, 
                 history,
-                cmd_vel=cmd_vel
+                height_points=height_points,
+                cmd_vel=cmd_vel,
+                v_current=v_current
             ).detach()
             self.transition.observations = obs
         
@@ -184,6 +192,17 @@ class AMPPPOMulti:
         self.transition.history = history
         self.transition.critic_observations = critic_obs
         self.transition.cmd_vel = cmd_vel
+        
+        # ========== 保存空间感知注意力需要的数据 ==========
+        if height_points is not None:
+            self.transition.height_points = height_points.detach()
+        else:
+            self.transition.height_points = None
+        if v_current is not None:
+            self.transition.v_current = v_current.detach()
+        else:
+            self.transition.v_current = None
+        # ==================================================
         
         # ========== 保存预测的落足点修正量（用于后续存储） ==========
         if self.use_foothold_predictor:
@@ -336,7 +355,8 @@ class AMPPPOMulti:
         
         for obs_batch, critic_obs_batch, actions_batch, next_obs_batch, next_critic_observations_batch, history_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
             old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, depth_image_batch, \
-            pred_footholds_batch, target_footholds_batch, foothold_mask_batch in generator:
+            pred_footholds_batch, target_footholds_batch, foothold_mask_batch, \
+            height_points_batch, v_current_batch in generator:
 
             aug_obs_batch, history_batch = obs_batch.detach(), history_batch.detach()
             
@@ -354,7 +374,9 @@ class AMPPPOMulti:
                     aug_obs_batch, 
                     history_batch, 
                     aug_depth_image_batch[:, :2, ...],
-                    cmd_vel=cmd_vel_batch
+                    height_points=height_points_batch,
+                    cmd_vel=cmd_vel_batch,
+                    v_current=v_current_batch
                 )
             else:
                 self.actor_critic.act(
@@ -362,7 +384,9 @@ class AMPPPOMulti:
                     history_batch, 
                     masks=masks_batch, 
                     hidden_states=hid_states_batch[0],
-                    cmd_vel=cmd_vel_batch
+                    height_points=height_points_batch,
+                    cmd_vel=cmd_vel_batch,
+                    v_current=v_current_batch
                 )
             
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)

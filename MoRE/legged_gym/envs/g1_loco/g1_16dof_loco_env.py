@@ -7,6 +7,7 @@ from legged_gym.utils.isaacgym_utils import get_euler_xyz as get_euler_xyz_in_te
 from legged_gym.datasets.motion_loader_g1 import G1_AMPLoader
 import torch
 import cv2
+import numpy as np
 import torch.nn.functional as F
 
 class G1_16Dof_Loco_Robot(LeggedRobot):
@@ -55,8 +56,12 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         # ========== 落足点引导注意力相关 ==========
         # 存储策略网络预测的落足点 [num_envs, 4] (左脚dx,dy + 右脚dx,dy)
         self.pred_foothold = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device, requires_grad=False)
-        # 存储注意力权重 [num_envs, 17, 11] 用于可视化
-        self.attention_weights = torch.zeros(self.num_envs, 17, 11, dtype=torch.float, device=self.device, requires_grad=False)
+        # 存储注意力权重，尺寸根据方案不同:
+        #   - 高度点方案: [num_envs, 17, 11]
+        #   - 深度图像方案: [num_envs, 5, 5]
+        # 初始化为 None，在第一次 set_attention_weights 时自动分配
+        self.attention_weights = None
+        self.attention_shape = None  # 记录注意力权重的形状
         
         # ========== 落足点预测辅助任务相关 ==========
         # 存储名义落足点 (Raibert Heuristic) [num_envs, 2] - 来自策略网络
@@ -82,7 +87,8 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         self.last_feet_contact_force[env_ids] = 0.
         self.last_last_feet_contact_force[env_ids] = 0.
         self.pred_foothold[env_ids] = 0.  # 重置预测落足点
-        self.attention_weights[env_ids] = 0.  # 重置注意力权重
+        if self.attention_weights is not None:
+            self.attention_weights[env_ids] = 0.  # 重置注意力权重
         self.nominal_foothold[env_ids] = 0.  # 重置名义落足点
         self.target_footholds[env_ids] = 0.  # 重置目标落足点
         self.foothold_mask[env_ids] = 0.  # 重置 swing mask
@@ -90,12 +96,64 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
     def set_attention_weights(self, attn_weights):
         """
         从策略网络接收注意力权重，用于可视化
+        自动适配不同尺寸:
+          - 高度点方案: [num_envs, 17, 11]
+          - 深度图像方案: [num_envs, 5, 5]
         
         Args:
-            attn_weights: [num_envs, 17, 11] 注意力权重热力图
+            attn_weights: [num_envs, H, W] 注意力权重热力图
         """
         if attn_weights is not None:
+            # 首次调用时自动初始化 buffer
+            if self.attention_weights is None or self.attention_shape != attn_weights.shape[1:]:
+                self.attention_shape = attn_weights.shape[1:]
+                self.attention_weights = torch.zeros(
+                    self.num_envs, *self.attention_shape, 
+                    dtype=torch.float, device=self.device, requires_grad=False
+                )
+                print(f"[Env] 注意力权重 buffer 初始化为: {self.attention_weights.shape}")
             self.attention_weights[:] = attn_weights.detach()
+    
+    def get_height_points_with_heights(self):
+        """
+        获取带有测量高度的地形采样点，用于空间注意力模块
+        
+        Returns:
+            height_points_with_z: [num_envs, num_x, num_y, 3] 地形高度采样点
+                - 前两维 (x, y) 是局部坐标系下的采样点位置
+                - 第三维 z 是归一化后的相对高度
+        
+        注意: 
+            - height_points 是在 base frame 下定义的采样点网格
+            - measured_heights 是每个采样点相对于机器人脚下的高度差
+            - 归一化: z = clip(base_height - measured_height, -1, 1)
+        """
+        if not self.cfg.terrain.measure_heights or not hasattr(self, 'height_points'):
+            return None
+        
+        if not isinstance(self.measured_heights, torch.Tensor):
+            return None
+        
+        # height_points: [num_envs, 187, 3] - 局部坐标系下的采样点 (x, y, 0)
+        # measured_heights: [num_envs, 187] - 每个点的高度测量值
+        
+        # 计算相对高度并归一化
+        # 使用与 privileged_obs_buf 相同的归一化方式
+        relative_heights = self.root_states[:, 2].unsqueeze(1) - self.cfg.normalization.base_height - self.measured_heights
+        normalized_heights = torch.clip(relative_heights, -1.0, 1.0)  # [num_envs, 187]
+        
+        # 构建完整的 (x, y, z) 数据
+        # height_points 的前两列是 x, y 坐标
+        height_points_with_z = self.height_points.clone()  # [num_envs, 187, 3]
+        height_points_with_z[:, :, 2] = normalized_heights  # 替换 z 坐标为归一化高度
+        
+        # 重塑为 [num_envs, num_x, num_y, 3]
+        # 配置中: measured_points_x 有 17 个点, measured_points_y 有 11 个点
+        num_x = len(self.cfg.terrain.measured_points_x)  # 17
+        num_y = len(self.cfg.terrain.measured_points_y)  # 11
+        height_points_reshaped = height_points_with_z.view(self.num_envs, num_x, num_y, 3)
+        
+        return height_points_reshaped
     
     def set_nominal_foothold(self, nominal_foothold):
         """
@@ -122,158 +180,196 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
                 sphere_geom, self.gym, self.viewer, self.envs[self.lookat_id], pose
             )
 
-    def _draw_foothold_attention(self):
+    def _draw_spatial_attention_viz(self):
         """
-        可视化落足点注意力机制
+        可视化空间注意力机制（自适应不同尺寸）
         
-        三层可视化：
-        1. 第一层（基础）：x > 0 的采样点用小蓝点显示
-        2. 第二层（叠加）：高注意力的点变色（蓝→红渐变）
-        3. 第三层（叠加）：预测落脚点用大红点标记
+        支持两种方案:
+          - 高度点方案: [17, 11] 注意力权重 -> 可直接映射到高度点
+          - 深度图像方案: [5, 5] 注意力权重 -> 仅显示2D热力图
+        
+        包含三部分：
+        1. 2D热力图窗口：显示注意力权重分布（两种方案通用）
+        2. 3D场景点云：在真实位置显示注意力权重（仅高度点方案）
+        3. 3D场景球体：显示名义落足点（绿色）和预测落足点（红色）
         """
-        self.gym.clear_lines(self.viewer)
-        
-        # 只可视化 lookat_id 对应的环境
         env_id = self.lookat_id
         
-        # ========== 获取采样点信息 ==========
-        # height_points: [num_envs, 187, 3] 身体坐标系下的采样点
-        # measured_heights: [num_envs, 187] 每个点的地形高度
-        
-        if not hasattr(self, 'height_points') or self.height_points is None:
+        # 检查注意力权重是否已初始化
+        if self.attention_weights is None:
             return
         
-        # 获取身体坐标系下的采样点 [187, 3]
-        local_points = self.height_points[env_id]  # [187, 3]
+        # ========== Part 1: 2D 注意力热力图 ==========
+        attn = self.attention_weights[env_id].cpu().numpy()  # [H, W]
+        H, W = attn.shape
+        attn_num_elements = H * W
         
-        # 筛选 x > 0 的点 (机器人前方)
-        # measured_points_x = [-0.8, ..., 0.8], 共17个点
-        # x > 0 的点对应索引 9-16 (共8个)，加上 x=0 的点共9个
-        # 网格是 17x11，每行11个点
-        # x 索引从 0 到 16，x > 0 对应索引 9-16
-        x_coords = torch.tensor(self.cfg.terrain.measured_points_x, device=self.device)
-        x_positive_mask = x_coords >= 0  # [17] 布尔掩码
+        # 判断注意力类型
+        # 高度点方案: 17x11 = 187
+        # 深度图像方案: 5x5 = 25
+        is_heightpoint_attention = (attn_num_elements == 187)
         
-        # 计算需要显示的点的索引
-        # height_points 排列方式: [x0y0, x0y1, ..., x0y10, x1y0, x1y1, ..., x16y10]
-        # 即外层是 x，内层是 y
-        num_y = len(self.cfg.terrain.measured_points_y)  # 11
+        if attn.max() > 0:
+            # 归一化到 [0, 255]
+            attn_normalized = (attn - attn.min()) / (attn.max() - attn.min() + 1e-8)
+            attn_uint8 = (attn_normalized * 255).astype(np.uint8)
+            
+            # 上采样到更大尺寸便于观察 (10x 放大)
+            target_h, target_w = H * 10, W * 10
+            attn_upsampled = cv2.resize(attn_uint8, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+            
+            # 应用颜色映射 (蓝→红: COLORMAP_JET)
+            attn_colored = cv2.applyColorMap(attn_upsampled, cv2.COLORMAP_JET)
+            
+            # 添加标题和数值信息
+            mode_str = "HeightPoint" if is_heightpoint_attention else "Image"
+            info_text = f"{mode_str} max:{attn.max():.3f}"
+            cv2.putText(attn_colored, info_text, (5, target_h - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            
+            # 显示 (窗口标题动态显示尺寸)
+            window_name = f"Spatial Attention ({H}x{W})"
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.imshow(window_name, attn_colored)
+            cv2.waitKey(1)
         
-        # 生成 x > 0 的点的索引
-        x_positive_indices = torch.where(x_positive_mask)[0]  # x >= 0 的索引
-        point_indices = []
-        for xi in x_positive_indices:
-            for yi in range(num_y):
-                point_indices.append(xi * num_y + yi)
-        point_indices = torch.tensor(point_indices, device=self.device, dtype=torch.long)
+        # ========== Part 2: 3D 场景中显示注意力权重点云 ==========
+        # 仅在高度点方案下可视化（注意力权重与高度点一一对应）
+        self.gym.clear_lines(self.viewer)
         
-        # 获取筛选后的点 [num_filtered, 3]
-        filtered_local_points = local_points[point_indices]  # 身体坐标系
-        
-        # ========== 转换到世界坐标系 ==========
-        # 使用 yaw 旋转 + 机器人位置
-        base_quat = self.base_quat[env_id]  # [4]
-        robot_pos = self.root_states[env_id, :3]  # [3]
-        
-        # 旋转采样点到世界坐标系
-        from legged_gym.utils.math import quat_apply_yaw
-        quat_expanded = base_quat.unsqueeze(0).repeat(len(point_indices), 1)  # [num_filtered, 4]
-        world_points_xy = quat_apply_yaw(quat_expanded, filtered_local_points) + robot_pos
-        
-        # 获取每个点的地形高度作为 z 坐标
-        # measured_heights 是地形的绝对高度（米），直接使用
-        if hasattr(self, 'measured_heights') and isinstance(self.measured_heights, torch.Tensor):
-            filtered_heights = self.measured_heights[env_id, point_indices]  # [num_filtered]
-            world_points_z = filtered_heights  # 地形绝对高度
-        else:
-            world_points_z = robot_pos[2] - self.cfg.normalization.base_height  # 默认使用地面高度
-        
-        world_points = world_points_xy.clone()
-        world_points[:, 2] = world_points_z
-        
-        # ========== 获取注意力权重 ==========
-        # attention_weights: [num_envs, 17, 11]
-        attn = self.attention_weights[env_id]  # [17, 11]
-        
-        # 筛选 x > 0 的注意力权重
-        filtered_attn = attn[x_positive_mask, :].flatten()  # [num_filtered]
-        
-        # 计算 top 20% 阈值
-        if filtered_attn.max() > 0:
-            threshold = torch.quantile(filtered_attn, 0.8)
-        else:
-            threshold = 0.0
-        
-        # ========== 第一层：所有点用小蓝点 ==========
-        small_radius = 0.01
-        for i, point in enumerate(world_points):
-            # 默认蓝色
-            color = (0.2, 0.4, 1.0)  # 蓝色
-            sphere_geom = gymutil.WireframeSphereGeometry(small_radius, 6, 6, None, color=color)
-            pose = gymapi.Transform(gymapi.Vec3(point[0].item(), point[1].item(), point[2].item()), r=None)
-            gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[env_id], pose)
-        
-        # ========== 第二层：高注意力点变色 ==========
-        for i, point in enumerate(world_points):
-            if filtered_attn[i] >= threshold and filtered_attn[i] > 0:
-                # 根据注意力值计算颜色 (蓝→红渐变)
-                attn_normalized = (filtered_attn[i] - threshold) / (filtered_attn.max() - threshold + 1e-6)
-                attn_normalized = attn_normalized.clamp(0, 1).item()
+        if is_heightpoint_attention and hasattr(self, 'height_points') and self.height_points is not None:
+            from legged_gym.utils.math import quat_apply_yaw
+            
+            base_quat = self.base_quat[env_id]
+            robot_pos = self.root_states[env_id, :3]
+            
+            # 获取局部坐标系下的高度点 [187, 3]
+            local_points = self.height_points[env_id]
+            
+            # 转换到世界坐标系
+            quat_expanded = base_quat.unsqueeze(0).repeat(local_points.shape[0], 1)
+            world_points = quat_apply_yaw(quat_expanded, local_points) + robot_pos
+            
+            # 获取地形高度
+            if isinstance(self.measured_heights, torch.Tensor):
+                world_points[:, 2] = self.measured_heights[env_id]
+            
+            # 只显示前方的点 (x >= 0)，并根据注意力权重着色
+            attn_flat = self.attention_weights[env_id].flatten()  # [187]
+            
+            # 计算阈值（top 20%）
+            threshold = torch.quantile(attn_flat, 0.8) if attn_flat.max() > 0 else 0.0
+            
+            # 绘制所有点
+            small_radius = 0.008
+            for i in range(local_points.shape[0]):
+                # 只显示 x >= 0 的点
+                if local_points[i, 0] < 0:
+                    continue
                 
-                # 渐变色: 蓝(0,0,1) -> 白(1,1,1) -> 红(1,0,0)
-                if attn_normalized < 0.5:
-                    # 蓝 -> 白
-                    t = attn_normalized * 2
-                    color = (t, t, 1.0)
+                point = world_points[i]
+                attn_val = attn_flat[i].item()
+                
+                if attn_val >= threshold and attn_flat.max() > 0:
+                    # 高注意力：蓝→红渐变
+                    t = (attn_val - threshold.item()) / (attn_flat.max().item() - threshold.item() + 1e-6)
+                    t = min(max(t, 0), 1)
+                    # 蓝(0,0,1) → 白(1,1,1) → 红(1,0,0)
+                    if t < 0.5:
+                        color = (t*2, t*2, 1.0)
+                    else:
+                        color = (1.0, 1.0-(t-0.5)*2, 1.0-(t-0.5)*2)
+                    radius = small_radius * 1.5
                 else:
-                    # 白 -> 红
-                    t = (attn_normalized - 0.5) * 2
-                    color = (1.0, 1.0 - t, 1.0 - t)
+                    # 低注意力：蓝色
+                    color = (0.2, 0.4, 1.0)
+                    radius = small_radius
                 
-                # 用稍大的球体覆盖
-                sphere_geom = gymutil.WireframeSphereGeometry(small_radius * 1.5, 8, 8, None, color=color)
+                sphere_geom = gymutil.WireframeSphereGeometry(radius, 6, 6, None, color=color)
                 pose = gymapi.Transform(gymapi.Vec3(point[0].item(), point[1].item(), point[2].item()), r=None)
                 gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[env_id], pose)
         
-        # ========== 调试信息（每100帧打印一次） ==========
-        if self.common_step_counter % 100 == 0:
-            print(f"[Attention Debug] attn max={filtered_attn.max().item():.4f}, "
-                  f"threshold={threshold:.4f}, points_above={int((filtered_attn >= threshold).sum().item())}")
-            print(f"[Foothold Debug] pred_foothold={self.pred_foothold[env_id].cpu().numpy()}")
+        # ========== Part 3: 3D 落足点可视化 ==========
+        base_quat = self.base_quat[env_id]
+        robot_pos = self.root_states[env_id, :3]
         
-        # ========== 第三层：预测落脚点用大红点 ==========
-        pred_foothold = self.pred_foothold[env_id]  # [4]: 左脚dx,dy + 右脚dx,dy
+        from legged_gym.utils.math import quat_apply_yaw
         
-        if torch.any(pred_foothold != 0):
-            # 左脚预测位置
-            pred_left_local = torch.tensor([pred_foothold[0], pred_foothold[1], 0], device=self.device)
+        # ---------- 名义落足点 (Raibert Heuristic) - 绿色 ----------
+        nominal = self.nominal_foothold[env_id]  # [2] (x, y)
+        if torch.any(nominal != 0):
+            # 左脚名义点 (添加 hip 偏移)
+            left_nominal_local = torch.tensor([nominal[0].item(), nominal[1].item() + 0.1, 0], device=self.device)
+            left_nominal_world = quat_apply_yaw(base_quat.unsqueeze(0), left_nominal_local.unsqueeze(0)).squeeze() + robot_pos
+            if hasattr(self, '_sample_terrain_height'):
+                left_z = self._sample_terrain_height(left_nominal_world[:2].unsqueeze(0)).squeeze()
+            else:
+                left_z = robot_pos[2] - 0.5
+            left_nominal_world[2] = left_z
+            
+            # 右脚名义点
+            right_nominal_local = torch.tensor([nominal[0].item(), nominal[1].item() - 0.1, 0], device=self.device)
+            right_nominal_world = quat_apply_yaw(base_quat.unsqueeze(0), right_nominal_local.unsqueeze(0)).squeeze() + robot_pos
+            if hasattr(self, '_sample_terrain_height'):
+                right_z = self._sample_terrain_height(right_nominal_world[:2].unsqueeze(0)).squeeze()
+            else:
+                right_z = robot_pos[2] - 0.5
+            right_nominal_world[2] = right_z
+            
+            # 绘制绿色球体（名义落足点）
+            green_color = (0.0, 1.0, 0.0)
+            sphere_geom = gymutil.WireframeSphereGeometry(0.025, 10, 10, None, color=green_color)
+            
+            pose = gymapi.Transform(gymapi.Vec3(
+                left_nominal_world[0].item(), left_nominal_world[1].item(), left_nominal_world[2].item()
+            ), r=None)
+            gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[env_id], pose)
+            
+            pose = gymapi.Transform(gymapi.Vec3(
+                right_nominal_world[0].item(), right_nominal_world[1].item(), right_nominal_world[2].item()
+            ), r=None)
+            gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[env_id], pose)
+        
+        # ---------- 预测落足点 - 红色 ----------
+        pred = self.pred_foothold[env_id]  # [4]: 左脚dx,dy + 右脚dx,dy
+        if torch.any(pred != 0) and pred.numel() >= 4:
+            # 左脚预测点
+            pred_left_local = torch.tensor([pred[0].item(), pred[1].item(), 0], device=self.device)
             pred_left_world = quat_apply_yaw(base_quat.unsqueeze(0), pred_left_local.unsqueeze(0)).squeeze() + robot_pos
-            # 采样地形高度
-            pred_left_z = self._sample_terrain_height(pred_left_world[:2].unsqueeze(0)).squeeze()
+            if hasattr(self, '_sample_terrain_height'):
+                pred_left_z = self._sample_terrain_height(pred_left_world[:2].unsqueeze(0)).squeeze()
+            else:
+                pred_left_z = robot_pos[2] - 0.5
             pred_left_world[2] = pred_left_z
             
-            # 右脚预测位置
-            pred_right_local = torch.tensor([pred_foothold[2], pred_foothold[3], 0], device=self.device)
+            # 右脚预测点
+            pred_right_local = torch.tensor([pred[2].item(), pred[3].item(), 0], device=self.device)
             pred_right_world = quat_apply_yaw(base_quat.unsqueeze(0), pred_right_local.unsqueeze(0)).squeeze() + robot_pos
-            pred_right_z = self._sample_terrain_height(pred_right_world[:2].unsqueeze(0)).squeeze()
+            if hasattr(self, '_sample_terrain_height'):
+                pred_right_z = self._sample_terrain_height(pred_right_world[:2].unsqueeze(0)).squeeze()
+            else:
+                pred_right_z = robot_pos[2] - 0.5
             pred_right_world[2] = pred_right_z
             
-            # 绘制大红点
-            big_radius = 0.02
+            # 绘制红色球体（预测落足点）
             red_color = (1.0, 0.0, 0.0)
+            sphere_geom = gymutil.WireframeSphereGeometry(0.03, 10, 10, None, color=red_color)
             
-            # 左脚
-            sphere_geom = gymutil.WireframeSphereGeometry(big_radius, 10, 10, None, color=red_color)
             pose = gymapi.Transform(gymapi.Vec3(
                 pred_left_world[0].item(), pred_left_world[1].item(), pred_left_world[2].item()
             ), r=None)
             gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[env_id], pose)
             
-            # 右脚
             pose = gymapi.Transform(gymapi.Vec3(
                 pred_right_world[0].item(), pred_right_world[1].item(), pred_right_world[2].item()
             ), r=None)
             gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[env_id], pose)
+        
+        # ========== 调试信息（每100帧打印一次） ==========
+        if self.common_step_counter % 100 == 0:
+            mode_str = "HeightPoint" if is_heightpoint_attention else "Image"
+            print(f"[Attention-{mode_str}] shape={H}x{W}, max={attn.max():.4f}, min={attn.min():.4f}")
+            print(f"[Nominal Foothold] {nominal.cpu().numpy()}")
+            print(f"[Pred Foothold] {pred.cpu().numpy()}")
 
     def _reset_dofs(self, env_ids):
         if self.cfg.init_state.random_default_pos:
@@ -366,9 +462,8 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
 
             # self._draw_foot_indicator()
             
-            # 落足点注意力可视化
-            if self.cfg.terrain.measure_heights:
-                self._draw_foothold_attention()
+            # 空间注意力可视化 (2D热力图 + 3D落足点)
+            self._draw_spatial_attention_viz()
     
         return env_ids, terminal_amp_states, terminal_obs[env_ids], terminal_critic_obs[env_ids]
 

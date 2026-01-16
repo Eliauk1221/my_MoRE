@@ -306,15 +306,32 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         
         # ========== 空间感知注意力参数 (Spatial Attention) ==========
         use_spatial_attention = True            # 是否启用空间感知注意力
-        spatial_feature_channels = 128          # 特征图通道数 (与 depth encoder 输出匹配)
-        spatial_feature_height = 5              # 特征图高度 (重塑后)
-        spatial_feature_width = 5               # 特征图宽度 (重塑后)
+        attention_type="heightpoint"          # 注意力类型: "image"=深度图像方案, "heightpoint"=高度点方案
+        
+        # --- 高度点方案参数 (attention_type="heightpoint") ---
+        num_points_x = 17                       # x方向高度点数 (对应 terrain.measured_points_x)
+        num_points_y = 11                       # y方向高度点数 (对应 terrain.measured_points_y)
+        point_feature_dim = 64                  # 每个点的特征维度
+        
+        # --- 深度图像方案参数 (attention_type="image") ---
+        spatial_feature_channels = 128          # 特征图通道数
+        spatial_feature_height = 5              # 特征图高度
+        spatial_feature_width = 5               # 特征图宽度
+        
+        # --- 通用参数 ---
         attention_hidden_dim = 128              # 注意力隐藏维度
         attention_heads = 4                     # 注意力头数
         attention_output_dim = 64               # 注意力输出维度
         T_stance = 0.25                         # Raibert 站立相时间 (秒)
         learnable_T_stance = True               # 是否让 T_stance 可学习
-        # ==============================================================
+        
+        # --- Raibert 公式选择 ---
+        # 简化版: p_nominal = (T_stance / 2) * v_cmd
+        # 完整版: p_nominal = (T_stance / 2) * v_cmd + k_raibert * (v_cmd - v_current)
+        use_full_raibert = True                 # 仿真训练建议使用完整版
+        k_raibert = 0.03                        # Raibert 反馈增益初始值
+        learnable_k_raibert = True              # 是否让 k_raibert 可学习
+        # ==============================================================================
         
         # ========== 落足点预测辅助任务参数 (Foothold Predictor) ==========
         use_foothold_predictor = True           # 是否启用落足点预测辅助任务

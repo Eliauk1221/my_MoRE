@@ -59,6 +59,12 @@ class RolloutStorageEX:
             self.target_footholds = None     # Oracle 计算的真值 [B, 2, 3]
             self.foothold_mask = None        # Swing leg 掩码 [B, 2]
             # ========================================
+            
+            # ========== 空间感知注意力需要的数据 ==========
+            self.height_points = None        # 地形高度采样点 [B, num_x, num_y, 3]
+            self.v_current = None            # 当前速度 [B, 3]
+            self.cmd_vel = None              # 指令速度 [B, 3]
+            # =============================================
         
         def clear(self):
             self.__init__()
@@ -66,7 +72,8 @@ class RolloutStorageEX:
     def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, actions_shape, 
                  device='cpu', history_len = 10, history_dim=45, depth_shape=None, depth_buffer_len=None, 
                  next_obs_shape=None, num_critics=1, num_experts=1,
-                 use_foothold_predictor=False):
+                 use_foothold_predictor=False,
+                 use_spatial_attention=False, num_points_x=17, num_points_y=11):
 
         self.device = device
         self.depth_image = None
@@ -127,6 +134,18 @@ class RolloutStorageEX:
             self.target_footholds = None
             self.foothold_mask = None
         # ==============================================
+        
+        # ========== 空间感知注意力存储 ==========
+        self.use_spatial_attention = use_spatial_attention
+        if use_spatial_attention:
+            # height_points: 地形高度采样点 [T, B, num_x, num_y, 3]
+            self.height_points = torch.zeros(num_transitions_per_env, num_envs, num_points_x, num_points_y, 3, device=self.device)
+            # v_current: 当前速度 [T, B, 3]
+            self.v_current = torch.zeros(num_transitions_per_env, num_envs, 3, device=self.device)
+        else:
+            self.height_points = None
+            self.v_current = None
+        # ========================================
 
         # rnn
         self.saved_hidden_states_a = None
@@ -162,6 +181,12 @@ class RolloutStorageEX:
         if self.foothold_mask is not None and transition.foothold_mask is not None:
             self.foothold_mask[self.step].copy_(transition.foothold_mask)
         # ========================================
+        # ========== 空间感知注意力 ==========
+        if self.height_points is not None and transition.height_points is not None:
+            self.height_points[self.step].copy_(transition.height_points)
+        if self.v_current is not None and transition.v_current is not None:
+            self.v_current[self.step].copy_(transition.v_current)
+        # ====================================
         self.step += 1
 
     def _save_hidden_states(self, hidden_states):
@@ -224,6 +249,10 @@ class RolloutStorageEX:
         target_footholds = self.target_footholds.flatten(0, 1) if self.target_footholds is not None else None
         foothold_mask = self.foothold_mask.flatten(0, 1) if self.foothold_mask is not None else None
         # ========================================
+        # ========== 空间感知注意力 ==========
+        height_points = self.height_points.flatten(0, 1) if self.height_points is not None else None
+        v_current = self.v_current.flatten(0, 1) if self.v_current is not None else None
+        # ====================================
 
         if self.privileged_observations is not None:
             critic_observations = self.privileged_observations.flatten(0, 1)
@@ -266,10 +295,15 @@ class RolloutStorageEX:
                 target_footholds_batch = target_footholds[batch_idx] if target_footholds is not None else None
                 foothold_mask_batch = foothold_mask[batch_idx] if foothold_mask is not None else None
                 # ========================================
+                # ========== 空间感知注意力 ==========
+                height_points_batch = height_points[batch_idx] if height_points is not None else None
+                v_current_batch = v_current[batch_idx] if v_current is not None else None
+                # ====================================
                 
                 yield obs_batch, critic_observations_batch, actions_batch, next_obs_batch, next_critic_observations_batch, history_batch, target_values_batch, advantages_batch, returns_batch, \
                        old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None, depth_image_batch, \
-                       pred_footholds_batch, target_footholds_batch, foothold_mask_batch
+                       pred_footholds_batch, target_footholds_batch, foothold_mask_batch, \
+                       height_points_batch, v_current_batch
 
     # for RNNs only
     def reccurent_mini_batch_generator(self, num_mini_batches, num_epochs=8):

@@ -29,5 +29,10 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 from .actor_critic import ActorCritic
-from .actor_critic_depth import ActorCriticDepth
+from .actor_critic_depth import (
+    ActorCriticDepth,           # 默认导出高度点方案
+    ActorCriticDepthImage,      # 深度图像方案
+    ActorCriticDepthHeightPoint,  # 高度点方案
+    create_actor_critic,        # 工厂函数
+)
 from .actor_critic_resi_moe import ActorCriticResiMoE
