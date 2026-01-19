@@ -65,6 +65,12 @@ class RolloutStorageEX:
             self.v_current = None            # 当前速度 [B, 3]
             self.cmd_vel = None              # 指令速度 [B, 3]
             # =============================================
+            
+            # ========== LIP + 平坦度注意力引导数据 ==========
+            self.safety_scores = None        # 物理安全分数 [B, num_points]
+            self.target_attention = None     # 目标注意力分布 [B, num_points]
+            self.curriculum_level = 0        # 当前课程等级
+            # =============================================
         
         def clear(self):
             self.__init__()
@@ -137,14 +143,23 @@ class RolloutStorageEX:
         
         # ========== 空间感知注意力存储 ==========
         self.use_spatial_attention = use_spatial_attention
+        self.num_points = num_points_x * num_points_y
         if use_spatial_attention:
             # height_points: 地形高度采样点 [T, B, num_x, num_y, 3]
             self.height_points = torch.zeros(num_transitions_per_env, num_envs, num_points_x, num_points_y, 3, device=self.device)
             # v_current: 当前速度 [T, B, 3]
             self.v_current = torch.zeros(num_transitions_per_env, num_envs, 3, device=self.device)
+            # ========== LIP + 平坦度注意力引导存储 ==========
+            # safety_scores: 物理安全分数 [T, B, num_points]
+            self.safety_scores = torch.zeros(num_transitions_per_env, num_envs, self.num_points, device=self.device)
+            # target_attention: 目标注意力分布 [T, B, num_points]
+            self.target_attention = torch.zeros(num_transitions_per_env, num_envs, self.num_points, device=self.device)
+            # ================================================
         else:
             self.height_points = None
             self.v_current = None
+            self.safety_scores = None
+            self.target_attention = None
         # ========================================
 
         # rnn
@@ -187,6 +202,12 @@ class RolloutStorageEX:
         if self.v_current is not None and transition.v_current is not None:
             self.v_current[self.step].copy_(transition.v_current)
         # ====================================
+        # ========== LIP + 平坦度注意力引导 ==========
+        if self.safety_scores is not None and transition.safety_scores is not None:
+            self.safety_scores[self.step].copy_(transition.safety_scores)
+        if self.target_attention is not None and transition.target_attention is not None:
+            self.target_attention[self.step].copy_(transition.target_attention)
+        # =============================================
         self.step += 1
 
     def _save_hidden_states(self, hidden_states):
@@ -253,6 +274,10 @@ class RolloutStorageEX:
         height_points = self.height_points.flatten(0, 1) if self.height_points is not None else None
         v_current = self.v_current.flatten(0, 1) if self.v_current is not None else None
         # ====================================
+        # ========== LIP + 平坦度注意力引导 ==========
+        safety_scores = self.safety_scores.flatten(0, 1) if self.safety_scores is not None else None
+        target_attention = self.target_attention.flatten(0, 1) if self.target_attention is not None else None
+        # =============================================
 
         if self.privileged_observations is not None:
             critic_observations = self.privileged_observations.flatten(0, 1)
@@ -299,11 +324,16 @@ class RolloutStorageEX:
                 height_points_batch = height_points[batch_idx] if height_points is not None else None
                 v_current_batch = v_current[batch_idx] if v_current is not None else None
                 # ====================================
+                # ========== LIP + 平坦度注意力引导 ==========
+                safety_scores_batch = safety_scores[batch_idx] if safety_scores is not None else None
+                target_attention_batch = target_attention[batch_idx] if target_attention is not None else None
+                # =============================================
                 
                 yield obs_batch, critic_observations_batch, actions_batch, next_obs_batch, next_critic_observations_batch, history_batch, target_values_batch, advantages_batch, returns_batch, \
                        old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None, depth_image_batch, \
                        pred_footholds_batch, target_footholds_batch, foothold_mask_batch, \
-                       height_points_batch, v_current_batch
+                       height_points_batch, v_current_batch, \
+                       safety_scores_batch, target_attention_batch
 
     # for RNNs only
     def reccurent_mini_batch_generator(self, num_mini_batches, num_epochs=8):

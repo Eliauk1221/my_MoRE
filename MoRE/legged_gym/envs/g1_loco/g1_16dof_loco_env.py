@@ -1,5 +1,11 @@
 
 from legged_gym.envs.base.legged_robot import LeggedRobot
+from legged_gym.envs.base.terrain_safety_scorer import (
+    TerrainSafetyScorer, 
+    TerrainSafetyScorerCfg,
+    AttentionGuidanceCfg,
+    get_beta
+)
 
 from isaacgym.torch_utils import *
 from isaacgym import gymtorch, gymapi, gymutil
@@ -79,6 +85,16 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         self.foothold_search_radius = 0.15  # 搜索半径 (米)
         self.foothold_search_resolution = 0.03  # 搜索分辨率 (米)
         # =============================================
+        
+        # ========== LIP + 平坦度注意力引导相关 ==========
+        # 初始化 TerrainSafetyScorer
+        self._init_terrain_safety_scorer()
+        # 存储安全分数 [num_envs, num_points]
+        num_points = len(self.cfg.terrain.measured_points_x) * len(self.cfg.terrain.measured_points_y)
+        self.safety_scores = torch.zeros(self.num_envs, num_points, dtype=torch.float, device=self.device, requires_grad=False)
+        # 存储目标注意力分布 [num_envs, num_points]
+        self.target_attention = torch.zeros(self.num_envs, num_points, dtype=torch.float, device=self.device, requires_grad=False)
+        # =============================================
 
     def reset_idx(self, env_ids):
         super().reset_idx(env_ids)
@@ -92,6 +108,86 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         self.nominal_foothold[env_ids] = 0.  # 重置名义落足点
         self.target_footholds[env_ids] = 0.  # 重置目标落足点
         self.foothold_mask[env_ids] = 0.  # 重置 swing mask
+        # 重置安全分数和目标注意力
+        self.safety_scores[env_ids] = 0.
+        self.target_attention[env_ids] = 0.
+    
+    def _init_terrain_safety_scorer(self):
+        """
+        初始化 TerrainSafetyScorer
+        基于 LIP + 平坦度的注意力引导机制
+        """
+        # 创建配置
+        scorer_cfg = TerrainSafetyScorerCfg()
+        scorer_cfg.z0 = 0.75  # 名义 CoM 高度
+        scorer_cfg.gravity = 9.81
+        scorer_cfg.sigma_flatness = 0.05
+        scorer_cfg.use_heading_awareness = True
+        scorer_cfg.min_vel_for_heading = 0.1
+        scorer_cfg.temperature = 0.1
+        
+        # 获取采样点数量
+        num_points_x = len(self.cfg.terrain.measured_points_x)
+        num_points_y = len(self.cfg.terrain.measured_points_y)
+        
+        # 创建评分器
+        self.terrain_safety_scorer = TerrainSafetyScorer(
+            cfg=scorer_cfg,
+            num_points_x=num_points_x,
+            num_points_y=num_points_y
+        ).to(self.device)
+        
+        print(f"[Env] TerrainSafetyScorer 初始化完成: {num_points_x}x{num_points_y} = {num_points_x * num_points_y} 点")
+    
+    def compute_safety_scores(self):
+        """
+        计算地形安全分数和目标注意力分布
+        
+        基于 LIP + 平坦度 + 速度方向感知
+        
+        Returns:
+            safety_scores: [num_envs, num_points] 安全分数
+            target_attention: [num_envs, num_points] 目标注意力分布
+        """
+        if not self.cfg.terrain.measure_heights:
+            return self.safety_scores, self.target_attention
+        
+        if not isinstance(self.measured_heights, torch.Tensor):
+            return self.safety_scores, self.target_attention
+        
+        # 获取带高度的地形采样点
+        height_points = self.get_height_points_with_heights()
+        if height_points is None:
+            return self.safety_scores, self.target_attention
+        
+        # 获取基座速度 (body frame)
+        base_lin_vel = self.base_lin_vel  # [num_envs, 3]
+        
+        # 计算安全分数
+        with torch.no_grad():
+            safety_scores, target_attention = self.terrain_safety_scorer(
+                height_points, base_lin_vel
+            )
+        
+        # 更新 buffer
+        self.safety_scores[:] = safety_scores
+        self.target_attention[:] = target_attention
+        
+        return safety_scores, target_attention
+    
+    def get_safety_scores(self):
+        """获取当前的安全分数 [num_envs, num_points]"""
+        return self.safety_scores
+    
+    def get_target_attention(self):
+        """获取目标注意力分布 [num_envs, num_points]"""
+        return self.target_attention
+    
+    def get_curriculum_level(self):
+        """获取当前课程等级，用于计算动态 β"""
+        if hasattr(self, 'terrain_levels'):
+            return self.terrain_levels.float().mean().item()
+        return 0
 
     def set_attention_weights(self, attn_weights):
         """

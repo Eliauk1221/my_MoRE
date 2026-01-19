@@ -306,7 +306,7 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         
         # ========== 空间感知注意力参数 (Spatial Attention) ==========
         use_spatial_attention = True            # 是否启用空间感知注意力
-        attention_type="heightpoint"          # 注意力类型: "image"=深度图像方案, "heightpoint"=高度点方案
+        attention_type = "heightpoint"          # 注意力类型: "image"=深度图像方案, "heightpoint"=高度点方案
         
         # --- 高度点方案参数 (attention_type="heightpoint") ---
         num_points_x = 17                       # x方向高度点数 (对应 terrain.measured_points_x)
@@ -322,15 +322,25 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         attention_hidden_dim = 128              # 注意力隐藏维度
         attention_heads = 4                     # 注意力头数
         attention_output_dim = 64               # 注意力输出维度
-        T_stance = 0.25                         # Raibert 站立相时间 (秒)
-        learnable_T_stance = True               # 是否让 T_stance 可学习
+        # ==============================================================================
         
-        # --- Raibert 公式选择 ---
-        # 简化版: p_nominal = (T_stance / 2) * v_cmd
-        # 完整版: p_nominal = (T_stance / 2) * v_cmd + k_raibert * (v_cmd - v_current)
-        use_full_raibert = True                 # 仿真训练建议使用完整版
-        k_raibert = 0.03                        # Raibert 反馈增益初始值
-        learnable_k_raibert = True              # 是否让 k_raibert 可学习
+        # ========== LIP + 平坦度注意力引导参数 (基于 PLANC) ==========
+        # --- 安全偏置参数 ---
+        use_safety_bias = True                  # 是否使用物理安全偏置引导注意力
+        use_attention_loss = True               # 是否使用注意力监督 loss (KL散度)
+        
+        # --- 课程式 β 衰减 ---
+        use_curriculum_decay = True             # 是否启用课程式衰减
+        beta_max = 2.0                          # 初期偏置强度 (强物理引导)
+        beta_min = 0.0                          # 后期偏置强度 (网络自主)
+        decay_curriculum_levels = 10            # 衰减所需的课程等级数
+        
+        # --- TerrainSafetyScorer 参数 ---
+        z0 = 0.75                               # 名义 CoM 高度 (m)
+        sigma_flatness = 0.05                   # 平坦度评分的梯度阈值
+        use_heading_awareness = True            # 是否启用速度方向感知
+        min_vel_for_heading = 0.1               # 低于此速度时不使用方向过滤 (m/s)
+        safety_temperature = 0.1                # 目标注意力分布的 softmax 温度
         # ==============================================================================
         
         # ========== 落足点预测辅助任务参数 (Foothold Predictor) ==========
@@ -350,6 +360,11 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         # ========== 落足点预测辅助任务参数 ==========
         use_foothold_predictor = True           # 是否启用落足点预测辅助任务
         aux_foothold_coef = 1.0                 # 辅助损失系数
+        # ==========================================
+        
+        # ========== 注意力引导 Loss 参数 ==========
+        use_attention_loss = True               # 是否使用注意力监督 loss
+        attention_loss_coef = 0.5               # 注意力 loss 权重 λ_attn
         # ==========================================
 
     class runner( LeggedRobotCfgPPO.runner ):

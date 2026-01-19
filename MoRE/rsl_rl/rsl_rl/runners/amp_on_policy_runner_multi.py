@@ -215,6 +215,15 @@ class AMPOnPolicyRunnerMulti:
         if self.use_spatial_attention:
             print("========== Runner: Spatial Attention ENABLED ==========")
         
+        # ========== 检查是否启用注意力引导 ==========
+        self.use_attention_loss = hasattr(self.alg, 'use_attention_loss') and self.alg.use_attention_loss
+        if self.use_attention_loss:
+            print("========== Runner: Attention Guidance Loss ENABLED ==========")
+            if not hasattr(self.env, 'compute_safety_scores'):
+                print("[WARNING] Environment does not implement 'compute_safety_scores()'. "
+                      "Please implement this method to provide safety scores.")
+        # ==============================================================
+        
         # ========== 检查是否启用落足点预测辅助任务 ==========
         self.use_foothold_predictor = hasattr(self.alg, 'use_foothold_predictor') and \
                                        self.alg.use_foothold_predictor
@@ -241,34 +250,34 @@ class AMPOnPolicyRunnerMulti:
                         obs = (obs, depth_image)
 
                     # ========== 提取空间感知注意力需要的数据 ==========
-                    cmd_vel = None
                     height_points = None
-                    v_current = None
+                    safety_scores = None
+                    target_attention = None
+                    curriculum_level = 0
+                    
                     if self.use_spatial_attention:
-                        # G1 环境的观测结构:
-                        # obs_buf: [cmd(3), ang_vel(3), gravity(3), dof_pos(16), dof_vel(16), actions(16)] = 57 维
-                        
-                        # cmd_vel: 从 obs_buf 的前 3 维获取指令速度 [B, 3]
-                        obs_tensor = obs[0] if isinstance(obs, tuple) else obs
-                        cmd_vel = obs_tensor[:, :3]
-                        
                         # height_points: 获取带高度的地形采样点 [B, 17, 11, 3]
                         if hasattr(self.env, 'get_height_points_with_heights'):
                             height_points = self.env.get_height_points_with_heights()
                         
-                        # v_current: 当前基座速度 [B, 3]，用于完整版 Raibert 公式
-                        if hasattr(self.env, 'base_lin_vel'):
-                            v_current = self.env.base_lin_vel.clone()
+                        # ========== LIP + 平坦度注意力引导 ==========
+                        # 计算安全分数和目标注意力分布
+                        if hasattr(self.env, 'compute_safety_scores'):
+                            safety_scores, target_attention = self.env.compute_safety_scores()
+                        
+                        # 获取当前课程等级（用于动态 β 衰减）
+                        if hasattr(self.env, 'get_curriculum_level'):
+                            curriculum_level = self.env.get_curriculum_level()
+                        # =============================================
                     # ==============================================================
 
-                    actions = self.alg.act(obs, critic_obs, history, height_points=height_points, cmd_vel=cmd_vel, v_current=v_current)
-                    
-                    # ========== 获取名义落足点并传递给环境用于可视化/奖励计算 ==========
-                    if self.use_spatial_attention:
-                        nominal_foothold = self.alg.get_nominal_foothold()
-                        if hasattr(self.env, 'set_nominal_foothold'):
-                            self.env.set_nominal_foothold(nominal_foothold)
-                    # ==============================================================
+                    actions = self.alg.act(
+                        obs, critic_obs, history, 
+                        height_points=height_points, 
+                        safety_scores=safety_scores, 
+                        target_attention=target_attention,
+                        curriculum_level=curriculum_level
+                    )
                     
                     obs, privileged_obs, rewards, dones, infos, _, terminal_amp_states, terminal_obs, terminal_critic_obs = self.env.step(actions)
                     
@@ -362,7 +371,8 @@ class AMPOnPolicyRunnerMulti:
                 self.alg.compute_returns(critic_obs, history)
             
             mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss, \
-            mean_policy_pred, mean_expert_pred, mean_agent_acc, mean_demo_acc, mean_foothold_loss = self.alg.update()
+            mean_policy_pred, mean_expert_pred, mean_agent_acc, mean_demo_acc, \
+            mean_foothold_loss, mean_attention_loss = self.alg.update()
             stop = time.time()
             learn_time = stop - start
             if self.log_dir is not None:
@@ -402,6 +412,8 @@ class AMPOnPolicyRunnerMulti:
         self.writer.add_scalar('Loss/AMP_grad', locs['mean_grad_pen_loss'], locs['it'])
         if self.use_foothold_predictor:
             self.writer.add_scalar('Loss/foothold_aux', locs['mean_foothold_loss'], locs['it'])
+        if self.use_attention_loss:
+            self.writer.add_scalar('Loss/attention_guidance', locs['mean_attention_loss'], locs['it'])
         self.writer.add_scalar('Loss/learning_rate', self.alg.policy_learning_rate, locs['it'])
         self.writer.add_scalar('Disc/agent_acc', locs['mean_agent_acc'], locs['it'])
         self.writer.add_scalar('Disc/demo_acc', locs['mean_demo_acc'], locs['it'])
@@ -421,8 +433,8 @@ class AMPOnPolicyRunnerMulti:
             self.writer.add_scalar('Attention/entropy', attention_stats['entropy'], locs['it'])
             self.writer.add_scalar('Attention/peak_value', attention_stats['peak_value'], locs['it'])
             self.writer.add_scalar('Attention/sparsity', attention_stats['sparsity'], locs['it'])
-            if 'T_stance' in attention_stats:
-                self.writer.add_scalar('Raibert/T_stance', attention_stats['T_stance'], locs['it'])
+            if 'current_beta' in attention_stats:
+                self.writer.add_scalar('Attention/current_beta', attention_stats['current_beta'], locs['it'])
         # ==========================================================
 
         str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "

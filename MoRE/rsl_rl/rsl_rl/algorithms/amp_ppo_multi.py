@@ -68,6 +68,10 @@ class AMPPPOMulti:
                  use_foothold_predictor=False,    # 是否启用落足点预测辅助任务
                  aux_foothold_coef=1.0,           # 辅助损失系数
                  # ===========================================
+                 # ========== 注意力引导 Loss 参数 ==========
+                 use_attention_loss=False,        # 是否使用注意力监督 loss
+                 attention_loss_coef=0.5,         # 注意力 loss 权重 λ_attn
+                 # ==========================================
                  **kwargs
                  ):
         self.use_amp = use_amp
@@ -82,6 +86,13 @@ class AMPPPOMulti:
         if use_foothold_predictor:
             print(f"========== Foothold Predictor Aux Loss ENABLED, coef={aux_foothold_coef} ==========")
         # ========================================
+        
+        # ========== 注意力引导 Loss ==========
+        self.use_attention_loss = use_attention_loss
+        self.attention_loss_coef = attention_loss_coef
+        if use_attention_loss:
+            print(f"========== Attention Guidance Loss ENABLED, coef={attention_loss_coef} ==========")
+        # =====================================
         if default_pos is not None: 
             self.default_pos = torch.tensor(default_pos, device=self.device)
 
@@ -138,7 +149,8 @@ class AMPPPOMulti:
     def train_mode(self):
         self.actor_critic.train()
 
-    def act(self, obs, critic_obs, history, height_points=None, cmd_vel=None, v_current=None):
+    def act(self, obs, critic_obs, history, height_points=None, safety_scores=None, 
+            target_attention=None, curriculum_level=0):
         """
         根据观测计算动作
         
@@ -147,8 +159,9 @@ class AMPPPOMulti:
             critic_obs: critic使用的观测
             history: 历史观测序列
             height_points: 地形高度采样点 [B, 17, 11, 3] (用于基于高度点的空间感知注意力)
-            cmd_vel: 指令速度 [B, 3] (用于空间感知注意力)
-            v_current: 当前速度 [B, 3] (用于完整版 Raibert 公式)
+            safety_scores: 物理安全分数 [B, num_points] (用于注意力偏置)
+            target_attention: 目标注意力分布 [B, num_points] (用于注意力监督)
+            curriculum_level: 当前课程等级 (用于动态 β 衰减)
         
         返回:
             actions: 动作
@@ -165,8 +178,8 @@ class AMPPPOMulti:
                 history, 
                 depth_image[:, :2, ...],
                 height_points=height_points,
-                cmd_vel=cmd_vel,
-                v_current=v_current
+                safety_scores=safety_scores,
+                curriculum_level=curriculum_level
             ).detach()
             self.transition.observations = obs[0]
             self.transition.depth_image = obs[1]
@@ -177,8 +190,8 @@ class AMPPPOMulti:
                 aug_obs, 
                 history,
                 height_points=height_points,
-                cmd_vel=cmd_vel,
-                v_current=v_current
+                safety_scores=safety_scores,
+                curriculum_level=curriculum_level
             ).detach()
             self.transition.observations = obs
         
@@ -191,17 +204,24 @@ class AMPPPOMulti:
         # need to record obs and critic_obs before env.step()
         self.transition.history = history
         self.transition.critic_observations = critic_obs
-        self.transition.cmd_vel = cmd_vel
         
         # ========== 保存空间感知注意力需要的数据 ==========
         if height_points is not None:
             self.transition.height_points = height_points.detach()
         else:
             self.transition.height_points = None
-        if v_current is not None:
-            self.transition.v_current = v_current.detach()
+        # ==================================================
+        
+        # ========== 保存 LIP + 平坦度注意力引导数据 ==========
+        if safety_scores is not None:
+            self.transition.safety_scores = safety_scores.detach()
         else:
-            self.transition.v_current = None
+            self.transition.safety_scores = None
+        if target_attention is not None:
+            self.transition.target_attention = target_attention.detach()
+        else:
+            self.transition.target_attention = None
+        self.transition.curriculum_level = curriculum_level
         # ==================================================
         
         # ========== 保存预测的落足点修正量（用于后续存储） ==========
@@ -214,10 +234,6 @@ class AMPPPOMulti:
         # =========================================================
         
         return self.transition.actions
-    
-    def get_nominal_foothold(self):
-        """获取策略网络计算的名义落足点 (Raibert Heuristic)，供环境可视化使用"""
-        return self.actor_critic.get_nominal_foothold()
     
     def get_attention_stats(self):
         """获取注意力统计量，用于tensorboard记录"""
@@ -287,6 +303,7 @@ class AMPPPOMulti:
         mean_agent_acc = 0
         mean_demo_acc = 0
         mean_foothold_loss = 0  # 落足点预测辅助损失
+        mean_attention_loss = 0  # 注意力引导 loss
         
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -356,17 +373,10 @@ class AMPPPOMulti:
         for obs_batch, critic_obs_batch, actions_batch, next_obs_batch, next_critic_observations_batch, history_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
             old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, depth_image_batch, \
             pred_footholds_batch, target_footholds_batch, foothold_mask_batch, \
-            height_points_batch, v_current_batch in generator:
+            height_points_batch, v_current_batch, \
+            safety_scores_batch, target_attention_batch in generator:
 
             aug_obs_batch, history_batch = obs_batch.detach(), history_batch.detach()
-            
-            # ========== 从 obs_batch 中提取 cmd_vel ==========
-            cmd_vel_batch = None
-            if hasattr(self.actor_critic, 'use_spatial_attention') and self.actor_critic.use_spatial_attention:
-                # G1 环境的观测结构:
-                # obs_buf: [cmd(3), ang_vel(3), gravity(3), dof_pos(16), dof_vel(16), actions(16)]
-                cmd_vel_batch = obs_batch[:, :3].detach()
-            # ==============================================================
             
             if self.use_depth:
                 aug_depth_image_batch = depth_image_batch.detach()
@@ -375,8 +385,8 @@ class AMPPPOMulti:
                     history_batch, 
                     aug_depth_image_batch[:, :2, ...],
                     height_points=height_points_batch,
-                    cmd_vel=cmd_vel_batch,
-                    v_current=v_current_batch
+                    safety_scores=safety_scores_batch,
+                    curriculum_level=0  # 在 update 时不使用课程衰减（使用 rollout 时的 β）
                 )
             else:
                 self.actor_critic.act(
@@ -385,8 +395,8 @@ class AMPPPOMulti:
                     masks=masks_batch, 
                     hidden_states=hid_states_batch[0],
                     height_points=height_points_batch,
-                    cmd_vel=cmd_vel_batch,
-                    v_current=v_current_batch
+                    safety_scores=safety_scores_batch,
+                    curriculum_level=0
                 )
             
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
@@ -465,6 +475,29 @@ class AMPPPOMulti:
                         # 没有掩码时，对所有腿计算 loss
                         foothold_loss = mse_per_leg.mean()
             # ===========================================
+            
+            # ========== 注意力引导 Loss (KL 散度) ==========
+            # 梯度流说明:
+            #   attention_loss.backward() 会产生梯度:
+            #   attention_loss → attn_weights → SpatialAttentionEncoder → query/key/value
+            #   
+            #   这会直接引导注意力分布向物理安全分布靠近
+            attention_loss = torch.tensor(0.0, device=self.device)
+            if self.use_attention_loss and target_attention_batch is not None:
+                # 获取当前前向传播的注意力权重
+                pred_attn_weights = self.actor_critic.get_attention_weights_flat()  # [B, num_points]
+                
+                if pred_attn_weights is not None:
+                    # KL 散度: KL(pred || target) = Σ pred * log(pred / target)
+                    # 使用 PyTorch 的 kl_div，注意 input 是 log_prob，target 是 prob
+                    pred_log_prob = torch.log(pred_attn_weights + 1e-8)  # [B, num_points]
+                    # kl_div expects log_input, target
+                    attention_loss = nn.functional.kl_div(
+                        pred_log_prob, 
+                        target_attention_batch, 
+                        reduction='batchmean'
+                    )
+            # ==============================================
 
             # Compute total loss.
             loss = (
@@ -472,7 +505,8 @@ class AMPPPOMulti:
                 surrogate_loss +
                 self.value_loss_coef * value_loss -
                 self.entropy_coef * entropy_batch.mean() +
-                self.aux_foothold_coef * foothold_loss  # 添加落足点预测辅助损失
+                self.aux_foothold_coef * foothold_loss +  # 落足点预测辅助损失
+                self.attention_loss_coef * attention_loss  # 注意力引导 loss
             )
 
             # Gradient step
@@ -495,6 +529,7 @@ class AMPPPOMulti:
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_foothold_loss += foothold_loss.item() if isinstance(foothold_loss, torch.Tensor) else foothold_loss
+            mean_attention_loss += attention_loss.item() if isinstance(attention_loss, torch.Tensor) else attention_loss
                 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
@@ -506,8 +541,9 @@ class AMPPPOMulti:
         mean_agent_acc /= num_updates
         mean_demo_acc /= num_updates
         mean_foothold_loss /= num_updates
+        mean_attention_loss /= num_updates
         
         self.storage.clear()
 
         return mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss, mean_policy_pred, mean_expert_pred,  \
-                mean_agent_acc, mean_demo_acc, mean_foothold_loss
+                mean_agent_acc, mean_demo_acc, mean_foothold_loss, mean_attention_loss

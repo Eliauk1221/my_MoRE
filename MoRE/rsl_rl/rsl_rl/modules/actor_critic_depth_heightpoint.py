@@ -151,24 +151,26 @@ class HeightPointAttentionEncoder(nn.Module):
     """
     基于地形高度点的空间感知注意力编码器 (Height Point Spatial Attention Encoder)
     
-    核心改进：使用显式的地形高度采样点代替深度图像特征图
+    核心特性：
+    - 使用显式的地形高度采样点代替深度图像特征图
     - 每个点有明确的物理坐标 (x, y) 和高度 z
     - 注意力权重具有明确的空间可解释性
     - Sim2Real 友好：几何信息在仿真和真实世界中一致
     
+    基于 LIP + 平坦度的注意力引导机制：
+    - Query 仅使用本体感知 (proprioception)，不再使用 Raibert 启发式落足点
+    - 注意力偏置：将物理安全分数作为偏置加入，直接引导注意力
+    - 注意力监督：使用 KL 散度作为 loss，进一步强化学习
+    
     输入:
         - height_points: [B, num_x, num_y, 3] 地形高度采样点 (x, y, z) in base frame
         - proprioception: [B, Proprio_Dim] 本体感知 (关节角、IMU等)
-        - cmd_vel: [B, 3] 用户指令速度
-        - v_current: [B, 3] 当前速度 (仅完整版 Raibert 需要)
+        - safety_scores: [B, num_points] 物理安全分数 (可选，用于注意力偏置)
+        - beta: float 偏置强度 (可选，用于课程式衰减)
         
     输出:
         - context_vector: [B, output_dim] 注意力加权的地形特征
-        - attn_weights: [B, num_x, num_y] 注意力权重 (用于可视化)
-    
-    Raibert 公式:
-        简化版 (部署友好): p_nominal = (T_stance / 2) * v_cmd
-        完整版 (仿真训练): p_nominal = (T_stance / 2) * v_cmd + k_raibert * (v_cmd - v_current)
+        - attn_weights: [B, num_x, num_y] 注意力权重 (用于可视化和监督)
     """
     
     def __init__(self,
@@ -179,11 +181,8 @@ class HeightPointAttentionEncoder(nn.Module):
                  hidden_dim: int = 128,               # 隐藏层维度
                  num_heads: int = 4,                  # 注意力头数
                  output_dim: int = 64,                # 输出特征维度
-                 T_stance: float = 0.25,              # 站立相时间 (秒)
-                 learnable_T_stance: bool = True,     # 是否让 T_stance 可学习
-                 use_full_raibert: bool = False,      # 是否使用完整版 Raibert 公式
-                 k_raibert: float = 0.03,             # Raibert 反馈增益
-                 learnable_k_raibert: bool = True):   # 是否让 k_raibert 可学习
+                 use_safety_bias: bool = True,        # 是否使用安全偏置
+                 **kwargs):                           # 兼容旧配置
         super().__init__()
         
         self.num_points_x = num_points_x
@@ -193,22 +192,7 @@ class HeightPointAttentionEncoder(nn.Module):
         self.point_feature_dim = point_feature_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
-        self.use_full_raibert = use_full_raibert
-        
-        # ========== Raibert 参数 ==========
-        if learnable_T_stance:
-            self.T_stance = nn.Parameter(torch.tensor(T_stance))
-        else:
-            self.register_buffer('T_stance', torch.tensor(T_stance))
-        
-        # 完整版 Raibert 的反馈增益
-        if use_full_raibert:
-            if learnable_k_raibert:
-                self.k_raibert = nn.Parameter(torch.tensor(k_raibert))
-            else:
-                self.register_buffer('k_raibert', torch.tensor(k_raibert))
-        else:
-            self.register_buffer('k_raibert', torch.tensor(0.0))  # 简化版不使用
+        self.use_safety_bias = use_safety_bias
         
         # ========== 点特征编码器 ==========
         # 将每个高度点 (x, y, z) 编码为特征向量
@@ -222,9 +206,9 @@ class HeightPointAttentionEncoder(nn.Module):
         )
         
         # ========== Query 生成器 ==========
-        # Query = MLP(proprioception + p_nominal)
-        # p_nominal: [B, 2] (只用 x, y 两个维度)
-        query_input_dim = proprio_dim + 2  # proprio + nominal foothold (x, y)
+        # Query = MLP(proprioception)
+        # 只使用本体感知，不再使用 Raibert 启发式落足点
+        query_input_dim = proprio_dim
         self.query_mlp = nn.Sequential(
             nn.Linear(query_input_dim, hidden_dim),
             nn.ELU(),
@@ -237,13 +221,9 @@ class HeightPointAttentionEncoder(nn.Module):
         self.key_proj = nn.Linear(point_feature_dim, hidden_dim)
         self.value_proj = nn.Linear(point_feature_dim, hidden_dim)
         
-        # ========== 多头交叉注意力 ==========
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            batch_first=True,
-            dropout=0.1
-        )
+        # ========== 注意力分数缩放 ==========
+        self.scale = (hidden_dim // num_heads) ** -0.5
+        self.num_heads = num_heads
         
         # ========== 输出融合层 ==========
         # 融合 attended feature + global pooled feature
@@ -253,43 +233,16 @@ class HeightPointAttentionEncoder(nn.Module):
             nn.Linear(hidden_dim, output_dim)
         )
         
-        # 保存注意力权重用于可视化
+        # 保存注意力权重用于可视化和监督
         self.last_attn_weights = None
-        self.last_nominal_foothold = None
-    
-    def compute_nominal_foothold(self, cmd_vel: torch.Tensor, v_current: torch.Tensor = None) -> torch.Tensor:
-        """
-        使用 Raibert 启发式公式计算名义落足点
-        
-        简化版公式: p_nominal = (T_stance / 2) * v_cmd
-        完整版公式: p_nominal = (T_stance / 2) * v_cmd + k_raibert * (v_cmd - v_current)
-        
-        Args:
-            cmd_vel: [B, 3] 指令速度 (x, y, yaw)
-            v_current: [B, 3] 当前速度 (x, y, yaw)，仅完整版需要
-            
-        Returns:
-            p_nominal: [B, 2] 名义落足点位置 (x, y) in base frame
-        """
-        # 只使用 x, y 分量
-        v_cmd = cmd_vel[:, :2]  # [B, 2]
-        
-        # 前馈项：基于指令速度
-        p_nominal = (self.T_stance / 2.0) * v_cmd
-        
-        # 完整版：添加速度误差反馈项
-        if self.use_full_raibert and v_current is not None:
-            v_cur = v_current[:, :2]  # [B, 2]
-            velocity_error = v_cmd - v_cur  # [B, 2]
-            p_nominal = p_nominal + self.k_raibert * velocity_error
-        
-        return p_nominal  # [B, 2]
+        self.last_raw_attn_scores = None  # 保存原始注意力分数（用于 loss 计算）
     
     def forward(self, 
                 height_points: torch.Tensor,
                 proprioception: torch.Tensor,
-                cmd_vel: torch.Tensor,
-                v_current: torch.Tensor = None) -> tuple:
+                safety_scores: torch.Tensor = None,
+                beta: float = 0.0,
+                **kwargs) -> tuple:
         """
         前向传播
         
@@ -297,8 +250,8 @@ class HeightPointAttentionEncoder(nn.Module):
             height_points: [B, num_x, num_y, 3] 地形高度点 (x, y, z) in base frame
                           或 [B, num_points, 3] 展平形式
             proprioception: [B, Proprio_Dim] 本体感知
-            cmd_vel: [B, 3] 指令速度
-            v_current: [B, 3] 当前速度 (仅完整版 Raibert 需要)
+            safety_scores: [B, num_points] 物理安全分数 (可选)
+            beta: float 偏置强度 (可选，用于课程式衰减)
             
         Returns:
             context_vector: [B, output_dim] 注意力加权的地形特征
@@ -319,55 +272,65 @@ class HeightPointAttentionEncoder(nn.Module):
         
         num_points = height_points_flat.shape[1]
         
-        # ========== Step A: 计算名义落足点 (Raibert Heuristic) ==========
-        p_nominal = self.compute_nominal_foothold(cmd_vel, v_current)  # [B, 2]
-        self.last_nominal_foothold = p_nominal  # 保存用于可视化/奖励
-        
-        # ========== Step B: 编码每个高度点 ==========
+        # ========== Step A: 编码每个高度点 ==========
         # height_points_flat: [B, num_points, 3] -> [B, num_points, point_feature_dim]
         point_features = self.point_encoder(height_points_flat)  # [B, num_points, point_feature_dim]
         
-        # ========== Step C: 构建空间感知 Query ==========
-        # 拼接 proprioception 和 p_nominal
-        query_input = torch.cat([proprioception, p_nominal], dim=-1)  # [B, proprio_dim + 2]
-        query = self.query_mlp(query_input).unsqueeze(1)  # [B, 1, hidden_dim]
+        # ========== Step B: 构建 Query (仅本体感知) ==========
+        query = self.query_mlp(proprioception).unsqueeze(1)  # [B, 1, hidden_dim]
         
-        # ========== Step D: 生成 Key 和 Value ==========
+        # ========== Step C: 生成 Key 和 Value ==========
         keys = self.key_proj(point_features)    # [B, num_points, hidden_dim]
         values = self.value_proj(point_features)  # [B, num_points, hidden_dim]
         
-        # ========== Step E: 多头注意力机制 ==========
-        # Query: [B, 1, hidden_dim]
-        # Keys:  [B, num_points, hidden_dim]
-        # Values: [B, num_points, hidden_dim]
-        attended, attn_weights = self.cross_attention(
-            query=query,
-            key=keys,
-            value=values
-        )  # attended: [B, 1, hidden_dim], attn_weights: [B, 1, num_points]
+        # ========== Step D: 计算注意力分数 ==========
+        # 手动实现注意力以便添加安全偏置
+        # raw_attention = (Q × K^T) / √d
+        raw_attn_scores = torch.bmm(query, keys.transpose(1, 2)) * self.scale  # [B, 1, num_points]
+        raw_attn_scores = raw_attn_scores.squeeze(1)  # [B, num_points]
         
-        # ========== Step F: 输出融合 ==========
-        # F.1: 全局地形特征作为补充 (平均池化)
+        # 保存原始注意力分数（用于调试/分析）
+        self.last_raw_attn_scores = raw_attn_scores.detach()
+        
+        # ========== Step E: 添加安全偏置 (LIP + 平坦度引导) ==========
+        if self.use_safety_bias and safety_scores is not None and beta > 0:
+            # biased_attention = raw_attention + β × safety_scores
+            biased_attn_scores = raw_attn_scores + beta * safety_scores
+        else:
+            biased_attn_scores = raw_attn_scores
+        
+        # ========== Step F: Softmax 获得注意力权重 ==========
+        attn_weights = torch.softmax(biased_attn_scores, dim=-1)  # [B, num_points]
+        
+        # ========== Step G: 加权聚合 Value ==========
+        # attn_weights: [B, num_points] -> [B, 1, num_points]
+        attended = torch.bmm(attn_weights.unsqueeze(1), values)  # [B, 1, hidden_dim]
+        
+        # ========== Step H: 输出融合 ==========
+        # H.1: 全局地形特征作为补充 (平均池化)
         global_feature = point_features.mean(dim=1)  # [B, point_feature_dim]
-        global_feature = self.key_proj(global_feature)  # [B, hidden_dim] 复用 key_proj
+        global_feature = self.key_proj(global_feature)  # [B, hidden_dim]
         
-        # F.2: 融合注意力输出和全局特征
+        # H.2: 融合注意力输出和全局特征
         attended = attended.squeeze(1)  # [B, hidden_dim]
         fused_output = torch.cat([attended, global_feature], dim=-1)  # [B, hidden_dim * 2]
         context_vector = self.output_mlp(fused_output)  # [B, output_dim]
         
-        # F.3: 重塑注意力权重用于可视化 [B, 1, num_points] -> [B, num_x, num_y]
-        self.last_attn_weights = attn_weights.squeeze(1).view(B, num_x, num_y)
+        # H.3: 重塑注意力权重用于可视化 [B, num_points] -> [B, num_x, num_y]
+        self.last_attn_weights = attn_weights.view(B, num_x, num_y)
         
         return context_vector, self.last_attn_weights
-    
-    def get_nominal_foothold(self) -> torch.Tensor:
-        """获取最近一次计算的名义落足点"""
-        return self.last_nominal_foothold
     
     def get_attention_weights(self) -> torch.Tensor:
         """获取最近一次的注意力权重，用于可视化"""
         return self.last_attn_weights
+    
+    def get_attention_weights_flat(self) -> torch.Tensor:
+        """获取展平的注意力权重 [B, num_points]，用于 loss 计算"""
+        if self.last_attn_weights is None:
+            return None
+        B = self.last_attn_weights.shape[0]
+        return self.last_attn_weights.view(B, -1)
 
 
 class ActorCriticDepth(nn.Module):
@@ -400,11 +363,14 @@ class ActorCriticDepth(nn.Module):
                         attention_hidden_dim=128,           # 注意力隐藏维度
                         attention_heads=4,                  # 注意力头数
                         attention_output_dim=64,            # 注意力输出维度
-                        T_stance=0.25,                      # Raibert站立相时间 (秒)
-                        learnable_T_stance=True,            # 是否让T_stance可学习
-                        use_full_raibert=False,             # 是否使用完整版Raibert公式
-                        k_raibert=0.03,                     # Raibert反馈增益
-                        learnable_k_raibert=True,           # 是否让k_raibert可学习
+                        # ==========================================
+                        # ========== LIP + 平坦度注意力引导参数 ==========
+                        use_safety_bias=True,               # 是否使用物理安全偏置
+                        use_attention_loss=True,            # 是否使用注意力监督 loss
+                        use_curriculum_decay=True,          # 是否启用课程式衰减
+                        beta_max=2.0,                       # 初期偏置强度
+                        beta_min=0.0,                       # 后期偏置强度
+                        decay_curriculum_levels=10,         # 衰减所需的课程等级数
                         # ==========================================
                         # ========== 落足点预测辅助任务参数 ==========
                         use_foothold_predictor=False,       # 是否启用落足点预测辅助任务
@@ -414,6 +380,11 @@ class ActorCriticDepth(nn.Module):
                         spatial_feature_channels=128,
                         spatial_feature_height=5,
                         spatial_feature_width=5,
+                        T_stance=0.25,                      # 已废弃 (兼容旧配置)
+                        learnable_T_stance=True,            # 已废弃
+                        use_full_raibert=False,             # 已废弃
+                        k_raibert=0.03,                     # 已废弃
+                        learnable_k_raibert=True,           # 已废弃
                         **kwargs):
         if kwargs:
             print("ActorCriticDepth.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()]))
@@ -424,10 +395,19 @@ class ActorCriticDepth(nn.Module):
         self.max_grad_norm = max_grad_norm
         self.use_spatial_attention = use_spatial_attention
         self.use_foothold_predictor = use_foothold_predictor
-        self.use_full_raibert = use_full_raibert
         self.num_actor_obs = num_actor_obs
         self.num_points_x = num_points_x
         self.num_points_y = num_points_y
+        
+        # ========== LIP + 平坦度注意力引导参数 ==========
+        self.use_safety_bias = use_safety_bias
+        self.use_attention_loss = use_attention_loss
+        self.use_curriculum_decay = use_curriculum_decay
+        self.beta_max = beta_max
+        self.beta_min = beta_min
+        self.decay_curriculum_levels = decay_curriculum_levels
+        self.current_beta = beta_max  # 当前偏置强度（会随课程衰减）
+        # ================================================
 
         # depth encoder (保留用于提取全局深度特征)
         depth_backbone = DepthOnlyFCBackbone58x87(output_dim=128, output_activation=activation)
@@ -438,14 +418,16 @@ class ActorCriticDepth(nn.Module):
         if use_spatial_attention:
             print("=" * 60)
             print("  基于地形高度点的空间感知注意力 (Height Point Attention) ENABLED")
+            print("  使用 LIP + 平坦度注意力引导机制 (Query 仅使用本体感知)")
             print("=" * 60)
             print(f"  高度点网格: {num_points_x} x {num_points_y} = {num_points_x * num_points_y} 点")
             print(f"  每点特征维度: {point_feature_dim}")
             print(f"  注意力头数: {attention_heads}")
             print(f"  输出维度: {attention_output_dim}")
-            print(f"  Raibert 公式: {'完整版 (含速度误差反馈)' if use_full_raibert else '简化版 (仅前馈)'}")
-            if use_full_raibert:
-                print(f"  k_raibert 初始值: {k_raibert}, 可学习: {learnable_k_raibert}")
+            print(f"  安全偏置: {'ENABLED' if use_safety_bias else 'DISABLED'}")
+            print(f"  注意力监督 Loss: {'ENABLED' if use_attention_loss else 'DISABLED'}")
+            if use_curriculum_decay:
+                print(f"  课程式 β 衰减: β_max={beta_max} → β_min={beta_min} (levels={decay_curriculum_levels})")
             
             # 基于高度点的空间感知注意力编码器
             self.spatial_attention = HeightPointAttentionEncoder(
@@ -456,11 +438,7 @@ class ActorCriticDepth(nn.Module):
                 hidden_dim=attention_hidden_dim,
                 num_heads=attention_heads,
                 output_dim=attention_output_dim,
-                T_stance=T_stance,
-                learnable_T_stance=learnable_T_stance,
-                use_full_raibert=use_full_raibert,
-                k_raibert=k_raibert,
-                learnable_k_raibert=learnable_k_raibert
+                use_safety_bias=use_safety_bias
             )
             
             # Actor输入维度: obs + history + depth + spatial_attention
@@ -492,10 +470,10 @@ class ActorCriticDepth(nn.Module):
         
         mlp_input_dim_c = num_critic_obs + his_latent_dim
         
-        # 保存名义落足点，供环境计算奖励使用
-        self.last_nominal_foothold = None
         # 保存预测的落足点修正量，供训练时计算 Aux Loss 使用
         self.last_pred_footholds = None
+        # 保存最新的注意力权重，供监督 loss 使用
+        self.last_attn_weights_flat = None
         
         # History Encoder
         encoder_layers = []
@@ -569,7 +547,8 @@ class ActorCriticDepth(nn.Module):
         mean = self.actor(observations)
         self.distribution = Normal(mean, mean*0. + self.std)
 
-    def act(self, observations, history, depth, height_points=None, cmd_vel=None, v_current=None, **kwargs):
+    def act(self, observations, history, depth, height_points=None, safety_scores=None, 
+            curriculum_level=0, **kwargs):
         """
         根据观测生成动作
         
@@ -578,8 +557,8 @@ class ActorCriticDepth(nn.Module):
             history: [B, history_len, obs_dim] 历史观测
             depth: [B, buffer_len, H, W] 深度图像
             height_points: [B, num_x, num_y, 3] 地形高度采样点 (启用空间注意力时必须)
-            cmd_vel: [B, 3] 指令速度 (启用空间注意力时必须)
-            v_current: [B, 3] 当前速度 (仅完整版 Raibert 需要)
+            safety_scores: [B, num_points] 物理安全分数 (用于注意力偏置)
+            curriculum_level: float 当前课程等级 (用于动态 β 衰减)
             
         Returns:
             actions: [B, num_actions] 采样的动作
@@ -592,15 +571,22 @@ class ActorCriticDepth(nn.Module):
         depth_feature = self.depth_encoder(depth)  # [B, 128]
         
         # 基于高度点的空间感知注意力
-        if self.use_spatial_attention and height_points is not None and cmd_vel is not None:
-            # 使用高度点空间注意力
-            attn_feature, _ = self.spatial_attention(
+        if self.use_spatial_attention and height_points is not None:
+            # 计算当前 β (课程式衰减)
+            beta = self._get_beta(curriculum_level)
+            self.current_beta = beta
+            
+            # 使用高度点空间注意力 (带安全偏置)
+            attn_feature, attn_weights = self.spatial_attention(
                 height_points=height_points,
                 proprioception=observations,
-                cmd_vel=cmd_vel,
-                v_current=v_current
+                safety_scores=safety_scores,
+                beta=beta
             )
-            self.last_nominal_foothold = self.spatial_attention.get_nominal_foothold()
+            
+            # 保存注意力权重用于监督 loss
+            B = attn_weights.shape[0]
+            self.last_attn_weights_flat = attn_weights.view(B, -1)
             
             # ========== 落足点预测辅助任务 ==========
             if self.foothold_predictor is not None:
@@ -613,16 +599,31 @@ class ActorCriticDepth(nn.Module):
         else:
             # 原始逻辑（无空间注意力）
             actor_input = torch.cat((observations, his_feature, depth_feature), dim=-1)
-            self.last_nominal_foothold = None
             self.last_pred_footholds = None
+            self.last_attn_weights_flat = None
         
         self.update_distribution(actor_input)
         return self.distribution.sample()
     
+    def _get_beta(self, curriculum_level: float) -> float:
+        """
+        根据课程等级计算当前的偏置强度 β
+        
+        公式: β = β_max - (β_max - β_min) × (level / max_level)
+        """
+        if not self.use_curriculum_decay:
+            return self.beta_max
+        
+        # 线性衰减
+        progress = min(curriculum_level / self.decay_curriculum_levels, 1.0)
+        beta = self.beta_max - (self.beta_max - self.beta_min) * progress
+        return beta
+    
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
-    def act_inference(self, observations, history, depth, height_points=None, cmd_vel=None, v_current=None, **kwargs):
+    def act_inference(self, observations, history, depth, height_points=None, safety_scores=None, 
+                      beta_inference=0.5, **kwargs):
         """
         推理时生成动作（无采样噪声）
         
@@ -631,8 +632,8 @@ class ActorCriticDepth(nn.Module):
             history: [B, history_len, obs_dim] 历史观测
             depth: [B, buffer_len, H, W] 深度图像
             height_points: [B, num_x, num_y, 3] 地形高度采样点
-            cmd_vel: [B, 3] 指令速度
-            v_current: [B, 3] 当前速度 (仅完整版 Raibert 需要)
+            safety_scores: [B, num_points] 物理安全分数 (用于注意力偏置)
+            beta_inference: float 推理时的偏置强度 (默认 0.5 作为安全保障)
             
         Returns:
             actions_mean: [B, num_actions] 动作均值
@@ -642,14 +643,14 @@ class ActorCriticDepth(nn.Module):
         depth_feature = self.depth_encoder(depth)  # [B, 128]
         
         # 基于高度点的空间感知注意力
-        if self.use_spatial_attention and height_points is not None and cmd_vel is not None:
-            attn_feature, _ = self.spatial_attention(
+        if self.use_spatial_attention and height_points is not None:
+            # 推理时使用固定的 β 值
+            attn_feature, attn_weights = self.spatial_attention(
                 height_points=height_points,
                 proprioception=observations,
-                cmd_vel=cmd_vel,
-                v_current=v_current
+                safety_scores=safety_scores,
+                beta=beta_inference
             )
-            self.last_nominal_foothold = self.spatial_attention.get_nominal_foothold()
             
             # 落足点预测（推理时也计算，用于可视化）
             if self.foothold_predictor is not None:
@@ -660,15 +661,10 @@ class ActorCriticDepth(nn.Module):
             actor_input = torch.cat((observations, his_feature, depth_feature, attn_feature), dim=-1)
         else:
             actor_input = torch.cat((observations, his_feature, depth_feature), dim=-1)
-            self.last_nominal_foothold = None
             self.last_pred_footholds = None
         
         actions_mean = self.actor(actor_input)
         return actions_mean
-    
-    def get_nominal_foothold(self):
-        """获取最近一次计算的名义落足点 (Raibert Heuristic)"""
-        return self.last_nominal_foothold
     
     def get_pred_footholds(self):
         """
@@ -681,6 +677,10 @@ class ActorCriticDepth(nn.Module):
         if self.use_spatial_attention and self.spatial_attention is not None:
             return self.spatial_attention.get_attention_weights()
         return None
+    
+    def get_attention_weights_flat(self):
+        """获取展平的注意力权重 [B, num_points]，用于 loss 计算"""
+        return self.last_attn_weights_flat
     
     def get_attention_stats(self):
         """
@@ -710,16 +710,14 @@ class ActorCriticDepth(nn.Module):
             topk_values, _ = torch.topk(attn_flat, k=k, dim=-1)
             sparsity = (topk_values.sum(dim=-1) / (attn_flat.sum(dim=-1) + 1e-8)).mean()
             
-            # 4. Raibert 参数
-            T_stance = self.spatial_attention.T_stance.item()
-            k_raibert = self.spatial_attention.k_raibert.item()
+            # 4. 当前 β 值
+            current_beta = self.current_beta
             
             return {
                 'entropy': entropy.item(),
                 'peak_value': peak_value.item(),
                 'sparsity': sparsity.item(),
-                'T_stance': T_stance,
-                'k_raibert': k_raibert,
+                'current_beta': current_beta,
             }
     
     def evaluate(self, critic_observations, history, **kwargs):
