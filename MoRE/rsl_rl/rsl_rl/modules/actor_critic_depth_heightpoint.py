@@ -35,6 +35,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Normal
 
 
@@ -68,7 +69,30 @@ class DepthOnlyFCBackbone58x87(nn.Module):
             self.output_activation = activation
 
     def forward(self, images: torch.Tensor):
-        images_compressed = self.image_compression(images.unsqueeze(1)) # [bs * 2, 1 64 64]
+        """
+        Args:
+            images: Tensor of shape [N, H, W] (no explicit channel dim).
+                Note: despite the historical class name containing "58x87", the current
+                `image_compression` MLP is built assuming a 64x64 input (so that the
+                conv stack ends in 64x5x5 -> 1600 features).
+                To make the model robust to different upstream depth resolutions,
+                we resize to (64, 64) when needed.
+        """
+        if images.ndim != 3:
+            raise ValueError(f"DepthOnlyFCBackbone expects images [N,H,W] but got shape {tuple(images.shape)}")
+
+        # `image_compression` is designed for 64x64.
+        target_hw = (64, 64)
+        if tuple(images.shape[-2:]) != target_hw:
+            # Resize only when mismatch happens; keep this path cheap for the common (64,64) case.
+            images = F.interpolate(
+                images.unsqueeze(1),
+                size=target_hw,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
+
+        images_compressed = self.image_compression(images.unsqueeze(1))  # [N, 1, 64, 64] -> [N, output_dim]
         latent = self.output_activation(images_compressed)
 
         return latent
@@ -86,65 +110,12 @@ class StackDepthEncoder(nn.Module):  # 堆叠深度编码器：处理多帧深�
         self.mlp = nn.Sequential(nn.Linear(16*62, 128), activation)
         
     def forward(self, depth_image):
-        # depth_image shape: [batch_size, num, 58, 87]
+        # depth_image shape: [batch_size, num, H, W] (typically 64x64 in current env configs)
         depth_latent = self.base_backbone(depth_image.flatten(0, 1))  # [batch_size * num, 128]
         depth_latent = depth_latent.reshape(depth_image.shape[0], depth_image.shape[1], -1)  # [batch_size, num, 128]
         depth_latent = self.conv1d(depth_latent) # [batch_size, 16, 62]
         depth_latent = self.mlp(depth_latent.flatten(1, 2))
         return depth_latent
-
-
-class FootholdPredictor(nn.Module):
-    """
-    落足点预测辅助头 (Foothold Prediction Auxiliary Head)
-    
-    预测相对于 Raibert 启发式点的修正量 (Residual Prediction)。
-    
-    输入: context_vector [B, input_dim] - 来自 HeightPointAttentionEncoder 的输出
-    输出: delta_footholds [B, 2, 3] - 左右腿的 (Δx, Δy, Δz) 修正量
-    
-    坐标系: Base Frame (基座坐标系)
-        - X: 机器人前方
-        - Y: 机器人左侧  
-        - Z: 垂直向上
-    
-    梯度流说明:
-        当 loss_foot.backward() 执行时:
-        loss_foot → FootholdPredictor → context_vector → HeightPointAttentionEncoder 
-        → height_points encoding
-        
-        这会强迫整个编码管道学习地形几何特征。
-    """
-    
-    def __init__(self, input_dim: int, hidden_dim: int = 256):
-        super().__init__()
-        
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 6)  # 2 legs * 3 coordinates = 6
-        )
-        
-        # 初始化最后一层为小值，使初始输出接近 0（即接近 Raibert 点）
-        nn.init.zeros_(self.mlp[-1].bias)
-        nn.init.normal_(self.mlp[-1].weight, std=0.01)
-    
-    def forward(self, context_vector: torch.Tensor) -> torch.Tensor:
-        """
-        前向传播
-        
-        Args:
-            context_vector: [B, input_dim] 来自 HeightPointAttentionEncoder 的输出
-            
-        Returns:
-            delta_footholds: [B, 2, 3] 落足点修正量
-                - dim 1: 0=Left leg, 1=Right leg
-                - dim 2: (Δx, Δy, Δz) in base frame
-        """
-        delta = self.mlp(context_vector)  # [B, 6]
-        return delta.view(-1, 2, 3)  # [B, 2, 3]
 
 
 class HeightPointAttentionEncoder(nn.Module):
@@ -392,10 +363,6 @@ class ActorCriticDepth(nn.Module):
                         beta_min=0.0,                       # 后期偏置强度
                         decay_curriculum_levels=10,         # 衰减所需的课程等级数
                         # ==========================================
-                        # ========== 落足点预测辅助任务参数 ==========
-                        use_foothold_predictor=False,       # 是否启用落足点预测辅助任务
-                        foothold_predictor_hidden_dim=256,  # FootholdPredictor 隐藏层维度
-                        # ==========================================
                         # 以下参数为兼容旧配置，不再使用
                         spatial_feature_channels=128,
                         spatial_feature_height=5,
@@ -414,7 +381,6 @@ class ActorCriticDepth(nn.Module):
         self.his_latent_dim = his_latent_dim
         self.max_grad_norm = max_grad_norm
         self.use_spatial_attention = use_spatial_attention
-        self.use_foothold_predictor = use_foothold_predictor
         self.num_actor_obs = num_actor_obs
         self.num_points_x = num_points_x
         self.num_points_y = num_points_y
@@ -464,34 +430,17 @@ class ActorCriticDepth(nn.Module):
             # Actor输入维度: obs + history + depth + spatial_attention
             mlp_input_dim_a = num_actor_obs + his_latent_dim + self.depth_output_dim + attention_output_dim
             print(f"  Actor输入维度: {mlp_input_dim_a}")
-            
-            # ========== 落足点预测辅助头 ==========
-            if use_foothold_predictor:
-                print("-" * 60)
-                print("  落足点预测辅助任务 (Foothold Predictor) ENABLED")
-                self.foothold_predictor = FootholdPredictor(
-                    input_dim=attention_output_dim,
-                    hidden_dim=foothold_predictor_hidden_dim
-                )
-                print(f"  FootholdPredictor: input_dim={attention_output_dim}, hidden_dim={foothold_predictor_hidden_dim}")
-            else:
-                print("-" * 60)
-                print("  落足点预测辅助任务 DISABLED")
-                self.foothold_predictor = None
             print("=" * 60)
         else:
             print("=" * 60)
             print("  空间感知注意力 DISABLED")
             print("=" * 60)
             self.spatial_attention = None
-            self.foothold_predictor = None
             mlp_input_dim_a = num_actor_obs + his_latent_dim + self.depth_output_dim
             print(f"  Actor输入维度 (无空间注意力): {mlp_input_dim_a}")
         
         mlp_input_dim_c = num_critic_obs + his_latent_dim
         
-        # 保存预测的落足点修正量，供训练时计算 Aux Loss 使用
-        self.last_pred_footholds = None
         # 保存最新的注意力权重，供监督 loss 使用
         self.last_attn_weights_flat = None
         
@@ -608,18 +557,11 @@ class ActorCriticDepth(nn.Module):
             B = attn_weights.shape[0]
             self.last_attn_weights_flat = attn_weights.view(B, -1)
             
-            # ========== 落足点预测辅助任务 ==========
-            if self.foothold_predictor is not None:
-                self.last_pred_footholds = self.foothold_predictor(attn_feature)  # [B, 2, 3]
-            else:
-                self.last_pred_footholds = None
-            
             # 拼接所有特征
             actor_input = torch.cat((observations, his_feature, depth_feature, attn_feature), dim=-1)
         else:
             # 原始逻辑（无空间注意力）
             actor_input = torch.cat((observations, his_feature, depth_feature), dim=-1)
-            self.last_pred_footholds = None
             self.last_attn_weights_flat = None
         
         self.update_distribution(actor_input)
@@ -672,25 +614,12 @@ class ActorCriticDepth(nn.Module):
                 beta=beta_inference
             )
             
-            # 落足点预测（推理时也计算，用于可视化）
-            if self.foothold_predictor is not None:
-                self.last_pred_footholds = self.foothold_predictor(attn_feature)  # [B, 2, 3]
-            else:
-                self.last_pred_footholds = None
-            
             actor_input = torch.cat((observations, his_feature, depth_feature, attn_feature), dim=-1)
         else:
             actor_input = torch.cat((observations, his_feature, depth_feature), dim=-1)
-            self.last_pred_footholds = None
         
         actions_mean = self.actor(actor_input)
         return actions_mean
-    
-    def get_pred_footholds(self):
-        """
-        获取最近一次预测的落足点修正量 [B, 2, 3]
-        """
-        return self.last_pred_footholds
     
     def get_attention_weights(self):
         """获取最近一次的注意力权重，用于可视化"""

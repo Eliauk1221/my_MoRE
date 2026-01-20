@@ -54,12 +54,6 @@ class RolloutStorageEX:
             self.next_observations = None
             self.next_critic_observations = None
             
-            # ========== 落足点预测辅助任务 ==========
-            self.pred_footholds = None       # 模型预测的落足点修正量 [B, 2, 3]
-            self.target_footholds = None     # Oracle 计算的真值 [B, 2, 3]
-            self.foothold_mask = None        # Swing leg 掩码 [B, 2]
-            # ========================================
-            
             # ========== 空间感知注意力需要的数据 ==========
             self.height_points = None        # 地形高度采样点 [B, num_x, num_y, 3]
             self.v_current = None            # 当前速度 [B, 3]
@@ -78,7 +72,6 @@ class RolloutStorageEX:
     def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, actions_shape, 
                  device='cpu', history_len = 10, history_dim=45, depth_shape=None, depth_buffer_len=None, 
                  next_obs_shape=None, num_critics=1, num_experts=1,
-                 use_foothold_predictor=False,
                  use_spatial_attention=False, num_points_x=17, num_points_y=11):
 
         self.device = device
@@ -126,21 +119,6 @@ class RolloutStorageEX:
         else:
             self.gate_weights = None
 
-        # ========== 落足点预测辅助任务存储 ==========
-        self.use_foothold_predictor = use_foothold_predictor
-        if use_foothold_predictor:
-            # pred_footholds: 模型预测的相对于 Raibert 点的修正量 [T, B, 2, 3]
-            self.pred_footholds = torch.zeros(num_transitions_per_env, num_envs, 2, 3, device=self.device)
-            # target_footholds: Oracle 计算的真值 (P_oracle - P_raibert) [T, B, 2, 3]
-            self.target_footholds = torch.zeros(num_transitions_per_env, num_envs, 2, 3, device=self.device)
-            # foothold_mask: Swing leg 掩码，只对摆动腿计算 loss [T, B, 2]
-            self.foothold_mask = torch.zeros(num_transitions_per_env, num_envs, 2, device=self.device)
-        else:
-            self.pred_footholds = None
-            self.target_footholds = None
-            self.foothold_mask = None
-        # ==============================================
-        
         # ========== 空间感知注意力存储 ==========
         self.use_spatial_attention = use_spatial_attention
         self.num_points = num_points_x * num_points_y
@@ -188,14 +166,6 @@ class RolloutStorageEX:
         self._save_hidden_states(transition.hidden_states)
         if self.gate_weights is not None:
             self.gate_weights[self.step].copy_(transition.gate_weights)
-        # ========== 落足点预测辅助任务 ==========
-        if self.pred_footholds is not None and transition.pred_footholds is not None:
-            self.pred_footholds[self.step].copy_(transition.pred_footholds)
-        if self.target_footholds is not None and transition.target_footholds is not None:
-            self.target_footholds[self.step].copy_(transition.target_footholds)
-        if self.foothold_mask is not None and transition.foothold_mask is not None:
-            self.foothold_mask[self.step].copy_(transition.foothold_mask)
-        # ========================================
         # ========== 空间感知注意力 ==========
         if self.height_points is not None and transition.height_points is not None:
             self.height_points[self.step].copy_(transition.height_points)
@@ -265,11 +235,6 @@ class RolloutStorageEX:
         depth_image = self.depth_image.flatten(0, 1) if self.depth_image is not None else None
         gate_weights = self.gate_weights.flatten(0, 1) if self.gate_weights is not None else None
         
-        # ========== 落足点预测辅助任务 ==========
-        pred_footholds = self.pred_footholds.flatten(0, 1) if self.pred_footholds is not None else None
-        target_footholds = self.target_footholds.flatten(0, 1) if self.target_footholds is not None else None
-        foothold_mask = self.foothold_mask.flatten(0, 1) if self.foothold_mask is not None else None
-        # ========================================
         # ========== 空间感知注意力 ==========
         height_points = self.height_points.flatten(0, 1) if self.height_points is not None else None
         v_current = self.v_current.flatten(0, 1) if self.v_current is not None else None
@@ -315,11 +280,6 @@ class RolloutStorageEX:
                 depth_image_batch = depth_image[batch_idx] if depth_image is not None else None
                 gate_weights_batch = gate_weights[batch_idx] if gate_weights is not None else None
                 
-                # ========== 落足点预测辅助任务 ==========
-                pred_footholds_batch = pred_footholds[batch_idx] if pred_footholds is not None else None
-                target_footholds_batch = target_footholds[batch_idx] if target_footholds is not None else None
-                foothold_mask_batch = foothold_mask[batch_idx] if foothold_mask is not None else None
-                # ========================================
                 # ========== 空间感知注意力 ==========
                 height_points_batch = height_points[batch_idx] if height_points is not None else None
                 v_current_batch = v_current[batch_idx] if v_current is not None else None
@@ -331,7 +291,6 @@ class RolloutStorageEX:
                 
                 yield obs_batch, critic_observations_batch, actions_batch, next_obs_batch, next_critic_observations_batch, history_batch, target_values_batch, advantages_batch, returns_batch, \
                        old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None, depth_image_batch, \
-                       pred_footholds_batch, target_footholds_batch, foothold_mask_batch, \
                        height_points_batch, v_current_batch, \
                        safety_scores_batch, target_attention_batch
 

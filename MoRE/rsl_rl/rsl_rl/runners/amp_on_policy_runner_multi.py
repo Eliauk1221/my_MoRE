@@ -42,7 +42,6 @@ from rsl_rl.algorithms.amp_ppo_multi import AMPPPOMulti
 from rsl_rl.modules.actor_critic import ActorCritic
 from rsl_rl.modules.actor_critic_depth import (
     ActorCriticDepth,           # 默认（高度点方案）
-    ActorCriticDepthImage,      # 深度图像方案
     ActorCriticDepthHeightPoint,  # 高度点方案（显式名称）
 )
 from rsl_rl.env import VecEnv
@@ -85,21 +84,11 @@ class AMPOnPolicyRunnerMulti:
             num_critic_obs = self.env.num_obs
         num_actor_obs = self.env.num_obs
         
-        # ========== 根据 attention_type 自动选择 ActorCritic 类 ==========
+        # ========== 选择 ActorCritic 类 ==========
+        # 当前代码库仅保留“高度点空间注意力”方案：
+        # - ActorCriticDepth / ActorCriticDepthHeightPoint 都指向高度点版本
         policy_class_name = self.cfg["policy_class_name"]
-        attention_type = self.policy_cfg.get("attention_type", "heightpoint")
-        use_spatial_attention = self.policy_cfg.get("use_spatial_attention", False)
-        
-        # 只有当启用空间注意力且类名是通用的 ActorCriticDepth 时才自动选择
-        if use_spatial_attention and policy_class_name == "ActorCriticDepth":
-            if attention_type == "image":
-                actor_critic_class = ActorCriticDepthImage
-                print(f"[Runner] 自动选择深度图像方案 (attention_type={attention_type})")
-            else:  # "heightpoint" 或其他
-                actor_critic_class = ActorCriticDepthHeightPoint
-                print(f"[Runner] 自动选择高度点方案 (attention_type={attention_type})")
-        else:
-            actor_critic_class = eval(policy_class_name)
+        actor_critic_class = eval(policy_class_name)
         # ================================================================
         
         actor_critic: ActorCritic = actor_critic_class( num_actor_obs=num_actor_obs,
@@ -224,20 +213,6 @@ class AMPOnPolicyRunnerMulti:
                       "Please implement this method to provide safety scores.")
         # ==============================================================
         
-        # ========== 检查是否启用落足点预测辅助任务 ==========
-        self.use_foothold_predictor = hasattr(self.alg, 'use_foothold_predictor') and \
-                                       self.alg.use_foothold_predictor
-        if self.use_foothold_predictor:
-            print("========== Runner: Foothold Predictor Aux Task ENABLED ==========")
-            # 检查环境是否实现了所需接口
-            if not hasattr(self.env, 'get_target_footholds'):
-                print("[WARNING] Environment does not implement 'get_target_footholds()'. "
-                      "Please implement this method to provide Oracle foothold targets.")
-            if not hasattr(self.env, 'get_foothold_mask'):
-                print("[WARNING] Environment does not implement 'get_foothold_mask()'. "
-                      "Please implement this method to provide swing leg mask.")
-        # ==============================================================
-        
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
             # Rollout
@@ -281,24 +256,6 @@ class AMPOnPolicyRunnerMulti:
                     
                     obs, privileged_obs, rewards, dones, infos, _, terminal_amp_states, terminal_obs, terminal_critic_obs = self.env.step(actions)
                     
-                    # ========== 获取落足点预测辅助任务的真值 ==========
-                    # target_footholds: Oracle 地形搜索得到的最优落足点（相对于 Raibert 点的修正量）
-                    # foothold_mask: Swing leg 掩码
-                    target_footholds = None
-                    foothold_mask = None
-                    if self.use_foothold_predictor:
-                        if hasattr(self.env, 'get_target_footholds'):
-                            # target_footholds = P_oracle - P_raibert，形状 [B, 2, 3]
-                            target_footholds = self.env.get_target_footholds()
-                            if target_footholds is not None:
-                                target_footholds = target_footholds.to(self.device)
-                        if hasattr(self.env, 'get_foothold_mask'):
-                            # foothold_mask: [B, 2], mask[b, i]=1 表示 Leg i 是 Swing Leg
-                            foothold_mask = self.env.get_foothold_mask()
-                            if foothold_mask is not None:
-                                foothold_mask = foothold_mask.to(self.device)
-                    # ===================================================
-                    
                     critic_obs = privileged_obs if privileged_obs is not None else obs
                     obs, critic_obs, rewards, dones = obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
 
@@ -322,11 +279,9 @@ class AMPOnPolicyRunnerMulti:
                             self.amp_obs_frames, rewards, normalizer=self.alg.amp_normalizer)
 
                         amp_obs = torch.clone(next_amp_obs)
-                        self.alg.process_env_step(rewards, dones, infos, next_obs, next_critic_obs, self.amp_obs_frames,
-                                                  target_footholds=target_footholds, foothold_mask=foothold_mask)
+                        self.alg.process_env_step(rewards, dones, infos, next_obs, next_critic_obs, self.amp_obs_frames)
                     else:
-                        self.alg.process_env_step(rewards, dones, infos, next_obs, next_critic_obs,
-                                                  target_footholds=target_footholds, foothold_mask=foothold_mask)
+                        self.alg.process_env_step(rewards, dones, infos, next_obs, next_critic_obs)
 
                     # process trajectory history
                     self.trajectory_history[env_ids] = 0
@@ -372,7 +327,7 @@ class AMPOnPolicyRunnerMulti:
             
             mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss, \
             mean_policy_pred, mean_expert_pred, mean_agent_acc, mean_demo_acc, \
-            mean_foothold_loss, mean_attention_loss = self.alg.update()
+            mean_attention_loss = self.alg.update()
             stop = time.time()
             learn_time = stop - start
             if self.log_dir is not None:
@@ -410,8 +365,6 @@ class AMPOnPolicyRunnerMulti:
         self.writer.add_scalar('Loss/surrogate', locs['mean_surrogate_loss'], locs['it'])
         self.writer.add_scalar('Loss/AMP', locs['mean_amp_loss'], locs['it'])
         self.writer.add_scalar('Loss/AMP_grad', locs['mean_grad_pen_loss'], locs['it'])
-        if self.use_foothold_predictor:
-            self.writer.add_scalar('Loss/foothold_aux', locs['mean_foothold_loss'], locs['it'])
         if self.use_attention_loss:
             self.writer.add_scalar('Loss/attention_guidance', locs['mean_attention_loss'], locs['it'])
         self.writer.add_scalar('Loss/learning_rate', self.alg.policy_learning_rate, locs['it'])
@@ -452,7 +405,6 @@ class AMPOnPolicyRunnerMulti:
                           f"""{'AMP mean expert pred:':>{pad}} {locs['mean_expert_pred']:.4f}\n"""
                           f"""{'AMP mean policy acc:':>{pad}} {locs['mean_agent_acc']:.4f}\n"""
                           f"""{'AMP mean demo acc:':>{pad}} {locs['mean_demo_acc']:.4f}\n"""
-                          f"""{'Foothold aux loss:':>{pad}} {locs['mean_foothold_loss']:.4f}\n"""
                           f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                           f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                           f"""{'Mean disc reward:':>{pad}} {statistics.mean(locs['discrewbuffer']):.2f}\n"""

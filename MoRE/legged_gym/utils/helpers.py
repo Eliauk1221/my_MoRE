@@ -164,7 +164,13 @@ def get_args():
     return args
 
 def export_policy_as_jit_depth(actor_critic, path):
-    exporter = PolicyExporterDepth(actor_critic)
+    # 当前策略可能启用“高度点空间注意力”，此时 actor 的输入包含额外的 attention feature。
+    # 为避免导出的 TorchScript 在运行时报维度不匹配，这里按模型类型选择 exporter。
+    if hasattr(actor_critic, "use_spatial_attention") and actor_critic.use_spatial_attention and \
+       hasattr(actor_critic, "spatial_attention") and actor_critic.spatial_attention is not None:
+        exporter = PolicyExporterDepthHeightPoint(actor_critic)
+    else:
+        exporter = PolicyExporterDepth(actor_critic)
     exporter.export(path)
 
 def export_policy_as_jit_resi(actor_critic, path):
@@ -185,6 +191,43 @@ class PolicyExporterDepth(torch.nn.Module):
         actor_input = torch.cat((obs, his_feature, depth_feature), dim=-1)
         return self.actor(actor_input)
     
+    def export(self, path):
+        os.makedirs(path, exist_ok=True)
+        path = os.path.join(path, 'policy_depth_1.pt')
+        self.to('cpu')
+        traced_script_module = torch.jit.script(self)
+        traced_script_module.save(path)
+
+
+class PolicyExporterDepthHeightPoint(torch.nn.Module):
+    """
+    TorchScript 导出器（高度点空间注意力版本）
+    
+    forward 额外需要:
+      - height_points: [B, num_x, num_y, 3]
+      - safety_scores: [B, num_points]  (若不想使用安全偏置，可传全 0)
+      - beta: float (推理偏置强度)
+    """
+    def __init__(self, actor_critic):
+        super().__init__()
+        self.actor = copy.deepcopy(actor_critic.actor)
+        self.history_encoder = copy.deepcopy(actor_critic.history_encoder)
+        self.depth_encoder = copy.deepcopy(actor_critic.depth_encoder)
+        self.spatial_attention = copy.deepcopy(actor_critic.spatial_attention)
+
+    def forward(self, obs, history, depth, height_points, safety_scores, beta: float = 0.5):
+        history = history.flatten(1)
+        his_feature = self.history_encoder(history)
+        depth_feature = self.depth_encoder(depth)
+        attn_feature, _ = self.spatial_attention(
+            height_points=height_points,
+            proprioception=obs,
+            safety_scores=safety_scores,
+            beta=beta
+        )
+        actor_input = torch.cat((obs, his_feature, depth_feature, attn_feature), dim=-1)
+        return self.actor(actor_input)
+
     def export(self, path):
         os.makedirs(path, exist_ok=True)
         path = os.path.join(path, 'policy_depth_1.pt')

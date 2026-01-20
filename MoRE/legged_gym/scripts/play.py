@@ -105,35 +105,28 @@ def play(args):
         if env.cfg.depth.warp_camera or env.cfg.depth.use_camera:
             obs = (obs, depth_image)
 
-        # 准备空间感知注意力所需的额外输入
-        cmd_vel = None
+        # 准备高度点空间注意力所需的额外输入
         height_points = None
+        safety_scores = None
         if use_spatial_attention:
-            # G1 环境的 obs_buf 结构:
-            # [cmd(3), ang_vel(3), gravity(3), dof_pos(16), dof_vel(16), actions(16)] = 57 维
-            
-            # cmd_vel: 从 obs 的前 3 维获取指令速度 [num_envs, 3]
-            obs_tensor = obs[0] if isinstance(obs, tuple) else obs
-            cmd_vel = obs_tensor[:, :3]
-            
             # height_points: 获取带高度的地形采样点 [num_envs, 17, 11, 3]
             if hasattr(env, 'get_height_points_with_heights'):
                 height_points = env.get_height_points_with_heights()
+            # safety_scores: 用于注意力安全偏置（若环境实现）
+            if hasattr(env, 'compute_safety_scores'):
+                safety_scores, _ = env.compute_safety_scores()
 
         if isinstance(obs, tuple):
             # 使用深度图的模型，支持基于高度点的空间感知注意力
             actions = policy(obs[0].detach(), trajectory_history.detach(), obs[1][:, :2, ...].detach(),
-                           height_points=height_points, cmd_vel=cmd_vel)
+                           height_points=height_points, safety_scores=safety_scores)
         else:
             # 不使用深度图的模型
             actions = policy(obs.detach(), trajectory_history)
         
-        # 获取并传递注意力权重和名义落足点给环境（用于可视化）
+        # 获取并传递注意力权重给环境（用于可视化）
         if use_spatial_attention:
-            nominal_foothold = actor_critic.get_nominal_foothold()
             attn_weights = actor_critic.get_attention_weights()
-            if hasattr(env, 'set_nominal_foothold'):
-                env.set_nominal_foothold(nominal_foothold)
             if hasattr(env, 'set_attention_weights'):
                 env.set_attention_weights(attn_weights)
         

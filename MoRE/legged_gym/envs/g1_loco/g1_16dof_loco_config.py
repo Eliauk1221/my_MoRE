@@ -286,10 +286,6 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
             cheat = -2
             feet_edge = -0.5
             y_offset_pen = -0.5
-            
-            # ========== 落足点采样奖励 ==========
-            foothold_sampling = 0.5             # 落足点采样奖励权重
-            # ==================================
 
         feet_contact_force_range = [200. , 600.]
 
@@ -306,18 +302,12 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         
         # ========== 空间感知注意力参数 (Spatial Attention) ==========
         use_spatial_attention = True            # 是否启用空间感知注意力
-        attention_type = "heightpoint"          # 注意力类型: "image"=深度图像方案, "heightpoint"=高度点方案
-        
-        # --- 高度点方案参数 (attention_type="heightpoint") ---
+
+        # --- 高度点方案参数 ---
         num_points_x = 17                       # x方向高度点数 (对应 terrain.measured_points_x)
         num_points_y = 11                       # y方向高度点数 (对应 terrain.measured_points_y)
         point_feature_dim = 64                  # 每个点的特征维度
-        
-        # --- 深度图像方案参数 (attention_type="image") ---
-        spatial_feature_channels = 128          # 特征图通道数
-        spatial_feature_height = 5              # 特征图高度
-        spatial_feature_width = 5               # 特征图宽度
-        
+
         # --- 通用参数 ---
         attention_hidden_dim = 128              # 注意力隐藏维度
         attention_heads = 4                     # 注意力头数
@@ -343,11 +333,6 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         safety_temperature = 0.1                # 目标注意力分布的 softmax 温度
         # ==============================================================================
         
-        # ========== 落足点预测辅助任务参数 (Foothold Predictor) ==========
-        use_foothold_predictor = True           # 是否启用落足点预测辅助任务
-        foothold_predictor_hidden_dim = 256     # FootholdPredictor 隐藏层维度
-        # ================================================================
-
     class algorithm( LeggedRobotCfgPPO.algorithm ):
         use_amp = False
         amp_loader_type = 'lafan_16dof_multi'
@@ -356,11 +341,6 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         entropy_coef = 0.01
         num_mini_batches = 8  # 从默认的4改为16，mini batch大小变为 2048*24/8=6144
         policy_learning_rate = 5e-4
-        
-        # ========== 落足点预测辅助任务参数 ==========
-        use_foothold_predictor = True           # 是否启用落足点预测辅助任务
-        aux_foothold_coef = 1.0                 # 辅助损失系数
-        # ==========================================
         
         # ========== 注意力引导 Loss 参数 ==========
         use_attention_loss = True               # 是否使用注意力监督 loss
