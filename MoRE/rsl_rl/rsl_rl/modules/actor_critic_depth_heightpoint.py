@@ -153,13 +153,15 @@ class HeightPointAttentionEncoder(nn.Module):
     
     核心特性：
     - 使用显式的地形高度采样点代替深度图像特征图
-    - 每个点有明确的物理坐标 (x, y) 和高度 z
+    - **位置编码 + 高度分离**: 解决 (x, y) 固定导致特征相似的问题
+      - 可学习的 2D 位置编码 (每个网格位置一个 embedding)
+      - 高度 z 独立编码，不被固定的 (x, y) 淹没
     - 注意力权重具有明确的空间可解释性
     - Sim2Real 友好：几何信息在仿真和真实世界中一致
     
-    基于 LIP + 平坦度的注意力引导机制：
-    - Query 仅使用本体感知 (proprioception)，不再使用 Raibert 启发式落足点
-    - 注意力偏置：将物理安全分数作为偏置加入，直接引导注意力
+    基于 VHIP + 平坦度的注意力引导机制：
+    - Query 仅使用本体感知 (proprioception)
+    - 注意力偏置：将 VHIP 安全分数作为偏置加入，直接引导注意力
     - 注意力监督：使用 KL 散度作为 loss，进一步强化学习
     
     输入:
@@ -194,12 +196,20 @@ class HeightPointAttentionEncoder(nn.Module):
         self.output_dim = output_dim
         self.use_safety_bias = use_safety_bias
         
-        # ========== 点特征编码器 ==========
-        # 将每个高度点 (x, y, z) 编码为特征向量
-        # 输入: 3 (x, y, height)
+        # ========== 新设计: 位置编码 + 高度编码分离 ==========
+        # 解决原来 (x, y) 固定导致特征相似的问题
+        
+        # 可学习的 2D 位置编码 (每个网格位置一个 embedding)
+        # 初始化为小的随机值
+        self.pos_embedding = nn.Parameter(
+            torch.randn(self.num_points, point_feature_dim) * 0.02
+        )
+        
+        # 高度编码器 (只处理 z，让高度信息独立表达)
+        # 输入: 1 (只有 z)
         # 输出: point_feature_dim
-        self.point_encoder = nn.Sequential(
-            nn.Linear(3, 32),
+        self.height_encoder = nn.Sequential(
+            nn.Linear(1, 32),
             nn.ELU(),
             nn.Linear(32, point_feature_dim),
             nn.ELU()
@@ -207,7 +217,7 @@ class HeightPointAttentionEncoder(nn.Module):
         
         # ========== Query 生成器 ==========
         # Query = MLP(proprioception)
-        # 只使用本体感知，不再使用 Raibert 启发式落足点
+        # 只使用本体感知
         query_input_dim = proprio_dim
         self.query_mlp = nn.Sequential(
             nn.Linear(query_input_dim, hidden_dim),
@@ -272,9 +282,19 @@ class HeightPointAttentionEncoder(nn.Module):
         
         num_points = height_points_flat.shape[1]
         
-        # ========== Step A: 编码每个高度点 ==========
-        # height_points_flat: [B, num_points, 3] -> [B, num_points, point_feature_dim]
-        point_features = self.point_encoder(height_points_flat)  # [B, num_points, point_feature_dim]
+        # ========== Step A: 编码每个高度点 (位置编码 + 高度分离) ==========
+        # 只使用高度 z 进行编码，位置信息通过可学习的 pos_embedding 注入
+        # 这解决了原来 (x, y) 固定导致特征相似的问题
+        
+        # A.1: 提取高度 z (第 3 维)
+        z_only = height_points_flat[:, :, 2:3]  # [B, num_points, 1]
+        
+        # A.2: 高度编码 (独立处理高度信息)
+        height_feature = self.height_encoder(z_only)  # [B, num_points, point_feature_dim]
+        
+        # A.3: 加上可学习的位置编码
+        # pos_embedding: [num_points, point_feature_dim] -> 广播到 [B, num_points, point_feature_dim]
+        point_features = height_feature + self.pos_embedding  # [B, num_points, point_feature_dim]
         
         # ========== Step B: 构建 Query (仅本体感知) ==========
         query = self.query_mlp(proprioception).unsqueeze(1)  # [B, 1, hidden_dim]
@@ -292,7 +312,7 @@ class HeightPointAttentionEncoder(nn.Module):
         # 保存原始注意力分数（用于调试/分析）
         self.last_raw_attn_scores = raw_attn_scores.detach()
         
-        # ========== Step E: 添加安全偏置 (LIP + 平坦度引导) ==========
+        # ========== Step E: 添加安全偏置 (VHIP + 平坦度引导) ==========
         if self.use_safety_bias and safety_scores is not None and beta > 0:
             # biased_attention = raw_attention + β × safety_scores
             biased_attn_scores = raw_attn_scores + beta * safety_scores

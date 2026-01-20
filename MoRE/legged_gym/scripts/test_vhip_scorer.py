@@ -9,8 +9,8 @@
 
 测试场景:
 1. 平地 (Flat): k=0, VHIP 退化为 LIP
-2. 上坡 (Uphill): k>0, 捕获域应该变小（需要踩得更近）
-3. 下坡 (Downhill): k<0, 捕获域应该变大（可以踩得更远）
+2. 上坡 (Uphill): k>0, DCM 发散更快，为“接住”它需要迈得更远
+3. 下坡 (Downhill): k<0, DCM 发散更慢，捕获点相对缩进
 4. 台阶 (Step): 边缘 k 很大，应该低分
 5. 踏脚石 (Stepping Stones): k≈0，应该正常工作
 6. 间隙 (Gap): 中间 k 剧变，边缘应该低分
@@ -39,8 +39,8 @@ class VHIPScorer:
     - DCM 演化修正因子: (1 + k / (2 * sqrt(g * z)))
     
     捕获域判断:
-    - 上坡 (k > 0): 捕获域变小，需要踩得更近
-    - 下坡 (k < 0): 捕获域变大，可以踩得更远
+    - 上坡 (k > 0): DCM 发散更快 → 捕获点更远
+    - 下坡 (k < 0): DCM 发散更慢 → 捕获点缩进
     - 平地 (k = 0): 退化为标准 LIP
     """
     
@@ -97,8 +97,8 @@ class VHIPScorer:
         z_eff = torch.clamp(z_eff, min=0.1)  # 防止负值或过小
         
         # VHIP 修正因子
-        # 当 k > 0 (上坡): factor > 1, DCM 发散更快, 捕获域变小
-        # 当 k < 0 (下坡): factor < 1, DCM 发散更慢, 捕获域变大
+        # 当 k > 0 (上坡): factor > 1, DCM 发散更快 → 捕获点更远
+        # 当 k < 0 (下坡): factor < 1, DCM 发散更慢 → 捕获点缩进
         # 当 k = 0 (平地): factor = 1, 退化为 LIP
         vhip_factor = 1 + k / (2 * torch.sqrt(self.g * z_eff))
         
@@ -144,9 +144,9 @@ class VHIPScorer:
         p_nominal_mag = (self.T_stance / 2) * v_mag  # [B, 1]
         
         # Step 5: VHIP 修正后的捕获点距离
-        # 上坡时 vhip_factor > 1, 捕获点变近 (p_capture < p_nominal)
-        # 下坡时 vhip_factor < 1, 捕获点变远 (p_capture > p_nominal)
-        p_capture_mag = p_nominal_mag / torch.clamp(vhip_factor, min=0.5, max=2.0)  # [B, num_points]
+        # 上坡时 vhip_factor > 1: DCM 发散更快 → 捕获点更远 (p_capture > p_nominal)
+        # 下坡时 vhip_factor < 1: DCM 发散更慢 → 捕获点缩进 (p_capture < p_nominal)
+        p_capture_mag = p_nominal_mag * torch.clamp(vhip_factor, min=0.5, max=2.0)  # [B, num_points]
         
         # Step 6: 计算每个采样点在速度方向上的投影距离
         point_x = height_points[..., 0]  # [B, num_points]
@@ -273,9 +273,9 @@ def test_flat_terrain():
 
 
 def test_uphill():
-    """测试 2: 上坡 - 捕获域应该变小"""
+    """测试 2: 上坡 - 捕获点应更远"""
     print("\n" + "=" * 60)
-    print("测试 2: 上坡 (Uphill) - 捕获域应该变小")
+    print("测试 2: 上坡 (Uphill) - 捕获点应更远")
     print("=" * 60)
     
     height_points = create_height_points()
@@ -317,7 +317,7 @@ def test_uphill():
     vhip_grid = debug['vhip_factor'].view(17, 11).numpy()
     im = ax.imshow(vhip_grid.T, origin='lower', cmap='RdYlGn_r', aspect='auto',
                    extent=[-0.8, 0.8, -0.5, 0.5], vmin=0.8, vmax=1.2)
-    ax.set_title('VHIP Factor\n(>1: smaller capture region)')
+    ax.set_title('VHIP Factor\n(>1: faster DCM divergence)')
     plt.colorbar(im, ax=ax)
     
     # VHIP 评分
@@ -331,7 +331,7 @@ def test_uphill():
     ax.legend(loc='upper right', fontsize=8)
     plt.colorbar(im, ax=ax)
     
-    plt.suptitle('Test 2: Uphill - Capture region should shrink', fontsize=12)
+    plt.suptitle('Test 2: Uphill - Capture point should be farther', fontsize=12)
     plt.tight_layout()
     plt.savefig('test_vhip_uphill.png', dpi=150)
     
@@ -339,15 +339,15 @@ def test_uphill():
     print(f"    - p_nominal = {debug['p_nominal'][0,0]:.3f} m")
     print(f"    - 平均坡度 k = {debug['slope_k'].mean():.3f}")
     print(f"    - VHIP factor 范围: [{debug['vhip_factor'].min():.3f}, {debug['vhip_factor'].max():.3f}]")
-    print(f"    - 前方 p_capture 比 p_nominal 更近 (因为上坡)")
+    print(f"    - 前方 p_capture 比 p_nominal 更远 (因为上坡)")
     print("  图片保存到: test_vhip_uphill.png")
     plt.close()
 
 
 def test_downhill():
-    """测试 3: 下坡 - 捕获域应该变大"""
+    """测试 3: 下坡 - 捕获点应缩进"""
     print("\n" + "=" * 60)
-    print("测试 3: 下坡 (Downhill) - 捕获域应该变大")
+    print("测试 3: 下坡 (Downhill) - 捕获点应缩进")
     print("=" * 60)
     
     height_points = create_height_points()
@@ -387,7 +387,7 @@ def test_downhill():
     vhip_grid = debug['vhip_factor'].view(17, 11).numpy()
     im = ax.imshow(vhip_grid.T, origin='lower', cmap='RdYlGn_r', aspect='auto',
                    extent=[-0.8, 0.8, -0.5, 0.5], vmin=0.8, vmax=1.2)
-    ax.set_title('VHIP Factor\n(<1: larger capture region)')
+    ax.set_title('VHIP Factor\n(<1: slower DCM divergence)')
     plt.colorbar(im, ax=ax)
     
     # VHIP 评分
@@ -398,14 +398,14 @@ def test_downhill():
     ax.set_title(f'VHIP Score\nmax={score.max():.3f}')
     plt.colorbar(im, ax=ax)
     
-    plt.suptitle('Test 3: Downhill - Capture region should expand', fontsize=12)
+    plt.suptitle('Test 3: Downhill - Capture point should retract', fontsize=12)
     plt.tight_layout()
     plt.savefig('test_vhip_downhill.png', dpi=150)
     
     print(f"  向前走 (vx=0.5 m/s) 在下坡地形:")
     print(f"    - p_nominal = {debug['p_nominal'][0,0]:.3f} m")
     print(f"    - VHIP factor 范围: [{debug['vhip_factor'].min():.3f}, {debug['vhip_factor'].max():.3f}]")
-    print(f"    - 前方 p_capture 比 p_nominal 更远 (因为下坡)")
+    print(f"    - 前方 p_capture 比 p_nominal 更近 (因为下坡)")
     print("  图片保存到: test_vhip_downhill.png")
     plt.close()
 
@@ -694,7 +694,7 @@ def test_comparison_lip_vs_vhip():
     vhip_grid = vhip_score.view(17, 11).numpy()
     im = ax.imshow(vhip_grid.T, origin='lower', cmap='hot', aspect='auto',
                    extent=[-0.8, 0.8, -0.5, 0.5])
-    ax.set_title('VHIP Score (considers slope)\nCapture closer on uphill')
+    ax.set_title('VHIP Score (considers slope)\nCapture farther on uphill')
     plt.colorbar(im, ax=ax)
     
     # 差异
@@ -711,7 +711,7 @@ def test_comparison_lip_vs_vhip():
     
     print(f"  LIP vs VHIP 对比 (上坡 k=0.25):")
     print(f"    - LIP 捕获点: d = {p_nominal:.3f} m (固定)")
-    print(f"    - VHIP 修正后: 上坡处捕获点更近")
+    print(f"    - VHIP 修正后: 上坡处捕获点更远")
     print(f"    - LIP 分数范围: [{lip_score.min():.4f}, {lip_score.max():.4f}]")
     print(f"    - VHIP 分数范围: [{vhip_score.min():.4f}, {vhip_score.max():.4f}]")
     print("  图片保存到: test_vhip_comparison.png")
@@ -743,8 +743,8 @@ def main():
     print("=" * 60)
     print("\n关键结论:")
     print("  1. 平地 (k=0): VHIP 退化为 LIP，正常工作")
-    print("  2. 上坡 (k>0): 捕获域变小，分数向机器人靠近")
-    print("  3. 下坡 (k<0): 捕获域变大，分数向远处扩展")
+    print("  2. 上坡 (k>0): DCM 发散更快，捕获点更远")
+    print("  3. 下坡 (k<0): DCM 发散更慢，捕获点缩进")
     print("  4. 台阶边缘: 陡峭惩罚使边缘分数降低")
     print("  5. 踏脚石: k≈0 的区域正常评分")
     print("  6. 交替斜坡: VHIP 能正确处理周期性地形")
@@ -752,4 +752,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 

@@ -167,9 +167,9 @@ class TerrainSafetyScorer(nn.Module):
         p_nominal_mag = (self.T_stance / 2) * v_mag  # [B, 1]
         
         # ========== Step 4: VHIP 修正后的捕获点距离 ==========
-        # 上坡时 vhip_factor > 1, 捕获点变近
-        # 下坡时 vhip_factor < 1, 捕获点变远
-        p_capture_mag = p_nominal_mag / vhip_factor  # [B, num_points]
+        # 上坡时 vhip_factor > 1: DCM 发散更快 → 为“接住”它需要迈得更远
+        # 下坡时 vhip_factor < 1: DCM 发散更慢 → 捕获点会相对缩进
+        p_capture_mag = p_nominal_mag * vhip_factor  # [B, num_points]
         
         # ========== Step 5: 计算每个点到捕获点的距离 ==========
         # 在速度方向上的投影
