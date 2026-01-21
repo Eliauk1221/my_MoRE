@@ -124,9 +124,10 @@ class HeightPointAttentionEncoder(nn.Module):
     
     核心特性：
     - 使用显式的地形高度采样点代替深度图像特征图
-    - **位置编码 + 高度分离**: 解决 (x, y) 固定导致特征相似的问题
-      - 可学习的 2D 位置编码 (每个网格位置一个 embedding)
-      - 高度 z 独立编码，不被固定的 (x, y) 淹没
+    - **两路特征（几何 + 位置）**：
+      - 几何视觉路：仅取 z，高度图 [B, 1, num_x, num_y] 经过 1~2 层 Conv2d，得到每个点的几何特征（捕捉邻域高差）
+      - 物理位置路：保留显式 (x, y, z) 绝对坐标
+      - 拼接后作为 K/V 输入：既表达“这里有坑/边缘”，也保留“它在什么位置”
     - 注意力权重具有明确的空间可解释性
     - Sim2Real 友好：几何信息在仿真和真实世界中一致
     
@@ -150,11 +151,13 @@ class HeightPointAttentionEncoder(nn.Module):
                  num_points_x: int = 17,              # x方向采样点数
                  num_points_y: int = 11,              # y方向采样点数
                  proprio_dim: int = 57,               # 本体感知维度
-                 point_feature_dim: int = 64,         # 每个点的特征维度
+                 point_feature_dim: int = 64,         # 几何特征维度（Conv2d输出通道数）
                  hidden_dim: int = 128,               # 隐藏层维度
                  num_heads: int = 4,                  # 注意力头数
                  output_dim: int = 64,                # 输出特征维度
                  use_safety_bias: bool = True,        # 是否使用安全偏置
+                 geom_cnn_hidden_channels: int = 16,  # 几何卷积隐藏通道数
+                 geom_cnn_layers: int = 2,            # 1 或 2 层 Conv2d
                  **kwargs):                           # 兼容旧配置
         super().__init__()
         
@@ -167,24 +170,28 @@ class HeightPointAttentionEncoder(nn.Module):
         self.output_dim = output_dim
         self.use_safety_bias = use_safety_bias
         
-        # ========== 新设计: 位置编码 + 高度编码分离 ==========
-        # 解决原来 (x, y) 固定导致特征相似的问题
+        # ========== 新设计: z→Conv2d(几何) + (x,y,z)(位置) 拼接 ==========
+        # 上路：仅使用 z 构造高度图像，并用卷积捕捉局部高差
+        # 下路：显式保留 (x,y,z) 坐标作为绝对位置
+        self.geom_cnn_layers = int(geom_cnn_layers)
+        if self.geom_cnn_layers not in (1, 2):
+            raise ValueError(f"geom_cnn_layers must be 1 or 2, got {geom_cnn_layers}")
         
-        # 可学习的 2D 位置编码 (每个网格位置一个 embedding)
-        # 初始化为小的随机值
-        self.pos_embedding = nn.Parameter(
-            torch.randn(self.num_points, point_feature_dim) * 0.02
-        )
+        if self.geom_cnn_layers == 1:
+            self.geom_cnn = nn.Sequential(
+                nn.Conv2d(in_channels=1, out_channels=point_feature_dim, kernel_size=3, padding=1),
+                nn.ELU(),
+            )
+        else:
+            self.geom_cnn = nn.Sequential(
+                nn.Conv2d(in_channels=1, out_channels=geom_cnn_hidden_channels, kernel_size=3, padding=1),
+                nn.ELU(),
+                nn.Conv2d(in_channels=geom_cnn_hidden_channels, out_channels=point_feature_dim, kernel_size=3, padding=1),
+                nn.ELU(),
+            )
         
-        # 高度编码器 (只处理 z，让高度信息独立表达)
-        # 输入: 1 (只有 z)
-        # 输出: point_feature_dim
-        self.height_encoder = nn.Sequential(
-            nn.Linear(1, 32),
-            nn.ELU(),
-            nn.Linear(32, point_feature_dim),
-            nn.ELU()
-        )
+        # K/V 的输入维度 = 几何特征 + 显式位置坐标 (x,y,z)
+        self.kv_input_dim = point_feature_dim + 3
         
         # ========== Query 生成器 ==========
         # Query = MLP(proprioception)
@@ -199,8 +206,8 @@ class HeightPointAttentionEncoder(nn.Module):
         # ========== Key 和 Value 投影 ==========
         # Key: 用于计算注意力分数
         # Value: 用于加权聚合
-        self.key_proj = nn.Linear(point_feature_dim, hidden_dim)
-        self.value_proj = nn.Linear(point_feature_dim, hidden_dim)
+        self.key_proj = nn.Linear(self.kv_input_dim, hidden_dim)
+        self.value_proj = nn.Linear(self.kv_input_dim, hidden_dim)
         
         # ========== 注意力分数缩放 ==========
         self.scale = (hidden_dim // num_heads) ** -0.5
@@ -253,19 +260,26 @@ class HeightPointAttentionEncoder(nn.Module):
         
         num_points = height_points_flat.shape[1]
         
-        # ========== Step A: 编码每个高度点 (位置编码 + 高度分离) ==========
-        # 只使用高度 z 进行编码，位置信息通过可学习的 pos_embedding 注入
-        # 这解决了原来 (x, y) 固定导致特征相似的问题
+        # ========== Step A: 两路构建每点特征 (几何Conv + 显式坐标) ==========
+        # A.0: 将高度点整理成网格形式，便于构造高度图
+        if height_points.dim() == 4:
+            height_points_grid = height_points  # [B, num_x, num_y, 3]
+        else:
+            if num_points != num_x * num_y:
+                raise ValueError(f"height_points has {num_points} points but expected {num_x}x{num_y}={num_x*num_y}")
+            height_points_grid = height_points_flat.view(B, num_x, num_y, 3)
         
-        # A.1: 提取高度 z (第 3 维)
-        z_only = height_points_flat[:, :, 2:3]  # [B, num_points, 1]
+        # 上路（几何视觉路）：z -> [B,1,num_x,num_y] -> Conv2d -> 每点几何特征
+        z_grid = height_points_grid[:, :, :, 2]  # [B, num_x, num_y]
+        z_img = z_grid.unsqueeze(1)  # [B, 1, num_x, num_y]
+        geom_feat_map = self.geom_cnn(z_img)  # [B, point_feature_dim, num_x, num_y]
+        geom_feat = geom_feat_map.permute(0, 2, 3, 1).contiguous().view(B, num_points, self.point_feature_dim)  # [B, N, C]
         
-        # A.2: 高度编码 (独立处理高度信息)
-        height_feature = self.height_encoder(z_only)  # [B, num_points, point_feature_dim]
+        # 下路（物理位置路）：显式 (x,y,z)
+        coords = height_points_flat.to(dtype=geom_feat.dtype)  # [B, N, 3]
         
-        # A.3: 加上可学习的位置编码
-        # pos_embedding: [num_points, point_feature_dim] -> 广播到 [B, num_points, point_feature_dim]
-        point_features = height_feature + self.pos_embedding  # [B, num_points, point_feature_dim]
+        # 汇合：拼接几何特征 + 坐标
+        point_features = torch.cat([geom_feat, coords], dim=-1)  # [B, N, C+3]
         
         # ========== Step B: 构建 Query (仅本体感知) ==========
         query = self.query_mlp(proprioception).unsqueeze(1)  # [B, 1, hidden_dim]
