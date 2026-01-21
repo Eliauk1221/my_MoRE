@@ -132,12 +132,16 @@ class RolloutStorageEX:
             self.safety_scores = torch.zeros(num_transitions_per_env, num_envs, self.num_points, device=self.device)
             # target_attention: 目标注意力分布 [T, B, num_points]
             self.target_attention = torch.zeros(num_transitions_per_env, num_envs, self.num_points, device=self.device)
+            # curriculum_level: 课程等级 [T, B]
+            # 用于在 update 阶段复现 rollout 当步的 β（避免 update 固定使用 β_max）
+            self.curriculum_level = torch.zeros(num_transitions_per_env, num_envs, device=self.device, dtype=torch.float)
             # ================================================
         else:
             self.height_points = None
             self.v_current = None
             self.safety_scores = None
             self.target_attention = None
+            self.curriculum_level = None
         # ========================================
 
         # rnn
@@ -177,6 +181,16 @@ class RolloutStorageEX:
             self.safety_scores[self.step].copy_(transition.safety_scores)
         if self.target_attention is not None and transition.target_attention is not None:
             self.target_attention[self.step].copy_(transition.target_attention)
+        if self.curriculum_level is not None:
+            # 允许 transition.curriculum_level 是 python 标量或 Tensor([B]) / Tensor([])
+            cl = transition.curriculum_level
+            if isinstance(cl, torch.Tensor):
+                if cl.numel() == 1:
+                    self.curriculum_level[self.step].fill_(float(cl.item()))
+                else:
+                    self.curriculum_level[self.step].copy_(cl.view(-1).to(dtype=torch.float))
+            else:
+                self.curriculum_level[self.step].fill_(float(cl))
         # =============================================
         self.step += 1
 
@@ -242,6 +256,7 @@ class RolloutStorageEX:
         # ========== LIP + 平坦度注意力引导 ==========
         safety_scores = self.safety_scores.flatten(0, 1) if self.safety_scores is not None else None
         target_attention = self.target_attention.flatten(0, 1) if self.target_attention is not None else None
+        curriculum_level = self.curriculum_level.flatten(0, 1) if self.curriculum_level is not None else None
         # =============================================
 
         if self.privileged_observations is not None:
@@ -287,12 +302,13 @@ class RolloutStorageEX:
                 # ========== LIP + 平坦度注意力引导 ==========
                 safety_scores_batch = safety_scores[batch_idx] if safety_scores is not None else None
                 target_attention_batch = target_attention[batch_idx] if target_attention is not None else None
+                curriculum_level_batch = curriculum_level[batch_idx] if curriculum_level is not None else None
                 # =============================================
                 
                 yield obs_batch, critic_observations_batch, actions_batch, next_obs_batch, next_critic_observations_batch, history_batch, target_values_batch, advantages_batch, returns_batch, \
                        old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None, depth_image_batch, \
                        height_points_batch, v_current_batch, \
-                       safety_scores_batch, target_attention_batch
+                       safety_scores_batch, target_attention_batch, curriculum_level_batch
 
     # for RNNs only
     def reccurent_mini_batch_generator(self, num_mini_batches, num_epochs=8):

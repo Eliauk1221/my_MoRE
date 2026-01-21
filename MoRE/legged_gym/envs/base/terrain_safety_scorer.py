@@ -9,8 +9,8 @@
 
 核心功能：
 1. VHIP Score: 基于变高度倒立摆 (Variable Height Inverted Pendulum) 的捕获域评估
-   - 上坡 (k > 0): 捕获域变小，需要踩得更近
-   - 下坡 (k < 0): 捕获域变大，可以踩得更远
+   - 上坡 (k > 0): 捕获域变大，需要踩得更远
+   - 下坡 (k < 0): 捕获域变小，可以踩得更近
    - 平地 (k = 0): 退化为标准 LIP
 2. Flatness Score: 基于局部高度梯度检测边缘/空隙
 3. Heading Factor: 速度方向感知，只关注前进方向的点
@@ -110,8 +110,8 @@ class TerrainSafetyScorer(nn.Module):
         
         核心思想:
         - VHIP 考虑了质心高度随地形变化的情况
-        - 上坡 (k > 0): DCM 发散更快，捕获域变小，需要踩得更近
-        - 下坡 (k < 0): DCM 发散更慢，捕获域变大，可以踩得更远
+        - 上坡 (k > 0): DCM 发散更快，捕获域变大，可以踩得更远
+        - 下坡 (k < 0): DCM 发散更慢，捕获域变小，需要踩得更近
         - 平地 (k = 0): 退化为标准 LIP
         
         VHIP 修正因子:
@@ -148,8 +148,8 @@ class TerrainSafetyScorer(nn.Module):
         z_eff = torch.clamp(z_eff, min=0.1)  # 防止负值或过小
         
         # VHIP 修正因子 (来自 Caron et al. 2019)
-        # 当 k > 0 (上坡): factor > 1, 捕获域变小
-        # 当 k < 0 (下坡): factor < 1, 捕获域变大
+        # 当 k > 0 (上坡): factor > 1, 捕获域变大
+        # 当 k < 0 (下坡): factor < 1, 捕获域变小
         # 当 k = 0 (平地): factor = 1, 退化为 LIP
         vhip_factor = 1 + k / (2 * torch.sqrt(self.gravity * z_eff))  # [B, num_points]
         vhip_factor = torch.clamp(vhip_factor, min=0.5, max=2.0)  # 限制范围

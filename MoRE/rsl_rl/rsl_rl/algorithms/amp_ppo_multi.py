@@ -344,7 +344,7 @@ class AMPPPOMulti:
         for obs_batch, critic_obs_batch, actions_batch, next_obs_batch, next_critic_observations_batch, history_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
             old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, depth_image_batch, \
             height_points_batch, v_current_batch, \
-            safety_scores_batch, target_attention_batch in generator:
+            safety_scores_batch, target_attention_batch, curriculum_level_batch in generator:
 
             aug_obs_batch, history_batch = obs_batch.detach(), history_batch.detach()
             
@@ -356,7 +356,7 @@ class AMPPPOMulti:
                     aug_depth_image_batch[:, :2, ...],
                     height_points=height_points_batch,
                     safety_scores=safety_scores_batch,
-                    curriculum_level=0  # 在 update 时不使用课程衰减（使用 rollout 时的 β）
+                    curriculum_level=curriculum_level_batch if curriculum_level_batch is not None else 0.0  # 使用 rollout 当步 curriculum/β
                 )
             else:
                 self.actor_critic.act(
@@ -366,7 +366,7 @@ class AMPPPOMulti:
                     hidden_states=hid_states_batch[0],
                     height_points=height_points_batch,
                     safety_scores=safety_scores_batch,
-                    curriculum_level=0
+                    curriculum_level=curriculum_level_batch if curriculum_level_batch is not None else 0.0
                 )
             
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)

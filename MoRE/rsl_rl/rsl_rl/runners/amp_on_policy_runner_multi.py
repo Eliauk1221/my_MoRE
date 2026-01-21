@@ -51,6 +51,51 @@ from legged_gym.utils.utils import Normalizer
 
 class AMPOnPolicyRunnerMulti:
 
+    @staticmethod
+    def _compute_prob_stats(probs: torch.Tensor, topk: int = 10) -> dict:
+        """Compute simple distribution stats for a probability tensor.
+
+        Args:
+            probs: [B, N] (or [N]) probability distribution (does not strictly need to be normalized).
+            topk: top-k mass used as a simple sparsity proxy.
+
+        Returns:
+            dict with keys: entropy, peak_value, min_value, sparsity, prob_sum, num_elements
+        """
+        if probs is None:
+            return None
+        if not isinstance(probs, torch.Tensor):
+            return None
+        if probs.numel() == 0:
+            return None
+        if probs.dim() == 1:
+            probs = probs.unsqueeze(0)
+
+        probs = probs.float()
+        # Normalize just in case upstream is not perfectly normalized.
+        probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
+
+        probs_safe = probs + 1e-8
+        entropy = (-torch.sum(probs_safe * torch.log(probs_safe), dim=-1)).mean().item()
+
+        peak_value = probs.max(dim=-1)[0].mean().item()
+        min_value = probs.min(dim=-1)[0].mean().item()
+
+        num_elements = probs.shape[-1]
+        k = min(topk, num_elements)
+        topk_values, _ = torch.topk(probs, k=k, dim=-1)
+        sparsity = topk_values.sum(dim=-1).mean().item()  # top-k mass; sum(probs)=1
+
+        prob_sum = probs.sum(dim=-1).mean().item()
+        return {
+            "entropy": entropy,
+            "peak_value": peak_value,
+            "min_value": min_value,
+            "sparsity": sparsity,
+            "prob_sum": prob_sum,
+            "num_elements": int(num_elements),
+        }
+
     def __init__(self,
                  env: VecEnv,
                  train_cfg,
@@ -316,6 +361,57 @@ class AMPOnPolicyRunnerMulti:
                 if self.use_spatial_attention:
                     attention_stats = self.alg.get_attention_stats()
                 # ==============================================
+                
+                # ========== 验证 A: teacher(target_attention) 分布是否过于均匀 ==========
+                target_attention_stats = None
+                if target_attention is not None:
+                    try:
+                        target_attention_stats = self._compute_prob_stats(target_attention)
+                    except Exception:
+                        target_attention_stats = None
+                # ==============================================================
+                
+                # ========== 验证 B: 同一批 raw logits 下，对比两种 β 的 attention ==========
+                beta_compare_stats = None
+                if self.use_spatial_attention and safety_scores is not None:
+                    try:
+                        actor_critic = self.alg.actor_critic
+                        spatial_attention = getattr(actor_critic, "spatial_attention", None)
+                        raw_attn_scores = getattr(spatial_attention, "last_raw_attn_scores", None) if spatial_attention is not None else None
+                        
+                        beta_rollout = getattr(actor_critic, "current_beta", None)
+                        beta_max = getattr(actor_critic, "beta_max", None)
+                        
+                        if raw_attn_scores is not None and beta_rollout is not None and beta_max is not None:
+                            beta_rollout = float(beta_rollout)
+                            beta_max = float(beta_max)
+                            
+                            logits_rollout = raw_attn_scores + beta_rollout * safety_scores
+                            logits_beta_max = raw_attn_scores + beta_max * safety_scores
+                            
+                            prob_rollout = torch.softmax(logits_rollout, dim=-1)
+                            prob_beta_max = torch.softmax(logits_beta_max, dim=-1)
+                            
+                            rollout_stats = self._compute_prob_stats(prob_rollout)
+                            beta_max_stats = self._compute_prob_stats(prob_beta_max)
+                            
+                            if rollout_stats is not None and beta_max_stats is not None:
+                                beta_compare_stats = {
+                                    "beta_rollout": beta_rollout,
+                                    "beta_max": beta_max,
+                                    "entropy_rollout": rollout_stats["entropy"],
+                                    "entropy_beta_max": beta_max_stats["entropy"],
+                                    "entropy_diff": rollout_stats["entropy"] - beta_max_stats["entropy"],
+                                    "peak_rollout": rollout_stats["peak_value"],
+                                    "peak_beta_max": beta_max_stats["peak_value"],
+                                    "peak_diff": rollout_stats["peak_value"] - beta_max_stats["peak_value"],
+                                    "sparsity_rollout": rollout_stats["sparsity"],
+                                    "sparsity_beta_max": beta_max_stats["sparsity"],
+                                    "sparsity_diff": rollout_stats["sparsity"] - beta_max_stats["sparsity"],
+                                }
+                    except Exception:
+                        beta_compare_stats = None
+                # ==============================================================
 
                 stop = time.time()
                 collection_time = stop - start
@@ -388,6 +484,35 @@ class AMPOnPolicyRunnerMulti:
             self.writer.add_scalar('Attention/sparsity', attention_stats['sparsity'], locs['it'])
             if 'current_beta' in attention_stats:
                 self.writer.add_scalar('Attention/current_beta', attention_stats['current_beta'], locs['it'])
+        # ==========================================================
+        
+        # ========== 验证 A: 记录 teacher(target_attention) 统计量 ==========
+        target_attention_stats = locs.get('target_attention_stats', None)
+        if target_attention_stats is not None:
+            self.writer.add_scalar('TargetAttention/entropy', target_attention_stats['entropy'], locs['it'])
+            self.writer.add_scalar('TargetAttention/peak_value', target_attention_stats['peak_value'], locs['it'])
+            self.writer.add_scalar('TargetAttention/min_value', target_attention_stats['min_value'], locs['it'])
+            self.writer.add_scalar('TargetAttention/sparsity', target_attention_stats['sparsity'], locs['it'])
+            self.writer.add_scalar('TargetAttention/prob_sum', target_attention_stats['prob_sum'], locs['it'])
+        # ==========================================================
+        
+        # ========== 验证 B: 记录两种 β 下的 attention 对比 ==========
+        beta_compare_stats = locs.get('beta_compare_stats', None)
+        if beta_compare_stats is not None:
+            self.writer.add_scalar('AttentionBetaCompare/beta_rollout', beta_compare_stats['beta_rollout'], locs['it'])
+            self.writer.add_scalar('AttentionBetaCompare/beta_max', beta_compare_stats['beta_max'], locs['it'])
+            
+            self.writer.add_scalar('AttentionBetaCompare/entropy_rollout', beta_compare_stats['entropy_rollout'], locs['it'])
+            self.writer.add_scalar('AttentionBetaCompare/entropy_beta_max', beta_compare_stats['entropy_beta_max'], locs['it'])
+            self.writer.add_scalar('AttentionBetaCompare/entropy_diff', beta_compare_stats['entropy_diff'], locs['it'])
+            
+            self.writer.add_scalar('AttentionBetaCompare/peak_rollout', beta_compare_stats['peak_rollout'], locs['it'])
+            self.writer.add_scalar('AttentionBetaCompare/peak_beta_max', beta_compare_stats['peak_beta_max'], locs['it'])
+            self.writer.add_scalar('AttentionBetaCompare/peak_diff', beta_compare_stats['peak_diff'], locs['it'])
+            
+            self.writer.add_scalar('AttentionBetaCompare/sparsity_rollout', beta_compare_stats['sparsity_rollout'], locs['it'])
+            self.writer.add_scalar('AttentionBetaCompare/sparsity_beta_max', beta_compare_stats['sparsity_beta_max'], locs['it'])
+            self.writer.add_scalar('AttentionBetaCompare/sparsity_diff', beta_compare_stats['sparsity_diff'], locs['it'])
         # ==========================================================
 
         str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "

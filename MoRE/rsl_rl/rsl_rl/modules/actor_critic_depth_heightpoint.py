@@ -222,7 +222,7 @@ class HeightPointAttentionEncoder(nn.Module):
                 height_points: torch.Tensor,
                 proprioception: torch.Tensor,
                 safety_scores: torch.Tensor = None,
-                beta: float = 0.0,
+                beta=0.0,
                 **kwargs) -> tuple:
         """
         前向传播
@@ -284,9 +284,15 @@ class HeightPointAttentionEncoder(nn.Module):
         self.last_raw_attn_scores = raw_attn_scores.detach()
         
         # ========== Step E: 添加安全偏置 (VHIP + 平坦度引导) ==========
-        if self.use_safety_bias and safety_scores is not None and beta > 0:
+        # 支持 beta 为标量或逐样本 Tensor([B])
+        if self.use_safety_bias and safety_scores is not None:
+            if isinstance(beta, torch.Tensor):
+                # [B] -> [B, 1]，用于广播到 [B, num_points]
+                beta_term = beta.view(-1, 1).to(dtype=safety_scores.dtype, device=safety_scores.device)
+            else:
+                beta_term = float(beta)
             # biased_attention = raw_attention + β × safety_scores
-            biased_attn_scores = raw_attn_scores + beta * safety_scores
+            biased_attn_scores = raw_attn_scores + beta_term * safety_scores
         else:
             biased_attn_scores = raw_attn_scores
         
@@ -363,15 +369,6 @@ class ActorCriticDepth(nn.Module):
                         beta_min=0.0,                       # 后期偏置强度
                         decay_curriculum_levels=10,         # 衰减所需的课程等级数
                         # ==========================================
-                        # 以下参数为兼容旧配置，不再使用
-                        spatial_feature_channels=128,
-                        spatial_feature_height=5,
-                        spatial_feature_width=5,
-                        T_stance=0.25,                      # 已废弃 (兼容旧配置)
-                        learnable_T_stance=True,            # 已废弃
-                        use_full_raibert=False,             # 已废弃
-                        k_raibert=0.03,                     # 已废弃
-                        learnable_k_raibert=True,           # 已废弃
                         **kwargs):
         if kwargs:
             print("ActorCriticDepth.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()]))
@@ -543,7 +540,11 @@ class ActorCriticDepth(nn.Module):
         if self.use_spatial_attention and height_points is not None:
             # 计算当前 β (课程式衰减)
             beta = self._get_beta(curriculum_level)
-            self.current_beta = beta
+            # 记录一个标量用于日志/对比（避免 tensor 导致 float() 失败）
+            if isinstance(beta, torch.Tensor):
+                self.current_beta = float(beta.mean().item())
+            else:
+                self.current_beta = float(beta)
             
             # 使用高度点空间注意力 (带安全偏置)
             attn_feature, attn_weights = self.spatial_attention(
@@ -567,7 +568,7 @@ class ActorCriticDepth(nn.Module):
         self.update_distribution(actor_input)
         return self.distribution.sample()
     
-    def _get_beta(self, curriculum_level: float) -> float:
+    def _get_beta(self, curriculum_level):
         """
         根据课程等级计算当前的偏置强度 β
         
@@ -576,10 +577,17 @@ class ActorCriticDepth(nn.Module):
         if not self.use_curriculum_decay:
             return self.beta_max
         
-        # 线性衰减
-        progress = min(curriculum_level / self.decay_curriculum_levels, 1.0)
-        beta = self.beta_max - (self.beta_max - self.beta_min) * progress
-        return beta
+        # 线性衰减（支持标量或逐样本 Tensor）
+        max_level = float(self.decay_curriculum_levels)
+        if isinstance(curriculum_level, torch.Tensor):
+            level = curriculum_level.to(dtype=torch.float)
+            progress = torch.clamp(level / max_level, 0.0, 1.0)
+            beta = self.beta_max - (self.beta_max - self.beta_min) * progress
+            return beta
+        else:
+            progress = min(float(curriculum_level) / max_level, 1.0)
+            beta = self.beta_max - (self.beta_max - self.beta_min) * progress
+            return beta
     
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
