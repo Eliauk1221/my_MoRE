@@ -135,13 +135,31 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         if height_points is None:
             return self.safety_scores, self.target_attention
         
-        # 获取基座速度 (body frame)
-        base_lin_vel = self.base_lin_vel  # [num_envs, 3]
+        # 获取基座速度（水平航向坐标系 / Horizontal Heading Frame）
+        # - X 指向机头方向（yaw）
+        # - Z 严格与重力反方向平行（不随 pitch/roll 旋转）
+        #
+        # 说明：
+        #   `self.base_lin_vel` 是用完整姿态 quat 做 inverse rotate 得到的 body frame 速度，
+        #   当机器人有 pitch/roll 时其 (x,y) 不是“水平”速度分量，会导致 TerrainSafetyScorer
+        #   的 heading_factor / VHIP 在几何点云(heading frame)下失配。
+        #
+        # 因此这里用 **严格 yaw-only quaternion** 把 world velocity 转到 heading frame。
+        # 注意：不能用“把 quat 的 (x,y) 置零再 normalize”的近似法；那会让 yaw 仍随 roll/pitch 耦合变化。
+        world_lin_vel = self.root_states[:, 7:10]  # [num_envs, 3] in world frame
+        q = self.base_quat
+        x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        half = 0.5 * yaw
+        base_quat_yaw = torch.zeros_like(q)
+        base_quat_yaw[:, 2] = torch.sin(half)
+        base_quat_yaw[:, 3] = torch.cos(half)
+        base_lin_vel_hh = quat_rotate_inverse(base_quat_yaw, world_lin_vel)  # [num_envs, 3]
         
         # 计算安全分数
         with torch.no_grad():
             safety_scores, target_attention = self.terrain_safety_scorer(
-                height_points, base_lin_vel
+                height_points, base_lin_vel_hh
             )
         
         # 更新 buffer

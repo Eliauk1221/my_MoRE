@@ -71,8 +71,11 @@ class TerrainSafetyScorer(nn.Module):
     为每个地形采样点计算安全分数，用于引导注意力机制。
     
     输入:
-        - height_points: [B, num_x, num_y, 3] 地形采样点 (x, y, z) in base frame
-        - base_lin_vel: [B, 3] 基座线速度 (body frame)
+        - height_points: [B, num_x, num_y, 3] 地形采样点 (x, y, z) in **水平航向坐标系**
+            - 原点在机器人中心
+            - X 指向机头方向（yaw）
+            - Z 与重力反方向平行（不随 pitch/roll 旋转）
+        - base_lin_vel: [B, 3] 基座线速度 in **水平航向坐标系**（与 height_points 同一 frame）
         - z_com: CoM 高度（可选，默认使用配置中的 z0）
     
     输出:
@@ -118,8 +121,8 @@ class TerrainSafetyScorer(nn.Module):
             vhip_factor = 1 + k / (2 * sqrt(g * z_eff))
         
         Args:
-            height_points: [B, num_points, 3] 采样点 (x, y, z) in base frame
-            base_lin_vel: [B, 3] 基座速度 (v_x, v_y, v_z) in body frame
+            height_points: [B, num_points, 3] 采样点 (x, y, z) in 水平航向坐标系
+            base_lin_vel: [B, 3] 基座速度 (v_x, v_y, v_z) in 水平航向坐标系
             z_com: [B] 或标量，CoM 高度（可选）
         
         Returns:
@@ -252,8 +255,8 @@ class TerrainSafetyScorer(nn.Module):
         - 低速时禁用方向过滤，避免原地站立时注意力消失
         
         Args:
-            height_points: [B, num_points, 3] 采样点 (x, y, z) in body frame
-            base_lin_vel: [B, 3] 基座速度 in body frame
+            height_points: [B, num_points, 3] 采样点 (x, y, z) in 水平航向坐标系
+            base_lin_vel: [B, 3] 基座速度 in 水平航向坐标系
         
         Returns:
             heading_factor: [B, num_points] 方向因子 [0, 1]
@@ -299,8 +302,8 @@ class TerrainSafetyScorer(nn.Module):
         计算综合安全分数和目标注意力分布
         
         Args:
-            height_points: [B, num_x, num_y, 3] 地形采样点
-            base_lin_vel: [B, 3] 基座速度
+            height_points: [B, num_x, num_y, 3] 地形采样点（水平航向坐标系）
+            base_lin_vel: [B, 3] 基座速度（水平航向坐标系）
             z_com: [B] 或标量，CoM 高度（可选）
         
         Returns:
