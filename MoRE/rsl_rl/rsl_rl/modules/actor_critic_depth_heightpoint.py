@@ -210,8 +210,11 @@ class HeightPointAttentionEncoder(nn.Module):
         self.value_proj = nn.Linear(self.kv_input_dim, hidden_dim)
         
         # ========== 注意力分数缩放 ==========
-        self.scale = (hidden_dim // num_heads) ** -0.5
         self.num_heads = num_heads
+        if hidden_dim % num_heads != 0:
+            raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})")
+        self.head_dim = hidden_dim // num_heads
+        self.scale = (self.head_dim) ** -0.5
         
         # ========== 输出融合层 ==========
         # 融合 attended feature + global pooled feature
@@ -282,40 +285,43 @@ class HeightPointAttentionEncoder(nn.Module):
         point_features = torch.cat([geom_feat, coords], dim=-1)  # [B, N, C+3]
         
         # ========== Step B: 构建 Query (仅本体感知) ==========
-        query = self.query_mlp(proprioception).unsqueeze(1)  # [B, 1, hidden_dim]
+        # 多头：hidden_dim = num_heads * head_dim
+        query = self.query_mlp(proprioception)  # [B, hidden_dim]
+        query = query.view(B, self.num_heads, self.head_dim).unsqueeze(2)  # [B, Heads, 1, head_dim]
         
         # ========== Step C: 生成 Key 和 Value ==========
-        keys = self.key_proj(point_features)    # [B, num_points, hidden_dim]
-        values = self.value_proj(point_features)  # [B, num_points, hidden_dim]
+        keys = self.key_proj(point_features)      # [B, N, hidden_dim]
+        values = self.value_proj(point_features)  # [B, N, hidden_dim]
+        keys = keys.view(B, num_points, self.num_heads, self.head_dim).transpose(1, 2)    # [B, Heads, N, head_dim]
+        values = values.view(B, num_points, self.num_heads, self.head_dim).transpose(1, 2)  # [B, Heads, N, head_dim]
         
-        # ========== Step D: 计算注意力分数 ==========
-        # 手动实现注意力以便添加安全偏置
-        # raw_attention = (Q × K^T) / √d
-        raw_attn_scores = torch.bmm(query, keys.transpose(1, 2)) * self.scale  # [B, 1, num_points]
-        raw_attn_scores = raw_attn_scores.squeeze(1)  # [B, num_points]
+        # ========== Step D: 计算注意力分数（真正多头并行） ==========
+        # raw_attention = (Q × K^T) / √d_head
+        raw_attn_scores = torch.matmul(query, keys.transpose(-2, -1)) * self.scale  # [B, Heads, 1, N]
+        raw_attn_scores = raw_attn_scores.squeeze(2)  # [B, Heads, N]
         
-        # 保存原始注意力分数（用于调试/分析）
-        self.last_raw_attn_scores = raw_attn_scores.detach()
+        # 保存原始注意力分数（用于调试/分析；保持兼容：取 heads 平均后存为 [B,N]）
+        self.last_raw_attn_scores = raw_attn_scores.mean(dim=1).detach()
         
         # ========== Step E: 添加安全偏置 (VHIP + 平坦度引导) ==========
-        # 支持 beta 为标量或逐样本 Tensor([B])
+        # safety_scores: [B, N] -> [B, 1, N]，广播到每个 head: [B, Heads, N]
         if self.use_safety_bias and safety_scores is not None:
+            safety = safety_scores.unsqueeze(1)  # [B, 1, N]
             if isinstance(beta, torch.Tensor):
-                # [B] -> [B, 1]，用于广播到 [B, num_points]
-                beta_term = beta.view(-1, 1).to(dtype=safety_scores.dtype, device=safety_scores.device)
+                beta_term = beta.view(-1, 1, 1).to(dtype=safety.dtype, device=safety.device)  # [B,1,1]
             else:
                 beta_term = float(beta)
-            # biased_attention = raw_attention + β × safety_scores
-            biased_attn_scores = raw_attn_scores + beta_term * safety_scores
+            biased_attn_scores = raw_attn_scores + beta_term * safety  # [B, Heads, N]
         else:
             biased_attn_scores = raw_attn_scores
         
         # ========== Step F: Softmax 获得注意力权重 ==========
-        attn_weights = torch.softmax(biased_attn_scores, dim=-1)  # [B, num_points]
+        attn_probs = torch.softmax(biased_attn_scores, dim=-1)  # [B, Heads, N]
         
-        # ========== Step G: 加权聚合 Value ==========
-        # attn_weights: [B, num_points] -> [B, 1, num_points]
-        attended = torch.bmm(attn_weights.unsqueeze(1), values)  # [B, 1, hidden_dim]
+        # ========== Step G: 加权聚合 Value（每个 head 独立） ==========
+        attended = torch.matmul(attn_probs.unsqueeze(2), values)  # [B, Heads, 1, head_dim]
+        attended = attended.squeeze(2)  # [B, Heads, head_dim]
+        attended = attended.reshape(B, self.hidden_dim)  # [B, hidden_dim]  拼回多头输出
         
         # ========== Step H: 输出融合 ==========
         # H.1: 全局地形特征作为补充 (平均池化)
@@ -323,11 +329,12 @@ class HeightPointAttentionEncoder(nn.Module):
         global_feature = self.key_proj(global_feature)  # [B, hidden_dim]
         
         # H.2: 融合注意力输出和全局特征
-        attended = attended.squeeze(1)  # [B, hidden_dim]
         fused_output = torch.cat([attended, global_feature], dim=-1)  # [B, hidden_dim * 2]
         context_vector = self.output_mlp(fused_output)  # [B, output_dim]
         
-        # H.3: 重塑注意力权重用于可视化 [B, num_points] -> [B, num_x, num_y]
+        # H.3: 重塑注意力权重用于可视化/监督
+        # 多头下返回一个单通道 attention：对 heads 取平均，保持兼容 [B, N]
+        attn_weights = attn_probs.mean(dim=1)  # [B, N]
         self.last_attn_weights = attn_weights.view(B, num_x, num_y)
         
         return context_vector, self.last_attn_weights
