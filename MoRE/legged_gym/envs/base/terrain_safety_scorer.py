@@ -363,6 +363,62 @@ class TerrainSafetyScorer(nn.Module):
         
         return heading_factor
     
+    def compute_heading_mask(self, height_points: torch.Tensor,
+                             base_lin_vel: torch.Tensor,
+                             neg_inf: float = -1e9) -> torch.Tensor:
+        """
+        计算 heading 的 logit-mask（用于 softmax 前加到 logits 上）。
+        
+        目标：让“后方点”在 softmax 后概率严格为 0。
+        
+        定义：
+            - 前方点：Mask = 0
+            - 后方点：Mask = -1e9 (近似 -inf)
+            - 低速：Mask = 0（保留所有点）
+        
+        Args:
+            height_points: [B, num_points, 3] 采样点 (x, y, z) in 水平航向坐标系
+            base_lin_vel: [B, 3] 基座速度 in 水平航向坐标系
+            neg_inf: float 负无穷近似
+        
+        Returns:
+            heading_mask: [B, num_points] logits mask
+        """
+        # 速度大小
+        v_x = base_lin_vel[:, 0]  # [B]
+        v_y = base_lin_vel[:, 1]  # [B]
+        vel_magnitude = torch.sqrt(v_x ** 2 + v_y ** 2 + 1e-8)  # [B]
+        
+        # 低速时禁用方向过滤
+        low_speed_mask = vel_magnitude < self.min_vel_for_heading  # [B]
+        
+        # 速度方向单位向量
+        v_dir_x = v_x / (vel_magnitude + 1e-8)  # [B]
+        v_dir_y = v_y / (vel_magnitude + 1e-8)  # [B]
+        
+        # 点方向单位向量（xy 平面）
+        point_x = height_points[:, :, 0]  # [B, N]
+        point_y = height_points[:, :, 1]  # [B, N]
+        point_norm = torch.sqrt(point_x ** 2 + point_y ** 2 + 1e-8)  # [B, N]
+        point_dir_x = point_x / (point_norm + 1e-8)
+        point_dir_y = point_y / (point_norm + 1e-8)
+        
+        # cos(theta) = dot(point_dir, vel_dir)
+        cos_theta = point_dir_x * v_dir_x.unsqueeze(-1) + point_dir_y * v_dir_y.unsqueeze(-1)  # [B, N]
+        
+        # 前方：cos(theta) > 0；后方：<= 0
+        neg_inf_tensor = torch.tensor(neg_inf, device=height_points.device, dtype=height_points.dtype)
+        heading_mask = torch.where(cos_theta > 0.0, torch.zeros_like(cos_theta), neg_inf_tensor.expand_as(cos_theta))
+        
+        # 低速时保留所有点
+        heading_mask = torch.where(
+            low_speed_mask.unsqueeze(-1).expand_as(heading_mask),
+            torch.zeros_like(heading_mask),
+            heading_mask
+        )
+        
+        return heading_mask
+    
     def forward(self, height_points: torch.Tensor,
                 base_lin_vel: torch.Tensor,
                 z_com: torch.Tensor = None) -> tuple:
@@ -396,11 +452,9 @@ class TerrainSafetyScorer(nn.Module):
         
         # ========== 4. 应用速度方向因子 ==========
         if self.cfg.use_heading_awareness:
-            heading_factor = self.compute_heading_factor(height_points_flat, base_lin_vel)
-            # 在 logit 空间中，乘法权重对应加法：log(score * heading) = log(score) + log(heading)
-            # 这里用 eps 避免 log(0) 直接产生 -inf；第6项会进一步改成显式 mask(-1e9)。
-            eps = 1e-8
-            safety_logits = safety_logits + torch.log(heading_factor + eps)
+            # 第6项：用 logits mask 替代“乘 0”/连续因子，确保 softmax 后后方点概率严格为 0
+            heading_mask = self.compute_heading_mask(height_points_flat, base_lin_vel, neg_inf=-1e9)
+            safety_logits = safety_logits + heading_mask
         
         # ========== 5. 生成目标注意力分布 ==========
         # 直接对 logits 做 softmax（保留 temperature 作为额外尖锐度控制）
