@@ -79,8 +79,8 @@ class TerrainSafetyScorer(nn.Module):
         - z_com: CoM 高度（可选，默认使用配置中的 z0）
     
     输出:
-        - safety_scores: [B, num_points] 每个点的最终安全分数（含方向感知）
-        - target_attention: [B, num_points] 目标注意力分布
+        - safety_logits: [B, num_points] 每个点的未归一化 logits（可理解为“负代价”），数值越大越安全
+        - target_attention: [B, num_points] 目标注意力分布（对 logits 做 softmax）
     """
     
     def __init__(self, cfg: TerrainSafetyScorerCfg = None, 
@@ -240,6 +240,74 @@ class TerrainSafetyScorer(nn.Module):
         
         return flatness_score
     
+    def compute_vhip_logit(self, height_points: torch.Tensor,
+                           base_lin_vel: torch.Tensor,
+                           z_com: torch.Tensor = None) -> torch.Tensor:
+        """
+        计算 VHIP 对应的 logit 项（不做 exp），与 `compute_vhip_score()` 的指数内部一致。
+        
+        返回:
+            vhip_logit: [B, num_points]
+                vhip_logit = - D_vhip^2 / (2*sigma_capture^2) - |k|/steep_threshold
+        """
+        if z_com is None:
+            z_com = self.z0
+        
+        # 与 compute_vhip_score 相同的中间量
+        point_x = height_points[:, :, 0]
+        point_y = height_points[:, :, 1]
+        point_z = height_points[:, :, 2]
+        
+        d = torch.sqrt(point_x ** 2 + point_y ** 2 + 1e-6)
+        k = point_z / (d + 1e-6)
+        
+        z_eff = torch.clamp(z_com + k * d, min=0.1)
+        vhip_factor = 1 + k / (2 * torch.sqrt(self.gravity * z_eff))
+        vhip_factor = torch.clamp(vhip_factor, min=0.5, max=2.0)
+        
+        v_x = base_lin_vel[:, 0:1]
+        v_y = base_lin_vel[:, 1:2]
+        v_mag = torch.sqrt(v_x ** 2 + v_y ** 2 + 1e-6)
+        v_dir_x = v_x / (v_mag + 1e-6)
+        v_dir_y = v_y / (v_mag + 1e-6)
+        
+        p_nominal_mag = (self.T_stance / 2) * v_mag
+        p_capture_mag = p_nominal_mag * vhip_factor
+        
+        proj_along_vel = point_x * v_dir_x + point_y * v_dir_y
+        proj_perp_vel = torch.abs(point_x * (-v_dir_y) + point_y * v_dir_x)
+        
+        dist_along = torch.abs(proj_along_vel - p_capture_mag)
+        dist_total_sq = dist_along ** 2 + (2 * proj_perp_vel) ** 2  # D_vhip^2
+        
+        vhip_logit = - dist_total_sq / (2 * (self.sigma_capture ** 2))
+        vhip_logit = vhip_logit - torch.abs(k) / self.steep_threshold
+        
+        return vhip_logit
+    
+    def compute_flatness_logit(self, height_points: torch.Tensor) -> torch.Tensor:
+        """
+        计算 Flatness 对应的 logit 项（不做 exp），与 `compute_flatness_score()` 的指数内部一致。
+        
+        返回:
+            flatness_logit: [B, num_points]
+                flatness_logit = - G_flat / sigma_flatness
+        """
+        # 提取高度 [B, num_x, num_y]
+        z = height_points[:, :, :, 2]
+        
+        grad_x = torch.zeros_like(z)
+        grad_x[:, :-1, :] = z[:, 1:, :] - z[:, :-1, :]
+        grad_x[:, -1, :] = grad_x[:, -2, :]
+        
+        grad_y = torch.zeros_like(z)
+        grad_y[:, :, :-1] = z[:, :, 1:] - z[:, :, :-1]
+        grad_y[:, :, -1] = grad_y[:, :, -2]
+        
+        gradient_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)  # G_flat
+        flatness_logit = - gradient_mag / self.sigma_flatness
+        return flatness_logit.view(height_points.shape[0], -1)
+    
     def compute_heading_factor(self, height_points: torch.Tensor,
                                base_lin_vel: torch.Tensor) -> torch.Tensor:
         """
@@ -299,7 +367,7 @@ class TerrainSafetyScorer(nn.Module):
                 base_lin_vel: torch.Tensor,
                 z_com: torch.Tensor = None) -> tuple:
         """
-        计算综合安全分数和目标注意力分布
+        计算综合安全 logits 和目标注意力分布
         
         Args:
             height_points: [B, num_x, num_y, 3] 地形采样点（水平航向坐标系）
@@ -307,7 +375,7 @@ class TerrainSafetyScorer(nn.Module):
             z_com: [B] 或标量，CoM 高度（可选）
         
         Returns:
-            safety_scores: [B, num_points] 最终安全分数
+            safety_logits: [B, num_points] 未归一化 logits（数值越大越安全）
             target_attention: [B, num_points] 目标注意力分布
         """
         B = height_points.shape[0]
@@ -316,27 +384,29 @@ class TerrainSafetyScorer(nn.Module):
         # 展平 height_points 用于 VHIP 计算
         height_points_flat = height_points.view(B, -1, 3)  # [B, num_points, 3]
         
-        # ========== 1. 计算 VHIP Score (考虑变高度的捕获域) ==========
-        vhip_score = self.compute_vhip_score(height_points_flat, base_lin_vel, z_com)
+        # ========== 1. 计算 VHIP Logit（不做 exp） ==========
+        vhip_logit = self.compute_vhip_logit(height_points_flat, base_lin_vel, z_com)  # [B, N]
         
-        # ========== 2. 计算 Flatness Score (检测边缘/空隙) ==========
-        flatness_score = self.compute_flatness_score(height_points)
+        # ========== 2. 计算 Flatness Logit（不做 exp） ==========
+        flatness_logit = self.compute_flatness_logit(height_points)  # [B, N]
         
-        # ========== 3. 计算综合分数 ==========
-        combined_score = vhip_score * flatness_score  # [B, num_points]
+        # ========== 3. 合成 Raw Logit ==========
+        # Logit_raw = - D_vhip^2 / (2*sigma^2) - G_flat / sigma_flat
+        safety_logits = vhip_logit + flatness_logit  # [B, N]  总分 = VHIP 扣分 + 平坦度扣分
         
         # ========== 4. 应用速度方向因子 ==========
         if self.cfg.use_heading_awareness:
             heading_factor = self.compute_heading_factor(height_points_flat, base_lin_vel)
-            safety_scores = combined_score * heading_factor
-        else:
-            safety_scores = combined_score
+            # 在 logit 空间中，乘法权重对应加法：log(score * heading) = log(score) + log(heading)
+            # 这里用 eps 避免 log(0) 直接产生 -inf；第6项会进一步改成显式 mask(-1e9)。
+            eps = 1e-8
+            safety_logits = safety_logits + torch.log(heading_factor + eps)
         
         # ========== 5. 生成目标注意力分布 ==========
-        # 使用 softmax 将分数转换为概率分布
-        target_attention = F.softmax(safety_scores / self.temperature, dim=-1)
+        # 直接对 logits 做 softmax（保留 temperature 作为额外尖锐度控制）
+        target_attention = F.softmax(safety_logits / self.temperature, dim=-1)
         
-        return safety_scores, target_attention
+        return safety_logits, target_attention
     
     def get_stats(self, safety_scores: torch.Tensor) -> dict:
         """获取安全分数统计量，用于 tensorboard 记录"""
