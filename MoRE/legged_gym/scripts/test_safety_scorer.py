@@ -336,6 +336,31 @@ def test_component_scores():
     vhip_score = scorer.compute_vhip_score(height_points_flat, base_lin_vel)
     flatness_score = scorer.compute_flatness_score(height_points)
     heading_factor = scorer.compute_heading_factor(height_points_flat, base_lin_vel)
+
+    # ========== 额外：检查 logit 的原始量级（你关心的 scale 问题） ==========
+    vhip_logit = scorer.compute_vhip_logit(height_points_flat, base_lin_vel)          # [1, N]
+    flatness_logit = scorer.compute_flatness_logit(height_points)                    # [1, N]
+    safety_logits_raw = vhip_logit + flatness_logit                                  # [1, N]（不含 heading mask）
+    heading_mask = scorer.compute_heading_mask(height_points_flat, base_lin_vel, neg_inf=-1e9) \
+        if cfg.use_heading_awareness else torch.zeros_like(safety_logits_raw)
+    # 含 heading mask 的最终 logits（masked 点为 -1e9）
+    safety_logits = safety_logits_raw + heading_mask
+
+    # 打印统计（忽略 masked 点，避免 -1e9 拉爆范围）
+    valid_mask = (heading_mask > -1e8)
+    print("\n[Logit Scale Check]")
+    print(f"  sigma_capture={float(cfg.sigma_capture):.3f}, sigma_flatness={float(cfg.sigma_flatness):.3f}, "
+          f"temperature={float(cfg.temperature):.3f}, use_heading_awareness={cfg.use_heading_awareness}")
+    _describe_tensor("vhip_logit", vhip_logit, mask=valid_mask)
+    _describe_tensor("flatness_logit", flatness_logit, mask=valid_mask)
+    _describe_tensor("safety_logits_raw", safety_logits_raw, mask=valid_mask)
+    _describe_tensor("safety_logits(final, masked removed)", safety_logits, mask=valid_mask)
+
+    # 对同一份 logits，比较不同 temperature 下的 teacher 分布尖锐度
+    for temp in (0.1, 0.5):
+        teacher = torch.softmax(safety_logits / temp, dim=-1)
+        print(f"  teacher(T={temp:.1f}): max={teacher.max().item():.4f}, entropy={compute_entropy(teacher):.2f}")
+    # ==============================================================
     
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     
@@ -398,6 +423,29 @@ def compute_entropy(probs):
     probs = probs + 1e-8
     entropy = -torch.sum(probs * torch.log(probs))
     return entropy.item()
+
+
+def _describe_tensor(name: str, t: torch.Tensor, mask: torch.Tensor = None):
+    """打印张量的数值范围/统计，用于检查 logits scale 是否合理。"""
+    with torch.no_grad():
+        if t is None:
+            print(f"  {name}: None")
+            return
+        x = t.detach()
+        if mask is not None:
+            x = x[mask]
+        x = x.float().cpu()
+        if x.numel() == 0:
+            print(f"  {name}: empty")
+            return
+        # percentiles for additional signal
+        q = torch.quantile(x, torch.tensor([0.0, 0.05, 0.5, 0.95, 1.0]))
+        std = x.std(unbiased=False).item()
+        print(
+            f"  {name}: "
+            f"min={q[0].item():.3f}, p5={q[1].item():.3f}, p50={q[2].item():.3f}, "
+            f"p95={q[3].item():.3f}, max={q[4].item():.3f}, mean={x.mean().item():.3f}, std={std:.3f}"
+        )
 
 
 def main():

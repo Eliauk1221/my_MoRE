@@ -330,7 +330,7 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         sigma_flatness = 0.05                   # 平坦度评分的梯度阈值
         use_heading_awareness = True            # 是否启用速度方向感知
         min_vel_for_heading = 0.1               # 低于此速度时不使用方向过滤 (m/s)
-        safety_temperature = 0.1                # 目标注意力分布的 softmax 温度
+        safety_temperature = 0.5                # 目标注意力分布的 softmax 温度（越大分布越平滑）
         # ==============================================================================
         
     class algorithm( LeggedRobotCfgPPO.algorithm ):
@@ -361,5 +361,7 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         amp_num_preload_transitions = 2000000
         amp_task_reward_lerp = 0.5
         amp_discr_hidden_dims = [1024, 512]
+        # 是否记录“当前 β vs β_max”的注意力分布对比（默认关闭，避免与“rollout/update 不同步”概念混淆）
+        log_attention_compare_vs_beta_max = False
 
   

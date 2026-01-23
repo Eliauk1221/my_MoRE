@@ -112,6 +112,8 @@ class AMPOnPolicyRunnerMulti:
             + train_cfg["runner"]["run_name"]
         )
         self.policy_cfg = train_cfg["policy"]
+        # 是否记录“当前 β vs β_max”的注意力分布对比（用于观察 curriculum 引导强度）
+        self.log_attention_compare_vs_beta_max = bool(self.cfg.get("log_attention_compare_vs_beta_max", False))
         self.all_cfg = train_cfg
         self.device = device
         self.env = env
@@ -136,12 +138,30 @@ class AMPOnPolicyRunnerMulti:
         actor_critic_class = eval(policy_class_name)
         # ================================================================
         
+        # ========== 从 policy cfg 中提取 TerrainSafetyScorer 相关参数（不传给 actor_critic） ==========
+        safety_scorer_cfg = {}
+        for k in ("safety_temperature", "z0", "sigma_flatness", "use_heading_awareness", "min_vel_for_heading"):
+            if k in self.policy_cfg:
+                safety_scorer_cfg[k] = self.policy_cfg[k]
+        # 训练开始前配置 env 内的 TerrainSafetyScorer（避免在 env 侧写死 temperature 等超参）
+        if safety_scorer_cfg and hasattr(self.env, "configure_terrain_safety_scorer"):
+            try:
+                self.env.configure_terrain_safety_scorer(**safety_scorer_cfg)
+                print(f"[Runner] TerrainSafetyScorer cfg overridden: {safety_scorer_cfg}")
+            except Exception as e:
+                print(f"[Runner][WARNING] Failed to configure TerrainSafetyScorer: {e}")
+        # 过滤掉不属于 actor_critic 的 key，避免 ActorCriticDepth 打印 unexpected args
+        actor_policy_cfg = dict(self.policy_cfg)
+        for k in safety_scorer_cfg.keys():
+            actor_policy_cfg.pop(k, None)
+        # ====================================================================================
+
         actor_critic: ActorCritic = actor_critic_class( num_actor_obs=num_actor_obs,
                                                         num_critic_obs=num_critic_obs,
                                                         num_actions=self.env.num_actions,
                                                         history_dim=self.obs_history_len * (num_actor_obs),
                                                         # history_dim=self.obs_history_len * num_actor_obs,
-                                                        **self.policy_cfg).to(self.device)
+                                                        **actor_policy_cfg).to(self.device)
         # prepare for AMP
         if self.use_amp:
             self.amp_loader_type = self.alg_cfg['amp_loader_type']
@@ -283,7 +303,12 @@ class AMPOnPolicyRunnerMulti:
                         # ========== LIP + 平坦度注意力引导 ==========
                         # 计算安全分数和目标注意力分布
                         if hasattr(self.env, 'compute_safety_scores'):
-                            safety_scores, target_attention = self.env.compute_safety_scores()
+                            # 优先复用上面已构建的 height_points，避免在 env 内重复构造
+                            try:
+                                safety_scores, target_attention = self.env.compute_safety_scores(height_points=height_points)
+                            except TypeError:
+                                # backward compatible with envs that don't accept the kwarg
+                                safety_scores, target_attention = self.env.compute_safety_scores()
                         
                         # 获取当前课程等级（用于动态 β 衰减）
                         if hasattr(self.env, 'get_curriculum_level'):
@@ -372,21 +397,40 @@ class AMPOnPolicyRunnerMulti:
                 # ==============================================================
                 
                 # ========== 验证 B: 同一批 raw logits 下，对比两种 β 的 attention ==========
-                beta_compare_stats = None
-                if self.use_spatial_attention and safety_scores is not None:
+                attn_compare_vs_beta_max_stats = None
+                if self.log_attention_compare_vs_beta_max and self.use_spatial_attention and safety_scores is not None:
                     try:
                         actor_critic = self.alg.actor_critic
                         spatial_attention = getattr(actor_critic, "spatial_attention", None)
                         raw_attn_scores = getattr(spatial_attention, "last_raw_attn_scores", None) if spatial_attention is not None else None
                         
-                        beta_rollout = getattr(actor_critic, "current_beta", None)
+                        # rollout 使用的 β 可能是逐 env 向量（A1：curriculum_level=[num_envs]），
+                        # 因此优先从 actor_critic._last_beta 读取，避免强行压成标量导致对比失真。
+                        last_beta = getattr(actor_critic, "_last_beta", None)
+                        beta_rollout_tensor = last_beta if isinstance(last_beta, torch.Tensor) else None
+                        if beta_rollout_tensor is None:
+                            # fallback: 用已标量化的 current_beta（来自 attention_stats 或 actor_critic.current_beta）
+                            beta_rollout_tensor = None
+                        beta_rollout_scalar = None
+                        if isinstance(last_beta, torch.Tensor):
+                            beta_rollout_scalar = float(last_beta.mean().item())
+                        elif last_beta is not None:
+                            beta_rollout_scalar = float(last_beta)
+                        else:
+                            if attention_stats is not None and "current_beta" in attention_stats:
+                                beta_rollout_scalar = float(attention_stats["current_beta"])
+                            else:
+                                beta_rollout_scalar = getattr(actor_critic, "current_beta", None)
                         beta_max = getattr(actor_critic, "beta_max", None)
                         
-                        if raw_attn_scores is not None and beta_rollout is not None and beta_max is not None:
-                            beta_rollout = float(beta_rollout)
+                        if raw_attn_scores is not None and beta_rollout_scalar is not None and beta_max is not None:
                             beta_max = float(beta_max)
                             
-                            logits_rollout = raw_attn_scores + beta_rollout * safety_scores
+                            if beta_rollout_tensor is not None and beta_rollout_tensor.numel() > 1:
+                                beta_term = beta_rollout_tensor.to(dtype=safety_scores.dtype, device=safety_scores.device).view(-1, 1)
+                                logits_rollout = raw_attn_scores + beta_term * safety_scores
+                            else:
+                                logits_rollout = raw_attn_scores + float(beta_rollout_scalar) * safety_scores
                             logits_beta_max = raw_attn_scores + beta_max * safety_scores
                             
                             prob_rollout = torch.softmax(logits_rollout, dim=-1)
@@ -396,8 +440,8 @@ class AMPOnPolicyRunnerMulti:
                             beta_max_stats = self._compute_prob_stats(prob_beta_max)
                             
                             if rollout_stats is not None and beta_max_stats is not None:
-                                beta_compare_stats = {
-                                    "beta_rollout": beta_rollout,
+                                attn_compare_vs_beta_max_stats = {
+                                    "beta_rollout": float(beta_rollout_scalar),
                                     "beta_max": beta_max,
                                     "entropy_rollout": rollout_stats["entropy"],
                                     "entropy_beta_max": beta_max_stats["entropy"],
@@ -410,7 +454,7 @@ class AMPOnPolicyRunnerMulti:
                                     "sparsity_diff": rollout_stats["sparsity"] - beta_max_stats["sparsity"],
                                 }
                     except Exception:
-                        beta_compare_stats = None
+                        attn_compare_vs_beta_max_stats = None
                 # ==============================================================
 
                 stop = time.time()
@@ -497,22 +541,23 @@ class AMPOnPolicyRunnerMulti:
         # ==========================================================
         
         # ========== 验证 B: 记录两种 β 下的 attention 对比 ==========
-        beta_compare_stats = locs.get('beta_compare_stats', None)
-        if beta_compare_stats is not None:
-            self.writer.add_scalar('AttentionBetaCompare/beta_rollout', beta_compare_stats['beta_rollout'], locs['it'])
-            self.writer.add_scalar('AttentionBetaCompare/beta_max', beta_compare_stats['beta_max'], locs['it'])
+        attn_compare_vs_beta_max_stats = locs.get('attn_compare_vs_beta_max_stats', None)
+        if attn_compare_vs_beta_max_stats is not None:
+            tag_prefix = 'AttentionCompareVsBetaMax'
+            self.writer.add_scalar(f'{tag_prefix}/beta_rollout', attn_compare_vs_beta_max_stats['beta_rollout'], locs['it'])
+            self.writer.add_scalar(f'{tag_prefix}/beta_max', attn_compare_vs_beta_max_stats['beta_max'], locs['it'])
             
-            self.writer.add_scalar('AttentionBetaCompare/entropy_rollout', beta_compare_stats['entropy_rollout'], locs['it'])
-            self.writer.add_scalar('AttentionBetaCompare/entropy_beta_max', beta_compare_stats['entropy_beta_max'], locs['it'])
-            self.writer.add_scalar('AttentionBetaCompare/entropy_diff', beta_compare_stats['entropy_diff'], locs['it'])
+            self.writer.add_scalar(f'{tag_prefix}/entropy_rollout', attn_compare_vs_beta_max_stats['entropy_rollout'], locs['it'])
+            self.writer.add_scalar(f'{tag_prefix}/entropy_beta_max', attn_compare_vs_beta_max_stats['entropy_beta_max'], locs['it'])
+            self.writer.add_scalar(f'{tag_prefix}/entropy_diff', attn_compare_vs_beta_max_stats['entropy_diff'], locs['it'])
             
-            self.writer.add_scalar('AttentionBetaCompare/peak_rollout', beta_compare_stats['peak_rollout'], locs['it'])
-            self.writer.add_scalar('AttentionBetaCompare/peak_beta_max', beta_compare_stats['peak_beta_max'], locs['it'])
-            self.writer.add_scalar('AttentionBetaCompare/peak_diff', beta_compare_stats['peak_diff'], locs['it'])
+            self.writer.add_scalar(f'{tag_prefix}/peak_rollout', attn_compare_vs_beta_max_stats['peak_rollout'], locs['it'])
+            self.writer.add_scalar(f'{tag_prefix}/peak_beta_max', attn_compare_vs_beta_max_stats['peak_beta_max'], locs['it'])
+            self.writer.add_scalar(f'{tag_prefix}/peak_diff', attn_compare_vs_beta_max_stats['peak_diff'], locs['it'])
             
-            self.writer.add_scalar('AttentionBetaCompare/sparsity_rollout', beta_compare_stats['sparsity_rollout'], locs['it'])
-            self.writer.add_scalar('AttentionBetaCompare/sparsity_beta_max', beta_compare_stats['sparsity_beta_max'], locs['it'])
-            self.writer.add_scalar('AttentionBetaCompare/sparsity_diff', beta_compare_stats['sparsity_diff'], locs['it'])
+            self.writer.add_scalar(f'{tag_prefix}/sparsity_rollout', attn_compare_vs_beta_max_stats['sparsity_rollout'], locs['it'])
+            self.writer.add_scalar(f'{tag_prefix}/sparsity_beta_max', attn_compare_vs_beta_max_stats['sparsity_beta_max'], locs['it'])
+            self.writer.add_scalar(f'{tag_prefix}/sparsity_diff', attn_compare_vs_beta_max_stats['sparsity_diff'], locs['it'])
         # ==========================================================
 
         str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "

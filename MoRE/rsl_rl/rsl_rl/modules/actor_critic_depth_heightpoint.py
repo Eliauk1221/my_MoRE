@@ -411,6 +411,9 @@ class ActorCriticDepth(nn.Module):
         self.beta_min = beta_min
         self.decay_curriculum_levels = decay_curriculum_levels
         self.current_beta = beta_max  # 当前偏置强度（会随课程衰减）
+        # 保存最近一次使用的 β（可能是 float 或 Tensor([B])），用于日志/对比。
+        # 注意：这里不在 act() 的热路径里做 .item()，避免频繁 GPU→CPU 同步。
+        self._last_beta = None
         # ================================================
 
         # depth encoder (保留用于提取全局深度特征)
@@ -561,10 +564,11 @@ class ActorCriticDepth(nn.Module):
         if self.use_spatial_attention and height_points is not None:
             # 计算当前 β (课程式衰减)
             beta = self._get_beta(curriculum_level)
-            # 记录一个标量用于日志/对比（避免 tensor 导致 float() 失败）
+            # 仅缓存 β；标量化在 log() 时再做，避免在 rollout/update 热路径里同步。
             if isinstance(beta, torch.Tensor):
-                self.current_beta = float(beta.mean().item())
+                self._last_beta = beta.detach()
             else:
+                self._last_beta = float(beta)
                 self.current_beta = float(beta)
             
             # 使用高度点空间注意力 (带安全偏置)
@@ -690,6 +694,14 @@ class ActorCriticDepth(nn.Module):
             
             # 4. 当前 β 值
             current_beta = self.current_beta
+            last_beta = getattr(self, "_last_beta", None)
+            if isinstance(last_beta, torch.Tensor):
+                # 仅在记录统计量时标量化（每 iteration 一次），避免热路径同步
+                current_beta = float(last_beta.mean().item())
+            elif last_beta is not None:
+                current_beta = float(last_beta)
+            # 同步更新 current_beta，供其他日志/对比逻辑复用
+            self.current_beta = current_beta
             
             return {
                 'entropy': entropy.item(),

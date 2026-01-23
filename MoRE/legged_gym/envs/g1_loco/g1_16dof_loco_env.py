@@ -74,6 +74,10 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         # 存储目标注意力分布 [num_envs, num_points]
         self.target_attention = torch.zeros(self.num_envs, num_points, dtype=torch.float, device=self.device, requires_grad=False)
         # =============================================
+        
+        # 复用 buffer：避免每个 step 在 `get_height_points_with_heights()` 里 clone 大张量
+        # 该 buffer 的 (x,y) 与 `self.height_points` 一致，只在每步更新 z。
+        self._height_points_with_z_buf = None
 
     def reset_idx(self, env_ids):
         super().reset_idx(env_ids)
@@ -99,7 +103,8 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         scorer_cfg.sigma_flatness = 0.05
         scorer_cfg.use_heading_awareness = True
         scorer_cfg.min_vel_for_heading = 0.1
-        scorer_cfg.temperature = 0.1
+        # 默认温度（训练时建议由 runner 从 train_cfg.policy.safety_temperature 覆盖）
+        scorer_cfg.temperature = 0.5
         
         # 获取采样点数量
         num_points_x = len(self.cfg.terrain.measured_points_x)
@@ -113,8 +118,48 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         ).to(self.device)
         
         print(f"[Env] TerrainSafetyScorer 初始化完成: {num_points_x}x{num_points_y} = {num_points_x * num_points_y} 点")
+
+    def configure_terrain_safety_scorer(self,
+                                        safety_temperature: float = None,
+                                        z0: float = None,
+                                        sigma_flatness: float = None,
+                                        use_heading_awareness: bool = None,
+                                        min_vel_for_heading: float = None):
+        """在 env 创建后动态配置 TerrainSafetyScorer（通常由 runner 在训练开始前调用）。
+
+        说明：
+            - `TerrainSafetyScorer` 内部大部分参数以 buffer 形式注册，需要同时更新 buffer 才会生效。
+            - 该方法仅在初始化/训练启动时调用一次，不属于热路径。
+        """
+        if not hasattr(self, "terrain_safety_scorer") or self.terrain_safety_scorer is None:
+            return
+
+        scorer = self.terrain_safety_scorer
+
+        if safety_temperature is not None:
+            t = float(safety_temperature)
+            scorer.cfg.temperature = t
+            scorer.temperature.fill_(t)
+
+        if z0 is not None:
+            z0_f = float(z0)
+            scorer.cfg.z0 = z0_f
+            scorer.z0.fill_(z0_f)
+
+        if sigma_flatness is not None:
+            sf = float(sigma_flatness)
+            scorer.cfg.sigma_flatness = sf
+            scorer.sigma_flatness.fill_(sf)
+
+        if min_vel_for_heading is not None:
+            mv = float(min_vel_for_heading)
+            scorer.cfg.min_vel_for_heading = mv
+            scorer.min_vel_for_heading.fill_(mv)
+
+        if use_heading_awareness is not None:
+            scorer.cfg.use_heading_awareness = bool(use_heading_awareness)
     
-    def compute_safety_scores(self):
+    def compute_safety_scores(self, height_points: torch.Tensor = None):
         """
         计算地形安全分数和目标注意力分布
         
@@ -130,8 +175,9 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         if not isinstance(self.measured_heights, torch.Tensor):
             return self.safety_scores, self.target_attention
         
-        # 获取带高度的地形采样点
-        height_points = self.get_height_points_with_heights()
+        # 获取带高度的地形采样点（若调用方已提供则复用，避免重复构建）
+        if height_points is None:
+            height_points = self.get_height_points_with_heights()
         if height_points is None:
             return self.safety_scores, self.target_attention
         
@@ -177,10 +223,18 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         return self.target_attention
     
     def get_curriculum_level(self):
-        """获取当前课程等级，用于计算动态 β"""
-        if hasattr(self, 'terrain_levels'):
-            return self.terrain_levels.float().mean().item()
-        return 0
+        """获取当前课程等级，用于计算动态 β。
+
+        说明：
+            - 为了避免在 rollout 阶段频繁触发 GPU→CPU 同步，这里**不返回 python 标量**，
+              而是返回位于 device 上的 Tensor。
+            - 推荐返回逐环境的课程等级向量 [num_envs]，这样策略端可实现逐 env 的 β。
+        """
+        if hasattr(self, 'terrain_levels') and isinstance(self.terrain_levels, torch.Tensor):
+            # [num_envs] on device
+            return self.terrain_levels.to(dtype=torch.float)
+        # fallback: keep shape-compatible tensor on device
+        return torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
 
     def set_attention_weights(self, attn_weights):
         """
@@ -233,14 +287,17 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         
         # 构建完整的 (x, y, z) 数据
         # height_points 的前两列是 x, y 坐标
-        height_points_with_z = self.height_points.clone()  # [num_envs, 187, 3]
-        height_points_with_z[:, :, 2] = normalized_heights  # 替换 z 坐标为归一化高度
+        if self._height_points_with_z_buf is None or self._height_points_with_z_buf.shape != self.height_points.shape:
+            # 只在首次/尺寸变化时分配；后续 step 复用该 buffer
+            self._height_points_with_z_buf = self.height_points.clone()  # [num_envs, 187, 3]
+        # 仅更新 z 坐标（in-place），避免 clone + 分配
+        self._height_points_with_z_buf[:, :, 2].copy_(normalized_heights)
         
         # 重塑为 [num_envs, num_x, num_y, 3]
         # 配置中: measured_points_x 有 17 个点, measured_points_y 有 11 个点
         num_x = len(self.cfg.terrain.measured_points_x)  # 17
         num_y = len(self.cfg.terrain.measured_points_y)  # 11
-        height_points_reshaped = height_points_with_z.view(self.num_envs, num_x, num_y, 3)
+        height_points_reshaped = self._height_points_with_z_buf.view(self.num_envs, num_x, num_y, 3)
         
         return height_points_reshaped
 
