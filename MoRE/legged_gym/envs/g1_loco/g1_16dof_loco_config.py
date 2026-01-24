@@ -80,6 +80,7 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         test_mode = False
         
     class env(LeggedRobotCfg.env):
+        num_envs = 4096
         num_observations = 57
         num_actions = 16
         amp_motion_files = './resources/g1_amp_data/lafan_walk+run_50FPS' 
@@ -285,10 +286,6 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
             cheat = -2
             feet_edge = -0.5
             y_offset_pen = -0.5
-            
-            # ========== 落足点采样奖励 ==========
-            foothold_sampling = 0.5             # 落足点采样奖励权重
-            # ==================================
 
         feet_contact_force_range = [200. , 600.]
 
@@ -302,17 +299,6 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         actor_hidden_dims = [512, 256, 128]
         critic_hidden_dims = [512, 256, 128]
         his_latent_dim = 64
-        
-        # ========== 落足点引导注意力参数 ==========
-        use_foothold_attention = True           # 是否启用落足点引导注意力
-        foothold_predictor_hidden = [256, 128]  # 落足点预测器隐藏层维度
-        attention_hidden_dim = 128              # 注意力模块隐藏维度
-        attention_heads = 4                     # 注意力头数
-        attention_output_dim = 64               # 注意力输出维度
-        foothold_scale = 0.5                    # 落足点预测范围 (米)
-        terrain_dim = 187                       # 地形采样点数 (17x11)
-        foot_pos_dim = 6                        # 脚位置维度 (左脚xyz + 右脚xyz)
-        # ==========================================
 
     class algorithm( LeggedRobotCfgPPO.algorithm ):
         use_amp = False

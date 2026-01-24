@@ -180,13 +180,6 @@ class AMPOnPolicyRunnerMulti:
         infos = {}
         infos["depth"] = self.env.warp_depth_buffer.clone().to(self.device) if self.use_depth else None
 
-        # ========== 新增：检查是否启用落足点引导注意力 ==========
-        self.use_foothold_attention = hasattr(self.alg.actor_critic, 'use_foothold_attention') and \
-                                      self.alg.actor_critic.use_foothold_attention
-        if self.use_foothold_attention:
-            print("========== Runner: Foothold-Guided Attention ENABLED ==========")
-        # ==============================================================
-        
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
             # Rollout
@@ -198,29 +191,8 @@ class AMPOnPolicyRunnerMulti:
                     if self.use_depth:
                         obs = (obs, depth_image)
 
-                    # ========== 新增：从 critic_obs 和环境提取落足点引导注意力需要的数据 ==========
-                    terrain_heights = None
-                    foot_pos = None
-                    if self.use_foothold_attention:
-                        # terrain_heights 是 privileged_obs 的最后 187 维（高度采样）
-                        terrain_heights = critic_obs[:, -187:]
-                        # foot_pos 是 privileged_obs 的 60:66 维（脚在身体坐标系下的位置）
-                        # privileged_obs 结构: base (60) + feet_info (12) + priv_info (38) + foot_force (6) + heights (187)
-                        # feet_info: footpos_in_body_frame (2*3=6) + footvel_in_body_frame (2*3=6)
-                        foot_pos = critic_obs[:, 60:66]
-                    # ==============================================================
+                    actions = self.alg.act(obs, critic_obs, history)
 
-                    actions = self.alg.act(obs, critic_obs, history, 
-                                           terrain_heights=terrain_heights, 
-                                           foot_pos=foot_pos)
-                    
-                    # ========== 新增：获取预测落足点并传递给环境用于奖励计算 ==========
-                    if self.use_foothold_attention:
-                        pred_foothold = self.alg.get_pred_foothold()
-                        if hasattr(self.env, 'set_pred_foothold'):
-                            self.env.set_pred_foothold(pred_foothold)
-                    # ==============================================================
-                    
                     obs, privileged_obs, rewards, dones, infos, _, terminal_amp_states, terminal_obs, terminal_critic_obs = self.env.step(actions)
                     
                     critic_obs = privileged_obs if privileged_obs is not None else obs
