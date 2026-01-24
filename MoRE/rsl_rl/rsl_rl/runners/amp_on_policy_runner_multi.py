@@ -179,6 +179,9 @@ class AMPOnPolicyRunnerMulti:
         tot_iter = self.current_learning_iteration + num_learning_iterations
         infos = {}
         infos["depth"] = self.env.warp_depth_buffer.clone().to(self.device) if self.use_depth else None
+        
+        # ===== 地形注意力支持 =====
+        self.use_terrain_attention = getattr(self.env, 'use_terrain_attention', False)
 
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
@@ -190,8 +193,16 @@ class AMPOnPolicyRunnerMulti:
                         depth_image = infos['depth']
                     if self.use_depth:
                         obs = (obs, depth_image)
+                    
+                    # ===== 获取地形注意力数据 =====
+                    terrain_data = None
+                    if self.use_terrain_attention:
+                        terrain_data = {
+                            'height_map': self.env.height_map.clone().to(self.device),
+                            'terrain_xyz': self.env.terrain_xyz.clone().to(self.device)
+                        }
 
-                    actions = self.alg.act(obs, critic_obs, history)
+                    actions = self.alg.act(obs, critic_obs, history, terrain_data=terrain_data)
 
                     obs, privileged_obs, rewards, dones, infos, _, terminal_amp_states, terminal_obs, terminal_critic_obs = self.env.step(actions)
                     
@@ -304,6 +315,30 @@ class AMPOnPolicyRunnerMulti:
         self.writer.add_scalar('Perf/total_fps', fps, locs['it'])
         self.writer.add_scalar('Perf/collection time', locs['collection_time'], locs['it'])
         self.writer.add_scalar('Perf/learning_time', locs['learn_time'], locs['it'])
+        
+        # ===== 地形注意力指标 =====
+        if self.use_terrain_attention and hasattr(self.alg.actor_critic, 'terrain_attention'):
+            terrain_attn = self.alg.actor_critic.terrain_attention
+            if terrain_attn is not None and terrain_attn.last_attention_weights is not None:
+                attn_weights = terrain_attn.last_attention_weights  # [B, 187]
+                
+                # 注意力熵 (越低越专注)
+                entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=-1).mean()
+                self.writer.add_scalar('Attention/entropy', entropy.item(), locs['it'])
+                
+                # Top-10 权重占比 (越高越集中)
+                top10_values, _ = torch.topk(attn_weights, 10, dim=-1)
+                top10_ratio = top10_values.sum(dim=-1).mean()
+                self.writer.add_scalar('Attention/top10_ratio', top10_ratio.item(), locs['it'])
+                
+                # 最大权重 (单点最大关注度)
+                max_weight = attn_weights.max(dim=-1).values.mean()
+                self.writer.add_scalar('Attention/max_weight', max_weight.item(), locs['it'])
+                
+                # 前方区域权重 (假设前半部分是前方)
+                num_points = attn_weights.shape[-1]
+                front_weight = attn_weights[:, :num_points//2].sum(dim=-1).mean()
+                self.writer.add_scalar('Attention/front_region_weight', front_weight.item(), locs['it'])
         if len(locs['rewbuffer']) > 0:
             self.writer.add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), locs['it'])
             self.writer.add_scalar('Train/mean_disc_reward', statistics.mean(locs['discrewbuffer']), locs['it'])

@@ -124,19 +124,33 @@ class AMPPPOMulti:
     def train_mode(self):
         self.actor_critic.train()
 
-    def act(self, obs, critic_obs, history):
+    def act(self, obs, critic_obs, history, terrain_data=None):
 
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
+        
+        # ===== 解析地形注意力数据 =====
+        height_map = None
+        terrain_xyz = None
+        if terrain_data is not None:
+            height_map = terrain_data.get('height_map')
+            terrain_xyz = terrain_data.get('terrain_xyz')
+        
         # Compute the actions and values
         if isinstance(obs, tuple):
             aug_obs, depth_image, aug_critic_obs = obs[0].detach(), obs[1].detach(), critic_obs.detach()
-            self.transition.actions = self.actor_critic.act(aug_obs, history, depth_image[:, :2, ...]).detach()
+            self.transition.actions = self.actor_critic.act(
+                aug_obs, history, depth_image[:, :2, ...],
+                height_map=height_map, terrain_xyz=terrain_xyz
+            ).detach()
             self.transition.observations = obs[0]
             self.transition.depth_image = obs[1]
         else:
             aug_obs, aug_critic_obs = obs.detach(), critic_obs.detach()
-            self.transition.actions = self.actor_critic.act(aug_obs, history).detach()
+            self.transition.actions = self.actor_critic.act(
+                aug_obs, history,
+                height_map=height_map, terrain_xyz=terrain_xyz
+            ).detach()
             self.transition.observations = obs
         
         self.transition.values = self.actor_critic.evaluate(aug_critic_obs, history=history).detach()

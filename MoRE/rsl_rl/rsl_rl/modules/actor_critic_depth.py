@@ -35,6 +35,99 @@ import torch.nn as nn
 from torch.distributions import Normal
 
 
+class TerrainAttentionEncoder(nn.Module):
+    """
+    双路地形特征提取 + 多头交叉注意力
+    - 上路: 5x5 CNN 提取几何特征（高度差、梯度等）
+    - 下路: 原始 (x,y,z) 坐标直接使用
+    - MHA 内部处理 K/V 投影，只需手动投影 Q
+    """
+    def __init__(self, 
+                 grid_h=17, 
+                 grid_w=11,
+                 obs_dim=57,
+                 hidden_dim=128,
+                 num_heads=8,
+                 output_dim=64):
+        super().__init__()
+        
+        self.grid_h = grid_h
+        self.grid_w = grid_w
+        self.num_points = grid_h * grid_w  # 187
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        
+        # ===== 上路: 5x5 CNN 提取几何特征 =====
+        # CNN输出维度 = hidden_dim - 3，留3维给xyz坐标
+        cnn_out_dim = hidden_dim - 3
+        self.height_cnn = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=5, padding=2),  # [B,1,17,11] -> [B,32,17,11]
+            nn.ReLU(),
+            nn.Conv2d(32, cnn_out_dim, kernel_size=5, padding=2),  # -> [B,hidden-3,17,11]
+            nn.ReLU(),
+        )
+        
+        # ===== Query 投影 (obs_dim → hidden_dim) =====
+        self.q_proj = nn.Linear(obs_dim, hidden_dim)
+        
+        # ===== 多头注意力 (MHA内部处理K/V投影) =====
+        self.multihead_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            kdim=hidden_dim,  # K的输入维度
+            vdim=hidden_dim,  # V的输入维度
+            batch_first=True
+        )
+        
+        # ===== 输出投影 =====
+        self.output_proj = nn.Linear(hidden_dim, output_dim)
+        
+        # 存储注意力权重用于可视化和监控
+        self.last_attention_weights = None
+        
+    def forward(self, height_map, terrain_xyz, obs):
+        """
+        Args:
+            height_map: [B, 17, 11] 高度图
+            terrain_xyz: [B, 187, 3] 每个采样点的 (x,y,z) 坐标（机体坐标系）
+            obs: [B, obs_dim] 本体感知观测
+            
+        Returns:
+            terrain_feature: [B, output_dim] 注意力加权后的地形特征
+        """
+        B = height_map.shape[0]
+        
+        # 上路: CNN 提取几何特征
+        h = height_map.unsqueeze(1)  # [B, 1, 17, 11]
+        cnn_feat = self.height_cnn(h)  # [B, hidden-3, 17, 11]
+        cnn_feat = cnn_feat.permute(0, 2, 3, 1)  # [B, 17, 11, hidden-3]
+        cnn_feat = cnn_feat.reshape(B, self.num_points, -1)  # [B, 187, hidden-3]
+        
+        # 下路: 直接使用原始坐标 xyz
+        xyz = terrain_xyz  # [B, 187, 3]
+        
+        # 拼接: CNN几何特征 + xyz位置坐标
+        kv_input = torch.cat([cnn_feat, xyz], dim=-1)  # [B, 187, hidden]
+        
+        # Query 投影
+        Q = self.q_proj(obs).unsqueeze(1)  # [B, 1, hidden]
+        
+        # 多头交叉注意力 (MHA内部投影K和V)
+        attn_output, attn_weights = self.multihead_attn(
+            query=Q,
+            key=kv_input,
+            value=kv_input
+        )  # attn_output: [B, 1, hidden], attn_weights: [B, 1, 187]
+        
+        # 保存注意力权重用于可视化
+        self.last_attention_weights = attn_weights.squeeze(1).detach()  # [B, 187]
+        
+        # 输出投影
+        terrain_feature = self.output_proj(attn_output.squeeze(1))  # [B, output_dim]
+        
+        return terrain_feature
+
+
 class DepthOnlyFCBackbone58x87(nn.Module):
     def __init__(self, output_dim, output_activation=None, in_channels=1):
         super().__init__()
@@ -105,6 +198,13 @@ class ActorCriticDepth(nn.Module):
                         activation='elu',
                         init_noise_std=1.0,
                         max_grad_norm=10.0,
+                        # ===== 地形注意力参数 =====
+                        use_terrain_attention=False,
+                        terrain_attn_grid_h=17,
+                        terrain_attn_grid_w=11,
+                        terrain_attn_hidden_dim=128,
+                        terrain_attn_num_heads=8,
+                        terrain_attn_output_dim=64,
                         **kwargs):
         if kwargs:
             print("ActorCriticEst.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()]))
@@ -113,12 +213,30 @@ class ActorCriticDepth(nn.Module):
 
         self.his_latent_dim = his_latent_dim
         self.max_grad_norm = max_grad_norm
+        self.use_terrain_attention = use_terrain_attention
 
         # depth encoder
         depth_backbone = DepthOnlyFCBackbone58x87(output_dim=128, output_activation=activation)
         self.depth_encoder = StackDepthEncoder(depth_backbone, buffer_len=2)
 
-        mlp_input_dim_a = num_actor_obs + his_latent_dim + depth_backbone.output_dim
+        # ===== 地形注意力编码器 (可选) =====
+        terrain_attn_dim = 0
+        if use_terrain_attention:
+            self.terrain_attention = TerrainAttentionEncoder(
+                grid_h=terrain_attn_grid_h,
+                grid_w=terrain_attn_grid_w,
+                obs_dim=num_actor_obs,
+                hidden_dim=terrain_attn_hidden_dim,
+                num_heads=terrain_attn_num_heads,
+                output_dim=terrain_attn_output_dim
+            )
+            terrain_attn_dim = terrain_attn_output_dim
+            print(f"TerrainAttentionEncoder enabled: grid={terrain_attn_grid_h}x{terrain_attn_grid_w}, "
+                  f"heads={terrain_attn_num_heads}, output_dim={terrain_attn_output_dim}")
+        else:
+            self.terrain_attention = None
+
+        mlp_input_dim_a = num_actor_obs + his_latent_dim + depth_backbone.output_dim + terrain_attn_dim
         mlp_input_dim_c = num_critic_obs + his_latent_dim
         
         # History Encoder
@@ -194,13 +312,19 @@ class ActorCriticDepth(nn.Module):
         mean = self.actor(observations)
         self.distribution = Normal(mean, mean*0. + self.std)
 
-    def act(self, observations, history, depth, **kwargs):
+    def act(self, observations, history, depth, height_map=None, terrain_xyz=None, **kwargs):
 
         history = history.flatten(1)
         his_feature = self.history_encoder(history)
         
         depth_feature = self.depth_encoder(depth)
-        actor_input = torch.cat((observations, his_feature, depth_feature), dim=-1)
+        
+        # 地形注意力特征 (可选)
+        if self.use_terrain_attention and height_map is not None and terrain_xyz is not None:
+            terrain_feature = self.terrain_attention(height_map, terrain_xyz, observations)
+            actor_input = torch.cat((observations, his_feature, depth_feature, terrain_feature), dim=-1)
+        else:
+            actor_input = torch.cat((observations, his_feature, depth_feature), dim=-1)
 
         self.update_distribution(actor_input)
         return self.distribution.sample()
@@ -208,12 +332,19 @@ class ActorCriticDepth(nn.Module):
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
-    def act_inference(self, observations, history, depth, **kwargs):
+    def act_inference(self, observations, history, depth, height_map=None, terrain_xyz=None, **kwargs):
 
         history = history.flatten(1)
         his_feature = self.history_encoder(history)
         depth_feature = self.depth_encoder(depth)
-        actor_input = torch.cat((observations, his_feature, depth_feature), dim=-1)
+        
+        # 地形注意力特征 (可选)
+        if self.use_terrain_attention and height_map is not None and terrain_xyz is not None:
+            terrain_feature = self.terrain_attention(height_map, terrain_xyz, observations)
+            actor_input = torch.cat((observations, his_feature, depth_feature, terrain_feature), dim=-1)
+        else:
+            actor_input = torch.cat((observations, his_feature, depth_feature), dim=-1)
+            
         actions_mean = self.actor(actor_input)
         return actions_mean
     

@@ -51,6 +51,18 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         self.last_last_feet_contact_force = torch.zeros(self.num_envs, 2, 3, dtype=torch.float, device=self.device, requires_grad=False)
         self.feet_indicator_offset = torch.tensor(self.cfg.asset.feet_indicator_offset, dtype=torch.float, device=self.device, requires_grad=False)
         self.feet_indicator_pos = torch.zeros(self.num_envs, len(self.feet_indices), *self.feet_indicator_offset.shape,dtype=torch.float, device=self.device, requires_grad=False)
+        
+        # ===== 地形注意力相关 buffer =====
+        if hasattr(self.cfg, 'terrain_attention') and self.cfg.terrain_attention.use_attention:
+            self.use_terrain_attention = True
+            grid_h = self.cfg.terrain_attention.grid_h
+            grid_w = self.cfg.terrain_attention.grid_w
+            self.terrain_xyz = torch.zeros(self.num_envs, grid_h * grid_w, 3, dtype=torch.float, device=self.device, requires_grad=False)
+            self.height_map = torch.zeros(self.num_envs, grid_h, grid_w, dtype=torch.float, device=self.device, requires_grad=False)
+        else:
+            self.use_terrain_attention = False
+            self.terrain_xyz = None
+            self.height_map = None
 
     def reset_idx(self, env_ids):
         super().reset_idx(env_ids)
@@ -249,6 +261,10 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         if self.cfg.terrain.measure_heights:  # 187
             heights = torch.clip(self.root_states[:, 2].unsqueeze(1) - self.cfg.normalization.base_height - self.measured_heights, -1, 1.) * self.obs_scales.height_measurements
             self.privileged_obs_buf = torch.cat((self.privileged_obs_buf, heights), dim=-1)
+        
+        # ===== 更新地形注意力相关数据 =====
+        if self.use_terrain_attention:
+            self._update_terrain_attention_data()
             
         # add perceptive inputs if not blind
         # add noise if needed
@@ -256,6 +272,32 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
             self.obs_buf += (2 * torch.rand_like(self.obs_buf) - 1) * self.noise_scale_vec
 
         return self.obs_buf, self.privileged_obs_buf
+    
+    def _update_terrain_attention_data(self):
+        """
+        更新地形注意力所需的数据:
+        - terrain_xyz: [num_envs, 187, 3] 机体坐标系下的采样点坐标
+        - height_map: [num_envs, grid_h, grid_w] 高度图
+        """
+        grid_h = self.cfg.terrain_attention.grid_h
+        grid_w = self.cfg.terrain_attention.grid_w
+        
+        # height_points 是在机体坐标系下的采样点 (x, y, 0)
+        # 我们需要在机体坐标系下保持 x, y，并添加采样到的高度 z
+        
+        # 获取采样到的高度（相对于机体高度的差值）
+        # measured_heights 在 post_physics_step 中由父类更新
+        heights_relative = self.root_states[:, 2].unsqueeze(1) - self.measured_heights  # [num_envs, 187]
+        
+        # 构建完整的 terrain_xyz
+        # x, y 来自 height_points (机体坐标系)
+        # z 是采样到的相对高度
+        self.terrain_xyz[:, :, 0] = self.height_points[:, :, 0]  # x
+        self.terrain_xyz[:, :, 1] = self.height_points[:, :, 1]  # y
+        self.terrain_xyz[:, :, 2] = heights_relative - self.cfg.normalization.base_height  # z (相对于基准高度)
+        
+        # 构建 height_map [num_envs, grid_h, grid_w]
+        self.height_map = self.terrain_xyz[:, :, 2].reshape(self.num_envs, grid_h, grid_w)
 
     def compute_reward(self):
         """ Compute rewards

@@ -101,6 +101,15 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         if scan_dot:
             num_privileged_obs += 187
 
+    class terrain_attention:
+        """地形注意力机制配置"""
+        use_attention = True  # 开关：设为True启用注意力机制，False则与原代码行为一致
+        grid_h = 17            # 采样网格高度 (对应 measured_points_x)
+        grid_w = 11            # 采样网格宽度 (对应 measured_points_y)
+        hidden_dim = 128       # 注意力隐藏维度 (需能被 num_heads 整除)
+        num_heads = 8          # 多头注意力头数
+        output_dim = 64        # 输出特征维度
+
     class depth(LeggedRobotCfg.depth):
         use_camera = False
         warp_camera = True
@@ -299,6 +308,14 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         actor_hidden_dims = [512, 256, 128]
         critic_hidden_dims = [512, 256, 128]
         his_latent_dim = 64
+        
+        # ===== 地形注意力参数 (需与 G1_16Dof_Loco_Cfg.terrain_attention 保持一致) =====
+        use_terrain_attention = True  # 开关: 必须与 env 配置中的 terrain_attention.use_attention 一致
+        terrain_attn_grid_h = 17
+        terrain_attn_grid_w = 11
+        terrain_attn_hidden_dim = 128
+        terrain_attn_num_heads = 8
+        terrain_attn_output_dim = 64
 
     class algorithm( LeggedRobotCfgPPO.algorithm ):
         use_amp = False
@@ -306,6 +323,7 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         amp_loader_class_name = "G1_AMPLoader"
         
         entropy_coef = 0.01
+        num_mini_batches = 8
         policy_learning_rate = 5e-4
 
     class runner( LeggedRobotCfgPPO.runner ):

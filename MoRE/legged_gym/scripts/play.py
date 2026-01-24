@@ -1,9 +1,75 @@
 from legged_gym import LEGGED_GYM_ROOT_DIR
 import os
 import isaacgym
+from isaacgym import gymapi, gymutil
 from legged_gym.envs import *
 from legged_gym.utils import  get_args, export_policy_as_jit_resi, export_policy_as_jit_depth, task_registry
 import torch
+import numpy as np
+
+
+def draw_attention_points(env, attention_weights, terrain_xyz):
+    """
+    根据注意力权重绘制彩色采样点
+    - 蓝色 (0, 0, 1): 低权重
+    - 红色 (1, 0, 0): 高权重
+    
+    Args:
+        env: 环境对象
+        attention_weights: [num_envs, 187] 注意力权重
+        terrain_xyz: [num_envs, 187, 3] 采样点坐标 (机体坐标系)
+    """
+    if env.viewer is None:
+        return
+        
+    env.gym.clear_lines(env.viewer)
+    
+    lookat_id = env.lookat_id if hasattr(env, 'lookat_id') else 0
+    
+    # 获取当前环境的权重和点
+    weights = attention_weights[lookat_id].cpu().numpy()
+    # 归一化到 [0, 1]
+    w_min, w_max = weights.min(), weights.max()
+    if w_max - w_min > 1e-8:
+        weights_norm = (weights - w_min) / (w_max - w_min)
+    else:
+        weights_norm = np.zeros_like(weights)
+    
+    # 获取世界坐标系下的点位置
+    # terrain_xyz 是机体坐标系，需要转换到世界坐标系
+    base_pos = env.root_states[lookat_id, :3].cpu().numpy()
+    base_quat = env.root_states[lookat_id, 3:7].cpu().numpy()
+    
+    points_body = terrain_xyz[lookat_id].cpu().numpy()  # [187, 3]
+    
+    # 简化：直接用机体位置 + 局部坐标（忽略旋转，或使用 yaw 旋转）
+    # 这里为了简化，只考虑 yaw 旋转
+    from isaacgym.torch_utils import quat_apply_yaw
+    points_world_xy = points_body[:, :2]  # 使用局部 xy
+    
+    # 计算 yaw 角
+    # quat = [x, y, z, w]
+    qx, qy, qz, qw = base_quat
+    yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy**2 + qz**2))
+    
+    # 旋转 xy
+    cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
+    rot_x = points_body[:, 0] * cos_yaw - points_body[:, 1] * sin_yaw
+    rot_y = points_body[:, 0] * sin_yaw + points_body[:, 1] * cos_yaw
+    
+    # 世界坐标
+    world_x = base_pos[0] + rot_x
+    world_y = base_pos[1] + rot_y
+    world_z = base_pos[2] + points_body[:, 2]  # z 是高度差
+    
+    # 绘制每个点
+    for i in range(len(weights_norm)):
+        w = weights_norm[i]
+        # 蓝色 → 红色渐变
+        color = (w, 0.0, 1.0 - w)
+        sphere_geom = gymutil.WireframeSphereGeometry(0.02, 6, 6, None, color=color)
+        pose = gymapi.Transform(gymapi.Vec3(world_x[i], world_y[i], world_z[i]), r=None)
+        gymutil.draw_lines(sphere_geom, env.gym, env.viewer, env.envs[lookat_id], pose)
 
 
 def play(args):
@@ -93,6 +159,10 @@ def play(args):
         infos["depth"] = env.depth_buffer.clone().to(env.device)  
     else:
         infos["depth"] = None
+    
+    # ===== 检查是否使用地形注意力 =====
+    use_terrain_attention = getattr(env, 'use_terrain_attention', False)
+    actor_critic = ppo_runner.alg.actor_critic
 
     for i in range(int(env.max_episode_length)):
         # get depth image
@@ -100,12 +170,27 @@ def play(args):
             depth_image = infos['depth']
         if env.cfg.depth.warp_camera or env.cfg.depth.use_camera:
             obs = (obs, depth_image)
+        
+        # ===== 准备地形注意力数据 =====
+        height_map = None
+        terrain_xyz = None
+        if use_terrain_attention and env.height_map is not None:
+            height_map = env.height_map.clone().to(env.device)
+            terrain_xyz = env.terrain_xyz.clone().to(env.device)
 
         if isinstance(obs, tuple):
-            actions = policy(obs[0].detach(), trajectory_history.detach(), obs[1][:, :2, ...].detach())
+            actions = policy(obs[0].detach(), trajectory_history.detach(), obs[1][:, :2, ...].detach(),
+                           height_map=height_map, terrain_xyz=terrain_xyz)
         else:
-            actions = policy(obs.detach(), trajectory_history)
+            actions = policy(obs.detach(), trajectory_history,
+                           height_map=height_map, terrain_xyz=terrain_xyz)
         obs, _, _, dones, infos, *_= env.step(actions.detach())
+        
+        # ===== 绘制注意力可视化 =====
+        if use_terrain_attention and hasattr(actor_critic, 'terrain_attention'):
+            terrain_attn = actor_critic.terrain_attention
+            if terrain_attn is not None and terrain_attn.last_attention_weights is not None:
+                draw_attention_points(env, terrain_attn.last_attention_weights, terrain_xyz)
 
         # process trajectory history
         env_ids = dones.nonzero(as_tuple=False).flatten()
