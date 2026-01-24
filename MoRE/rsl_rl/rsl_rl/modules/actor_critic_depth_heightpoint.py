@@ -37,6 +37,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
+from torch import Tensor
+from typing import Optional, Tuple
 
 
 class DepthOnlyFCBackbone58x87(nn.Module):
@@ -78,16 +80,18 @@ class DepthOnlyFCBackbone58x87(nn.Module):
                 To make the model robust to different upstream depth resolutions,
                 we resize to (64, 64) when needed.
         """
-        if images.ndim != 3:
-            raise ValueError(f"DepthOnlyFCBackbone expects images [N,H,W] but got shape {tuple(images.shape)}")
+        # TorchScript friendly checks (avoid f-strings / tuple(images.shape) which are not scriptable).
+        if images.dim() != 3:
+            raise RuntimeError("DepthOnlyFCBackbone expects images with shape [N, H, W] (3D tensor).")
 
         # `image_compression` is designed for 64x64.
-        target_hw = (64, 64)
-        if tuple(images.shape[-2:]) != target_hw:
+        target_h = 64
+        target_w = 64
+        if images.size(-2) != target_h or images.size(-1) != target_w:
             # Resize only when mismatch happens; keep this path cheap for the common (64,64) case.
             images = F.interpolate(
                 images.unsqueeze(1),
-                size=target_hw,
+                size=(target_h, target_w),
                 mode="bilinear",
                 align_corners=False,
             ).squeeze(1)
@@ -225,15 +229,18 @@ class HeightPointAttentionEncoder(nn.Module):
         )
         
         # 保存注意力权重用于可视化和监督
-        self.last_attn_weights = None
-        self.last_raw_attn_scores = None  # 保存原始注意力分数（用于 loss 计算）
+        # TorchScript: explicitly mark these as Optional[Tensor], otherwise scripting may infer NoneType
+        # and fail on the first Tensor assignment in forward().
+        self.last_attn_weights = torch.jit.Attribute(None, Optional[Tensor])
+        self.last_raw_attn_scores = torch.jit.Attribute(None, Optional[Tensor])  # 保存原始注意力分数（用于 loss 计算）
     
-    def forward(self, 
-                height_points: torch.Tensor,
-                proprioception: torch.Tensor,
-                safety_scores: torch.Tensor = None,
-                beta=0.0,
-                **kwargs) -> tuple:
+    def forward(
+        self,
+        height_points: torch.Tensor,
+        proprioception: torch.Tensor,
+        safety_scores: Optional[torch.Tensor] = None,
+        beta: float = 0.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         前向传播
         
@@ -249,7 +256,6 @@ class HeightPointAttentionEncoder(nn.Module):
             attn_weights: [B, num_x, num_y] 注意力权重热力图
         """
         B = height_points.shape[0]
-        device = height_points.device
         
         # 处理输入形状
         if height_points.dim() == 4:
@@ -269,7 +275,7 @@ class HeightPointAttentionEncoder(nn.Module):
             height_points_grid = height_points  # [B, num_x, num_y, 3]
         else:
             if num_points != num_x * num_y:
-                raise ValueError(f"height_points has {num_points} points but expected {num_x}x{num_y}={num_x*num_y}")
+                raise RuntimeError("height_points has unexpected number of points; expected num_x * num_y.")
             height_points_grid = height_points_flat.view(B, num_x, num_y, 3)
         
         # 上路（几何视觉路）：z -> [B,1,num_x,num_y] -> Conv2d -> 每点几何特征
@@ -307,10 +313,14 @@ class HeightPointAttentionEncoder(nn.Module):
         # safety_scores: [B, N] -> [B, 1, N]，广播到每个 head: [B, Heads, N]
         if self.use_safety_bias and safety_scores is not None:
             safety = safety_scores.unsqueeze(1)  # [B, 1, N]
-            if isinstance(beta, torch.Tensor):
-                beta_term = beta.view(-1, 1, 1).to(dtype=safety.dtype, device=safety.device)  # [B,1,1]
+            # TorchScript: keep beta a float. Eager mode: also accept Tensor beta for backward compatibility.
+            if torch.jit.is_scripting():
+                beta_term = beta
             else:
-                beta_term = float(beta)
+                if isinstance(beta, torch.Tensor):
+                    beta_term = beta.view(-1, 1, 1).to(dtype=safety.dtype, device=safety.device)  # [B,1,1]
+                else:
+                    beta_term = float(beta)
             biased_attn_scores = raw_attn_scores + beta_term * safety  # [B, Heads, N]
         else:
             biased_attn_scores = raw_attn_scores
@@ -335,15 +345,16 @@ class HeightPointAttentionEncoder(nn.Module):
         # H.3: 重塑注意力权重用于可视化/监督
         # 多头下返回一个单通道 attention：对 heads 取平均，保持兼容 [B, N]
         attn_weights = attn_probs.mean(dim=1)  # [B, N]
-        self.last_attn_weights = attn_weights.view(B, num_x, num_y)
+        attn_weights_view = attn_weights.view(B, num_x, num_y)
+        self.last_attn_weights = attn_weights_view
         
-        return context_vector, self.last_attn_weights
+        return context_vector, attn_weights_view
     
-    def get_attention_weights(self) -> torch.Tensor:
+    def get_attention_weights(self) -> Optional[torch.Tensor]:
         """获取最近一次的注意力权重，用于可视化"""
         return self.last_attn_weights
     
-    def get_attention_weights_flat(self) -> torch.Tensor:
+    def get_attention_weights_flat(self) -> Optional[torch.Tensor]:
         """获取展平的注意力权重 [B, num_points]，用于 loss 计算"""
         if self.last_attn_weights is None:
             return None

@@ -10,7 +10,8 @@ def play(args):
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     # override some parameters for testing
     env_cfg.env.episode_length_s = 100
-    env_cfg.env.num_envs = 1
+    # For visualization, keep a safe default (1) unless explicitly overridden via --num_envs.
+    env_cfg.env.num_envs = args.num_envs if args.num_envs is not None else 1
     env_cfg.terrain.num_rows = 5
     env_cfg.terrain.num_cols = 5
     env_cfg.terrain.curriculum = False
