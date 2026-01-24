@@ -123,6 +123,13 @@ class AMPOnPolicyRunnerMulti:
         self.num_amp_frames = train_cfg['runner']['num_amp_frames']
 
         # init storage and model
+        # 获取地形注意力配置
+        terrain_attn_grid_h = None
+        terrain_attn_grid_w = None
+        if hasattr(self.env.cfg, 'terrain_attention') and self.env.cfg.terrain_attention.use_attention:
+            terrain_attn_grid_h = self.env.cfg.terrain_attention.grid_h
+            terrain_attn_grid_w = self.env.cfg.terrain_attention.grid_w
+        
         self.alg.init_storage(self.env.num_envs, 
                               self.num_steps_per_env, 
                               [num_actor_obs], 
@@ -131,7 +138,9 @@ class AMPOnPolicyRunnerMulti:
                               self.obs_history_len, 
                               self.env.num_obs,
                               depth_shape=self.depth_shape if self.use_depth else None,
-                              depth_buffer_len=self.env.cfg.depth.buffer_len if self.use_depth else None)
+                              depth_buffer_len=self.env.cfg.depth.buffer_len if self.use_depth else None,
+                              terrain_attn_grid_h=terrain_attn_grid_h,
+                              terrain_attn_grid_w=terrain_attn_grid_w)
 
         # Log
         self.log_dir = log_dir

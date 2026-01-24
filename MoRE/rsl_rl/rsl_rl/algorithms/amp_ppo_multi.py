@@ -114,9 +114,11 @@ class AMPPPOMulti:
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
 
-    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, history_len, history_dim, depth_shape=None, depth_buffer_len=None):
+    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, history_len, history_dim, depth_shape=None, depth_buffer_len=None, terrain_attn_grid_h=None, terrain_attn_grid_w=None):
         self.storage = RolloutStorage(
-            num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device, history_len, history_dim, depth_shape, depth_buffer_len)
+            num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device, history_len, history_dim, depth_shape, depth_buffer_len,
+            terrain_attn_grid_h=terrain_attn_grid_h, terrain_attn_grid_w=terrain_attn_grid_w)
+        self.use_terrain_attention = terrain_attn_grid_h is not None and terrain_attn_grid_w is not None
 
     def test_mode(self):
         self.actor_critic.test()
@@ -162,6 +164,9 @@ class AMPPPOMulti:
         # need to record obs and critic_obs before env.step()
         self.transition.history = history
         self.transition.critic_observations = critic_obs
+        # 保存地形注意力数据
+        self.transition.height_map = height_map
+        self.transition.terrain_xyz = terrain_xyz
         return self.transition.actions
     
         
@@ -280,15 +285,21 @@ class AMPPPOMulti:
                 mean_demo_acc += demo_acc.mean().item()
         
         for obs_batch, critic_obs_batch, actions_batch, next_obs_batch, next_critic_observations_batch, history_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
-            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, depth_image_batch, *_ in generator:
+            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch, depth_image_batch, height_map_batch, terrain_xyz_batch, *_ in generator:
 
             aug_obs_batch, history_batch = obs_batch.detach(), history_batch.detach()
             
+            # 地形注意力数据
+            height_map = height_map_batch.detach() if height_map_batch is not None else None
+            terrain_xyz = terrain_xyz_batch.detach() if terrain_xyz_batch is not None else None
+            
             if self.use_depth:
                 aug_depth_image_batch = depth_image_batch.detach()
-                self.actor_critic.act(aug_obs_batch, history_batch, aug_depth_image_batch[:, :2, ...])
+                self.actor_critic.act(aug_obs_batch, history_batch, aug_depth_image_batch[:, :2, ...],
+                                     height_map=height_map, terrain_xyz=terrain_xyz)
             else:
-                self.actor_critic.act(obs_batch, history_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+                self.actor_critic.act(obs_batch, history_batch, masks=masks_batch, hidden_states=hid_states_batch[0],
+                                     height_map=height_map, terrain_xyz=terrain_xyz)
 
             
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
