@@ -14,6 +14,7 @@ TerrainSafetyScorer 测试脚本
 - 静止状态 (v=0)
 - 向前行走 (v_x > 0)
 - 向侧面行走 (v_y > 0)
+- 斜向行走 (v_x > 0, v_y > 0)
 """
 
 import sys
@@ -51,13 +52,21 @@ def create_step_up_terrain(
     grid_h: int = 17, 
     grid_w: int = 11, 
     batch_size: int = 1,
-    step_height: float = 0.15,
-    step_position: float = 0.5  # 台阶位置 (0-1, 相对于网格)
+    step_height: float = 0.1,
+    num_steps: int = 2
 ) -> torch.Tensor:
-    """创建上升台阶地形 (前方抬高)"""
+    """创建连续上升台阶地形 (前方多阶抬高)
+    
+    Args:
+        step_height: 每阶台阶的高度
+        num_steps: 台阶数量
+    """
     height_map = torch.zeros(batch_size, grid_h, grid_w)
-    step_idx = int(grid_h * step_position)
-    height_map[:, step_idx:, :] = step_height
+    # 将网格分成 num_steps + 1 段 (身后平地 + num_steps 阶台阶)
+    segment_len = grid_h // (num_steps + 1)
+    for i in range(num_steps):
+        start_idx = segment_len * (i + 1)
+        height_map[:, start_idx:, :] = step_height * (i + 1)
     return height_map
 
 
@@ -65,13 +74,21 @@ def create_step_down_terrain(
     grid_h: int = 17, 
     grid_w: int = 11, 
     batch_size: int = 1,
-    step_depth: float = 0.2,
-    step_position: float = 0.5
+    step_depth: float = 0.1,
+    num_steps: int = 2
 ) -> torch.Tensor:
-    """创建下降台阶地形 (前方降低)"""
+    """创建连续下降台阶地形 (前方多阶降低)
+    
+    Args:
+        step_depth: 每阶台阶的深度
+        num_steps: 台阶数量
+    """
     height_map = torch.zeros(batch_size, grid_h, grid_w)
-    step_idx = int(grid_h * step_position)
-    height_map[:, step_idx:, :] = -step_depth
+    # 将网格分成 num_steps + 1 段
+    segment_len = grid_h // (num_steps + 1)
+    for i in range(num_steps):
+        start_idx = segment_len * (i + 1)
+        height_map[:, start_idx:, :] = -step_depth * (i + 1)
     return height_map
 
 
@@ -105,14 +122,41 @@ def create_slope_terrain(
     return height_map
 
 
-def create_rough_terrain(
+def create_stepping_stones_terrain(
     grid_h: int = 17, 
     grid_w: int = 11, 
     batch_size: int = 1,
-    roughness: float = 0.1
+    stone_height: float = 0.0,
+    gap_depth: float = 0.5,
+    stone_size: int = 2,
+    gap_size: int = 1
 ) -> torch.Tensor:
-    """创建粗糙地形 (随机噪声)"""
-    height_map = torch.randn(batch_size, grid_h, grid_w) * roughness
+    """创建踏脚石地形 (交替的石块和间隙)
+    
+    模拟实际训练中的 stepping stones 地形。
+    石块为 0 高度，间隙为负高度（深坑）。
+    
+    Args:
+        stone_height: 石块高度（相对基准）
+        gap_depth: 间隙深度
+        stone_size: 石块尺寸（网格单位）
+        gap_size: 间隙尺寸（网格单位）
+    """
+    height_map = torch.zeros(batch_size, grid_h, grid_w)
+    pattern_size = stone_size + gap_size
+    
+    for i in range(grid_h):
+        for j in range(grid_w):
+            # 计算在 pattern 中的位置
+            i_in_pattern = i % pattern_size
+            j_in_pattern = j % pattern_size
+            
+            # 如果在间隙区域
+            if i_in_pattern >= stone_size or j_in_pattern >= stone_size:
+                height_map[:, i, j] = -gap_depth
+            else:
+                height_map[:, i, j] = stone_height
+    
     return height_map
 
 
@@ -130,6 +174,17 @@ def create_gap_terrain(
     start_idx = max(0, center_idx - gap_width // 2)
     end_idx = min(grid_h, center_idx + gap_width // 2 + 1)
     height_map[:, start_idx:end_idx, :] = -gap_depth
+    return height_map
+
+
+def create_rough_terrain(
+    grid_h: int = 17, 
+    grid_w: int = 11, 
+    batch_size: int = 1,
+    roughness_scale: float = 0.1
+) -> torch.Tensor:
+    """创建粗糙地形 (随机高频起伏，用于测试 local_var)"""
+    height_map = torch.randn(batch_size, grid_h, grid_w) * roughness_scale
     return height_map
 
 
@@ -155,17 +210,23 @@ def visualize_scorer_output(
         sample_idx: 要可视化的 batch 索引
         save_path: 保存路径 (可选)
     """
-    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
-    fig.suptitle(f"{title}\nVelocity: v_x={base_lin_vel[sample_idx, 0]:.2f}, "
-                 f"v_y={base_lin_vel[sample_idx, 1]:.2f} m/s", fontsize=14)
+    fig, axes = plt.subplots(3, 4, figsize=(20, 15))
+    fig.suptitle(
+        f"{title}\n"
+        f"Velocity: v_x={base_lin_vel[sample_idx, 0]:.2f}, v_y={base_lin_vel[sample_idx, 1]:.2f} m/s | "
+        f"α={debug_info['alpha']:.3f}", 
+        fontsize=14
+    )
     
     # 采样点坐标
     measured_points_x = [-0.8, -0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 
                           0., 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
     measured_points_y = [-0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3, 0.4, 0.5]
     
+    # extent: [left, right, bottom, top] with origin='lower'
+    # 让 X 轴向上为正（上方 = 机器人前方）
     extent = [measured_points_y[0], measured_points_y[-1], 
-              measured_points_x[-1], measured_points_x[0]]
+              measured_points_x[0], measured_points_x[-1]]
     
     def add_robot_marker(ax):
         """在图上标记机器人位置"""
@@ -181,93 +242,157 @@ def visualize_scorer_output(
         cp_y = capture_offset[1, center_h, center_w].item()
         ax.plot(cp_y, cp_x, 'r*', markersize=15, label='Capture Point (center)')
     
+    def add_velocity_arrow(ax, vel):
+        """标记速度方向"""
+        v_x, v_y = vel[0].item(), vel[1].item()
+        v_norm = np.sqrt(v_x**2 + v_y**2)
+        if v_norm > 0.05:
+            # 箭头从原点指向速度方向
+            ax.annotate('', xy=(v_y * 0.3, v_x * 0.3), xytext=(0, 0),
+                       arrowprops=dict(arrowstyle='->', color='blue', lw=2))
+    
+    # 使用 origin='lower' 让 X 轴向上为正（图示上方 = 机器人前方）
+    imshow_kwargs = dict(extent=extent, aspect='auto', origin='lower')
+    
+    # ===== Row 1: 基础信息 =====
+    
     # 1. Height Map
     ax = axes[0, 0]
-    im = ax.imshow(height_map[sample_idx].detach().cpu().numpy(), extent=extent, aspect='auto', cmap='terrain')
+    im = ax.imshow(height_map[sample_idx].detach().cpu().numpy(), **imshow_kwargs, cmap='terrain')
     ax.set_title('Height Map')
-    ax.set_xlabel('Y (m)')
-    ax.set_ylabel('X (m)')
+    ax.set_xlabel('Y (m) ← Left | Right →')
+    ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
     plt.colorbar(im, ax=ax, label='Height (m)')
     
-    # 2. S_geo (几何分数)
+    # 2. Slope (归一化坡度)
     ax = axes[0, 1]
-    S_geo = debug_info['S_geo'][sample_idx].detach().cpu().numpy()
-    im = ax.imshow(S_geo, extent=extent, aspect='auto', cmap='RdYlGn')
-    ax.set_title(f'S_geo (Geometric Score)\nσ_geo={debug_info["sigma_geo"]:.3f}')
+    slope = debug_info['slope'][sample_idx].detach().cpu().numpy()
+    im = ax.imshow(slope, **imshow_kwargs, cmap='hot')
+    ax.set_title(f'Slope (tan θ)\nthreshold={0.5}')
     ax.set_xlabel('Y (m)')
-    ax.set_ylabel('X (m)')
+    ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
-    plt.colorbar(im, ax=ax, label='Score')
+    plt.colorbar(im, ax=ax, label='tan(θ)')
     
-    # 3. S_dyn (动力学分数)
+    # 3. Local Variance (局部方差)
     ax = axes[0, 2]
-    S_dyn = debug_info['S_dyn'][sample_idx].detach().cpu().numpy()
-    im = ax.imshow(S_dyn, extent=extent, aspect='auto', cmap='RdYlGn')
-    ax.set_title(f'S_dyn (Dynamic Score)\nσ_dyn={debug_info["sigma_dyn"]:.3f}')
+    local_var = debug_info['local_var'][sample_idx].detach().cpu().numpy()
+    im = ax.imshow(local_var, **imshow_kwargs, cmap='hot')
+    ax.set_title(f'Local Variance\nthreshold={0.02}')
     ax.set_xlabel('Y (m)')
-    ax.set_ylabel('X (m)')
+    ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
-    add_capture_point(ax, debug_info['capture_offset'][sample_idx])
-    ax.legend(loc='upper right')
-    plt.colorbar(im, ax=ax, label='Score')
+    plt.colorbar(im, ax=ax, label='Variance')
     
-    # 4. Roughness
+    # 4. Omega (自然频率)
     ax = axes[0, 3]
-    roughness = debug_info['roughness'][sample_idx].detach().cpu().numpy()
-    im = ax.imshow(roughness, extent=extent, aspect='auto', cmap='hot')
-    ax.set_title('Roughness (Gradient Magnitude)')
-    ax.set_xlabel('Y (m)')
-    ax.set_ylabel('X (m)')
-    add_robot_marker(ax)
-    plt.colorbar(im, ax=ax, label='Roughness')
-    
-    # 5. Omega (自然频率)
-    ax = axes[1, 0]
     omega = debug_info['omega'][sample_idx].detach().cpu().numpy()
-    im = ax.imshow(omega, extent=extent, aspect='auto', cmap='viridis')
+    im = ax.imshow(omega, **imshow_kwargs, cmap='viridis')
     ax.set_title('ω (Natural Frequency)')
     ax.set_xlabel('Y (m)')
-    ax.set_ylabel('X (m)')
+    ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
     plt.colorbar(im, ax=ax, label='ω (rad/s)')
     
-    # 6. Unsafe Mask
-    ax = axes[1, 1]
-    unsafe_mask = debug_info['unsafe_mask'][sample_idx].detach().cpu().numpy().astype(float)
-    im = ax.imshow(unsafe_mask, extent=extent, aspect='auto', cmap='Reds')
-    ax.set_title('Unsafe Mask (Combined)')
-    ax.set_xlabel('Y (m)')
-    ax.set_ylabel('X (m)')
-    add_robot_marker(ax)
-    plt.colorbar(im, ax=ax, label='Unsafe')
+    # ===== Row 2: 分数和掩码 =====
     
-    # 7. Individual Masks
-    ax = axes[1, 2]
-    steep = debug_info['steep_mask'][sample_idx].detach().cpu().numpy().astype(float) * 1
-    too_low = debug_info['too_low_mask'][sample_idx].detach().cpu().numpy().astype(float) * 2
-    too_high = debug_info['too_high_mask'][sample_idx].detach().cpu().numpy().astype(float) * 3
-    combined = steep + too_low + too_high
-    im = ax.imshow(combined, extent=extent, aspect='auto', cmap='tab10', vmin=0, vmax=4)
-    ax.set_title('Mask Types\n0:Safe, 1:Steep, 2:TooLow, 3:TooHigh')
+    # 5. S_geo (几何分数)
+    ax = axes[1, 0]
+    S_geo = debug_info['S_geo'][sample_idx].detach().cpu().numpy()
+    im = ax.imshow(S_geo, **imshow_kwargs, cmap='RdYlGn')
+    ax.set_title(f'S_geo (Geometric Score)\nσ_geo={debug_info["sigma_geo"]:.3f}')
     ax.set_xlabel('Y (m)')
-    ax.set_ylabel('X (m)')
+    ax.set_ylabel('X (m) ↑ Forward')
+    add_robot_marker(ax)
+    plt.colorbar(im, ax=ax, label='Score')
+    
+    # 6. S_dyn (动力学分数)
+    ax = axes[1, 1]
+    S_dyn = debug_info['S_dyn'][sample_idx].detach().cpu().numpy()
+    im = ax.imshow(S_dyn, **imshow_kwargs, cmap='RdYlGn')
+    ax.set_title(f'S_dyn (Dynamic Score)\nσ_dyn={debug_info["sigma_dyn"]:.3f}')
+    ax.set_xlabel('Y (m)')
+    ax.set_ylabel('X (m) ↑ Forward')
+    add_robot_marker(ax)
+    add_capture_point(ax, debug_info['capture_offset'][sample_idx])
+    add_velocity_arrow(ax, base_lin_vel[sample_idx])
+    ax.legend(loc='upper right')
+    plt.colorbar(im, ax=ax, label='Score')
+    
+    # 7. Steep Mask (陡坡 + 局部方差)
+    ax = axes[1, 2]
+    steep_mask = debug_info['steep_mask'][sample_idx].detach().cpu().numpy().astype(float)
+    im = ax.imshow(steep_mask, **imshow_kwargs, cmap='Reds')
+    ax.set_title('Steep Mask\n(slope > thresh OR var > thresh)')
+    ax.set_xlabel('Y (m)')
+    ax.set_ylabel('X (m) ↑ Forward')
+    add_robot_marker(ax)
+    plt.colorbar(im, ax=ax, label='Masked')
+    
+    # 8. Behind Mask (身后区域 - 点积半平面)
+    ax = axes[1, 3]
+    behind_mask = debug_info['behind_mask'][sample_idx].detach().cpu().numpy().astype(float)
+    im = ax.imshow(behind_mask, **imshow_kwargs, cmap='Blues')
+    ax.set_title('Behind Mask\n(dot product half-plane)')
+    ax.set_xlabel('Y (m)')
+    ax.set_ylabel('X (m) ↑ Forward')
+    add_robot_marker(ax)
+    add_velocity_arrow(ax, base_lin_vel[sample_idx])
+    plt.colorbar(im, ax=ax, label='Masked')
+    
+    # ===== Row 3: 最终结果 =====
+    
+    # 9. Pit Mask (深坑)
+    ax = axes[2, 0]
+    pit_mask = debug_info['pit_mask'][sample_idx].detach().cpu().numpy().astype(float)
+    im = ax.imshow(pit_mask, **imshow_kwargs, cmap='Purples')
+    ax.set_title('Pit Mask\n(height < -threshold)')
+    ax.set_xlabel('Y (m)')
+    ax.set_ylabel('X (m) ↑ Forward')
+    add_robot_marker(ax)
+    plt.colorbar(im, ax=ax, label='Masked')
+    
+    # 10. Combined Mask Types (可视化不同掩码的叠加)
+    ax = axes[2, 1]
+    steep = debug_info['steep_mask'][sample_idx].detach().cpu().numpy().astype(float) * 1
+    pit = debug_info['pit_mask'][sample_idx].detach().cpu().numpy().astype(float) * 2
+    behind = debug_info['behind_mask'][sample_idx].detach().cpu().numpy().astype(float) * 3
+    combined = steep + pit + behind
+    im = ax.imshow(combined, **imshow_kwargs, cmap='tab10', vmin=0, vmax=4)
+    ax.set_title('Mask Types (overlapping)\n0:Safe, 1:Steep, 2:Pit, 3:Behind')
+    ax.set_xlabel('Y (m)')
+    ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
     plt.colorbar(im, ax=ax, label='Mask Type')
     
-    # 8. Final Bias (融合后)
-    ax = axes[1, 3]
+    # 11. Final Bias (2D)
+    ax = axes[2, 2]
     bias_2d = debug_info['bias_2d'][sample_idx].detach().cpu().numpy()
-    # 将 -1e9 替换为 NaN 以便可视化
-    bias_vis = np.where(bias_2d < -1e8, np.nan, bias_2d)
-    im = ax.imshow(bias_vis, extent=extent, aspect='auto', cmap='RdYlGn')
-    ax.set_title('Final Bias (masked areas = NaN)')
+    im = ax.imshow(bias_2d, **imshow_kwargs, cmap='RdYlGn')
+    ax.set_title('Final Bias (with soft penalties)')
     ax.set_xlabel('Y (m)')
-    ax.set_ylabel('X (m)')
+    ax.set_ylabel('X (m) ↑ Forward')
+    add_robot_marker(ax)
+    add_capture_point(ax, debug_info['capture_offset'][sample_idx])
+    add_velocity_arrow(ax, base_lin_vel[sample_idx])
+    ax.legend(loc='upper right')
+    plt.colorbar(im, ax=ax, label='Bias')
+    
+    # 12. Softmax Attention (最终注意力分布)
+    ax = axes[2, 3]
+    bias_flat = bias_2d.flatten()
+    attention = np.exp(bias_flat - bias_flat.max())  # 数值稳定的 softmax
+    attention = attention / attention.sum()
+    attention_2d = attention.reshape(bias_2d.shape)
+    im = ax.imshow(attention_2d, **imshow_kwargs, cmap='hot')
+    ax.set_title('Softmax Attention')
+    ax.set_xlabel('Y (m)')
+    ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
     add_capture_point(ax, debug_info['capture_offset'][sample_idx])
     ax.legend(loc='upper right')
-    plt.colorbar(im, ax=ax, label='Bias')
+    plt.colorbar(im, ax=ax, label='Attention Weight')
     
     plt.tight_layout()
     
@@ -299,6 +424,8 @@ def test_dimension_alignment(scorer: TerrainSafetyScorer):
         assert bias.shape == (B, 187), f"bias shape mismatch: {bias.shape}"
         assert debug_info['S_geo'].shape == (B, 17, 11), f"S_geo shape mismatch"
         assert debug_info['S_dyn'].shape == (B, 17, 11), f"S_dyn shape mismatch"
+        assert debug_info['slope'].shape == (B, 17, 11), f"slope shape mismatch"
+        assert debug_info['local_var'].shape == (B, 17, 11), f"local_var shape mismatch"
         assert debug_info['omega'].shape == (B, 17, 11), f"omega shape mismatch"
         assert debug_info['capture_offset'].shape == (B, 2, 17, 11), f"capture_offset shape mismatch"
         
@@ -340,9 +467,9 @@ def test_device_handling(scorer: TerrainSafetyScorer):
 
 
 def test_pit_detection(scorer: TerrainSafetyScorer):
-    """测试深坑检测"""
+    """测试深坑检测（软掩码）"""
     print("\n" + "="*60)
-    print("Test: Pit Detection")
+    print("Test: Pit Detection (Soft Penalty)")
     print("="*60)
     
     # 创建深坑地形
@@ -351,20 +478,78 @@ def test_pit_detection(scorer: TerrainSafetyScorer):
     
     bias, debug_info = scorer(height_map, base_lin_vel, return_debug_info=True)
     
-    # 检查深坑区域是否被掩码
-    too_low_mask = debug_info['too_low_mask']
+    # 检查深坑区域是否被标记
+    pit_mask = debug_info['pit_mask']
     pit_region = height_map < -scorer.height_drop_threshold
     
-    assert torch.all(too_low_mask[pit_region]), "Pit area should be masked"
-    assert torch.all(bias.view(1, 17, 11)[pit_region] < -1e8), "Pit bias should be -inf"
+    assert torch.all(pit_mask[pit_region]), "Pit area should be masked"
     
-    # 检查平坦区域是否安全
+    # 检查深坑区域的 bias 是否应用了 pit_penalty
+    bias_2d = bias.view(1, 17, 11)
     flat_region = torch.abs(height_map) < 0.1
-    assert not torch.all(too_low_mask[flat_region]), "Flat areas should not all be masked"
     
-    print("  Pit region correctly masked: ✓")
-    print("  Flat region correctly safe: ✓")
+    # 深坑区域的 bias 应该显著低于平坦区域
+    pit_bias_mean = bias_2d[pit_region].mean().item()
+    flat_bias_mean = bias_2d[flat_region].mean().item()
+    
+    assert pit_bias_mean < flat_bias_mean + scorer.pit_penalty, \
+        f"Pit bias ({pit_bias_mean:.2f}) should be lower than flat bias ({flat_bias_mean:.2f}) by pit_penalty ({scorer.pit_penalty})"
+    
+    print(f"  Pit region correctly penalized: ✓ (bias diff: {flat_bias_mean - pit_bias_mean:.2f})")
+    print(f"  Pit penalty: {scorer.pit_penalty}")
     print("  [PASS] Pit detection test passed!")
+
+
+def test_behind_mask_dot_product(scorer: TerrainSafetyScorer):
+    """测试身后掩码（点积半平面）"""
+    print("\n" + "="*60)
+    print("Test: Behind Mask (Dot Product Half-Plane)")
+    print("="*60)
+    
+    height_map = create_flat_terrain()
+    
+    # 向前行走
+    vel_forward = torch.tensor([[0.5, 0.0, 0.0]])
+    _, debug_forward = scorer(height_map, vel_forward, return_debug_info=True)
+    
+    # 向右行走
+    vel_right = torch.tensor([[0.0, 0.5, 0.0]])
+    _, debug_right = scorer(height_map, vel_right, return_debug_info=True)
+    
+    # 斜向行走 (45度)
+    vel_diagonal = torch.tensor([[0.5, 0.5, 0.0]])
+    _, debug_diagonal = scorer(height_map, vel_diagonal, return_debug_info=True)
+    
+    behind_forward = debug_forward['behind_mask'][0]
+    behind_right = debug_right['behind_mask'][0]
+    behind_diagonal = debug_diagonal['behind_mask'][0]
+    
+    # 向前走时，身后区域应该在 x < 0 的区域
+    # 使用网格坐标来验证
+    grid_h, grid_w = 17, 11
+    measured_points_x = torch.tensor([-0.8, -0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 
+                                       0., 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
+    
+    # 向前走时，x < -behind_threshold 的点应该被掩码
+    x_behind_threshold = measured_points_x < -scorer.behind_threshold
+    forward_expected_count = x_behind_threshold.sum().item() * grid_w
+    forward_actual_count = behind_forward.sum().item()
+    
+    print(f"  Forward walking:")
+    print(f"    Expected ~{forward_expected_count} masked points, got {forward_actual_count}")
+    
+    # 斜向走时，掩码应该是相对于速度方向的半平面
+    diagonal_count = behind_diagonal.sum().item()
+    print(f"  Diagonal walking (45°):")
+    print(f"    Behind mask count: {diagonal_count}")
+    
+    # 验证斜向走时掩码形状是斜的（而不是轴对齐的）
+    # 左下角 (x<0, y<0) 应该被掩码，右上角 (x>0, y>0) 不应该被掩码
+    assert behind_diagonal[0, 0].item() == True, "Lower-left corner should be masked for diagonal movement"
+    assert behind_diagonal[-1, -1].item() == False, "Upper-right corner should NOT be masked for diagonal movement"
+    
+    print("  Diagonal mask is correctly oriented: ✓")
+    print("  [PASS] Behind mask (dot product) test passed!")
 
 
 def test_capture_point_offset(scorer: TerrainSafetyScorer):
@@ -401,10 +586,110 @@ def test_capture_point_offset(scorer: TerrainSafetyScorer):
     # 向侧面行走时捕获点向侧面偏移 (y 方向)
     assert cap_side[1].mean() > 0, "Side velocity should have positive y capture offset"
     
+    print(f"  Alpha value: {debug_forward['alpha']:.3f}")
     print("  Zero velocity → capture at origin: ✓")
     print("  Forward velocity → capture ahead: ✓")
     print("  Side velocity → capture to side: ✓")
     print("  [PASS] Capture point offset test passed!")
+
+
+def test_slope_normalization(scorer: TerrainSafetyScorer):
+    """测试坡度归一化（中心差分）"""
+    print("\n" + "="*60)
+    print("Test: Slope Normalization (Central Difference)")
+    print("="*60)
+    
+    # 创建已知坡度的斜坡
+    # 从 x=0 到 x=1.6m，高度变化 0.32m，坡度 tan(θ) = 0.32/1.6 = 0.2
+    height_map = create_slope_terrain(max_height=0.32)
+    base_lin_vel = torch.zeros(1, 3)
+    
+    _, debug_info = scorer(height_map, base_lin_vel, return_debug_info=True)
+    
+    slope = debug_info['slope'][0]
+    
+    # 中间区域的坡度应该接近理论值 0.2
+    # 边界由于 padding 可能略有偏差
+    center_slope = slope[5:12, 3:8].mean().item()
+    expected_slope = 0.32 / 1.6  # = 0.2
+    
+    print(f"  Expected slope: {expected_slope:.4f}")
+    print(f"  Measured center slope: {center_slope:.4f}")
+    print(f"  dx={scorer.dx:.3f}, dy={scorer.dy:.3f}")
+    
+    assert abs(center_slope - expected_slope) < 0.05, \
+        f"Center slope {center_slope:.4f} should be close to {expected_slope:.4f}"
+    
+    print("  Slope normalization correct: ✓")
+    print("  [PASS] Slope normalization test passed!")
+
+
+def test_local_variance(scorer: TerrainSafetyScorer):
+    """测试局部方差检测"""
+    print("\n" + "="*60)
+    print("Test: Local Variance Detection")
+    print("="*60)
+    
+    # 创建粗糙地形
+    rough_map = create_rough_terrain(roughness_scale=0.2)
+    # 创建平坦地形
+    flat_map = create_flat_terrain()
+    
+    base_lin_vel = torch.zeros(1, 3)
+    
+    _, debug_rough = scorer(rough_map, base_lin_vel, return_debug_info=True)
+    _, debug_flat = scorer(flat_map, base_lin_vel, return_debug_info=True)
+    
+    rough_var = debug_rough['local_var'][0].mean().item()
+    flat_var = debug_flat['local_var'][0].mean().item()
+    
+    print(f"  Rough terrain local variance: {rough_var:.6f}")
+    print(f"  Flat terrain local variance: {flat_var:.6f}")
+    
+    assert rough_var > flat_var, "Rough terrain should have higher local variance"
+    assert flat_var < 1e-6, "Flat terrain should have near-zero local variance"
+    
+    # 检查粗糙地形是否触发 steep_mask
+    steep_mask_rough = debug_rough['steep_mask'][0]
+    steep_mask_flat = debug_flat['steep_mask'][0]
+    
+    print(f"  Rough terrain steep_mask ratio: {steep_mask_rough.float().mean():.2%}")
+    print(f"  Flat terrain steep_mask ratio: {steep_mask_flat.float().mean():.2%}")
+    
+    assert steep_mask_rough.float().mean() > steep_mask_flat.float().mean(), \
+        "Rough terrain should have more steep_mask coverage"
+    
+    print("  Local variance detection correct: ✓")
+    print("  [PASS] Local variance test passed!")
+
+
+def test_soft_penalty_values(scorer: TerrainSafetyScorer):
+    """测试分层软惩罚值"""
+    print("\n" + "="*60)
+    print("Test: Soft Penalty Values")
+    print("="*60)
+    
+    print(f"  behind_penalty: {scorer.behind_penalty}")
+    print(f"  steep_penalty: {scorer.steep_penalty}")
+    print(f"  pit_penalty: {scorer.pit_penalty}")
+    
+    # 验证惩罚值的相对大小
+    assert scorer.behind_penalty > scorer.steep_penalty, \
+        "behind_penalty should be less severe than steep_penalty"
+    assert scorer.steep_penalty > scorer.pit_penalty, \
+        "steep_penalty should be less severe than pit_penalty"
+    
+    # 验证惩罚值都是负数
+    assert scorer.behind_penalty < 0, "behind_penalty should be negative"
+    assert scorer.steep_penalty < 0, "steep_penalty should be negative"
+    assert scorer.pit_penalty < 0, "pit_penalty should be negative"
+    
+    # 验证惩罚值不会导致数值问题
+    assert scorer.pit_penalty > -100, "pit_penalty should not be too extreme"
+    
+    print("  Penalty hierarchy correct: behind > steep > pit (less severe to more severe)")
+    print("  All penalties are negative and reasonable: ✓")
+    print("  [PASS] Soft penalty values test passed!")
 
 
 def run_visual_tests(scorer: TerrainSafetyScorer, save_dir: Optional[str] = None):
@@ -420,12 +705,14 @@ def run_visual_tests(scorer: TerrainSafetyScorer, save_dir: Optional[str] = None
         ("Flat Terrain - Stationary", create_flat_terrain(), torch.zeros(1, 3)),
         ("Flat Terrain - Forward", create_flat_terrain(), torch.tensor([[0.5, 0.0, 0.0]])),
         ("Flat Terrain - Sideways", create_flat_terrain(), torch.tensor([[0.0, 0.3, 0.0]])),
-        ("Step Up", create_step_up_terrain(step_height=0.2), torch.tensor([[0.3, 0.0, 0.0]])),
-        ("Step Down", create_step_down_terrain(step_depth=0.25), torch.tensor([[0.3, 0.0, 0.0]])),
+        ("Flat Terrain - Diagonal", create_flat_terrain(), torch.tensor([[0.4, 0.3, 0.0]])),
+        ("Two-Step Up", create_step_up_terrain(step_height=0.1, num_steps=2), torch.tensor([[0.3, 0.0, 0.0]])),
+        ("Two-Step Down", create_step_down_terrain(step_depth=0.1, num_steps=2), torch.tensor([[0.3, 0.0, 0.0]])),
         ("Deep Pit", create_pit_terrain(pit_depth=0.5), torch.tensor([[0.3, 0.0, 0.0]])),
         ("Slope", create_slope_terrain(max_height=0.3), torch.tensor([[0.3, 0.0, 0.0]])),
-        ("Rough Terrain", create_rough_terrain(roughness=0.15), torch.tensor([[0.3, 0.0, 0.0]])),
+        ("Stepping Stones", create_stepping_stones_terrain(stone_size=3, gap_size=1, gap_depth=0.4), torch.tensor([[0.3, 0.0, 0.0]])),
         ("Gap", create_gap_terrain(gap_depth=0.8), torch.tensor([[0.3, 0.0, 0.0]])),
+        ("Rough Terrain", create_rough_terrain(roughness_scale=0.15), torch.tensor([[0.3, 0.0, 0.0]])),
     ]
     
     for idx, (name, height_map, vel) in enumerate(test_cases):
@@ -446,20 +733,27 @@ def run_visual_tests(scorer: TerrainSafetyScorer, save_dir: Optional[str] = None
 def main():
     """主测试函数"""
     print("="*60)
-    print("TerrainSafetyScorer Test Suite")
+    print("TerrainSafetyScorer Test Suite (Updated)")
     print("="*60)
     
-    # 创建打分器
+    # 创建打分器（使用更新后的参数）
     scorer = TerrainSafetyScorer(
         grid_h=17,
         grid_w=11,
         z_nominal=0.75,
-        roughness_threshold=0.3,
+        slope_threshold=0.5,           # 原 roughness_threshold
+        local_var_threshold=0.02,      # 新增
         height_drop_threshold=0.3,
-        height_climb_threshold=0.4,
+        behind_threshold=0.3,
+        behind_vel_threshold=0.1,
+        behind_penalty=-3.0,           # 新增：身后区域轻惩罚
+        steep_penalty=-8.0,            # 新增：陡坡中等惩罚
+        pit_penalty=-12.0,             # 新增：深坑重惩罚
         learnable_sigma=True,
         init_sigma_dyn=0.3,
         init_sigma_geo=0.1,
+        learnable_alpha=True,          # 新增
+        init_alpha=1.0,                # 新增
     )
     
     print(f"\nScorer Configuration:")
@@ -469,7 +763,11 @@ def main():
     test_dimension_alignment(scorer)
     test_device_handling(scorer)
     test_pit_detection(scorer)
+    test_behind_mask_dot_product(scorer)
     test_capture_point_offset(scorer)
+    test_slope_normalization(scorer)
+    test_local_variance(scorer)
+    test_soft_penalty_values(scorer)
     
     print("\n" + "="*60)
     print("All Unit Tests Passed! ✓")
@@ -484,4 +782,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
