@@ -7,6 +7,11 @@ TerrainSafetyScorer: 物理引导的地形安全打分模块
 - S_geo: 几何平坦度分数（归一化中心差分坡度 + 局部方差）
 - S_dyn: 动力学可行性分数（逐点 VHIP 捕获点，可学习 alpha）
 - 分层软掩码: 陡峭/深坑/身后区域的差异化惩罚
+
+height_map 符号语义 (与 LeggedGym 管线一致):
+- height_map = base_z - base_height - terrain_z
+- 正值 = 地面更低（坑）
+- 负值 = 地面更高（凸起/台阶）
 """
 
 import torch
@@ -39,8 +44,7 @@ class TerrainSafetyScorer(nn.Module):
         g: float = 9.81,
         z_nominal: float = 0.75,
         C_scaling: float = 1.0,
-        slope_threshold: float = 0.5,
-        local_var_threshold: float = 0.02,
+        local_var_threshold: float = 0.01,
         height_drop_threshold: float = 0.3,
         behind_threshold: float = 0.3,
         behind_vel_threshold: float = 0.1,
@@ -49,7 +53,7 @@ class TerrainSafetyScorer(nn.Module):
         pit_penalty: float = -12.0,
         learnable_sigma: bool = True,
         init_sigma_dyn: float = 0.3,
-        init_sigma_geo: float = 0.1,
+        init_sigma_geo: float = 0.2,
         learnable_alpha: bool = True,
         init_alpha: float = 1.0,
     ):
@@ -64,9 +68,8 @@ class TerrainSafetyScorer(nn.Module):
             g: 重力加速度
             z_nominal: 名义站立高度 (G1 约 0.75m)
             C_scaling: 捕获点基础缩放系数
-            slope_threshold: 坡度安全阈值 (tan(θ)，0.5 对应约 27°)
-            local_var_threshold: 局部方差阈值 (用于检测碎石/台阶边缘)
-            height_drop_threshold: 深坑检测阈值 (米)
+            local_var_threshold: 局部方差阈值 (用于检测碎石/台阶边缘的高频起伏)
+            height_drop_threshold: 深坑检测阈值 (米，正值表示坑深)
             behind_threshold: 身后区域掩码阈值 (米，相对速度方向的投影距离)
             behind_vel_threshold: 触发身后掩码的最小速度 (m/s)
             behind_penalty: 身后区域惩罚值 (轻，不优先)
@@ -86,7 +89,6 @@ class TerrainSafetyScorer(nn.Module):
         self.g = g
         self.z_nominal = z_nominal
         self.C_scaling = C_scaling
-        self.slope_threshold = slope_threshold
         self.local_var_threshold = local_var_threshold
         self.height_drop_threshold = height_drop_threshold
         self.behind_threshold = behind_threshold
@@ -177,9 +179,14 @@ class TerrainSafetyScorer(nn.Module):
         # 坡度幅值 (tan(θ))
         slope = torch.sqrt(dh_dx ** 2 + dh_dy ** 2 + 1e-8).squeeze(1)  # [B, H, W]
         
-        # ===== 3x3 局部方差 (检测碎石/台阶边缘) =====
-        local_mean = F.avg_pool2d(h, kernel_size=3, stride=1, padding=1)  # [B, 1, H, W]
-        local_var = F.avg_pool2d((h - local_mean) ** 2, kernel_size=3, stride=1, padding=1).squeeze(1)  # [B, H, W]
+        # ===== 3x3 局部方差 (replicate padding，避免边界伪高方差) =====
+        # 使用 replicate padding 计算局部均值
+        local_mean = F.avg_pool2d(h_pad, kernel_size=3, stride=1, padding=0)  # [B, 1, H, W]
+        
+        # 计算 (h - local_mean)^2，需要重新 pad
+        h_centered = h - local_mean
+        h_centered_pad = F.pad(h_centered, (1, 1, 1, 1), mode='replicate')
+        local_var = F.avg_pool2d(h_centered_pad ** 2, kernel_size=3, stride=1, padding=0).squeeze(1)  # [B, H, W]
         
         # 几何分数 = 负的坡度
         S_geo = -slope
@@ -210,9 +217,12 @@ class TerrainSafetyScorer(nn.Module):
         alpha = F.softplus(self.raw_alpha) + 1e-6
         
         # 逐点计算有效高度 (质心到地面的高度)
-        # height_map 存储的是 "采样点高度 - 基准高度"
-        # 有效高度 = z_nominal - height_map (当 height_map 为正表示地面抬高)
-        effective_z = self.z_nominal - height_map  # [B, H, W]
+        # height_map 符号语义 (与 LeggedGym 管线一致):
+        #   height_map = base_z - base_height - terrain_z
+        #   正值 = 地面更低（坑）→ 有效高度增加
+        #   负值 = 地面更高（凸起）→ 有效高度减少
+        # 有效高度 = z_nominal + height_map
+        effective_z = self.z_nominal + height_map  # [B, H, W]
         effective_z = effective_z.clamp(min=0.1)  # 防止除零
         
         # 逐点自然频率 omega = sqrt(g / z)
@@ -316,11 +326,12 @@ class TerrainSafetyScorer(nn.Module):
         bias = S_dyn / (2 * sigma_dyn ** 2) + S_geo / (sigma_geo ** 2)
         
         # ===== 5. 分层软掩码 (差异化惩罚) =====
-        # 5.1 陡坡/边缘检测 (坡度过大 或 局部方差过大)
-        steep_mask = (slope > self.slope_threshold) | (local_var > self.local_var_threshold)
+        # 5.1 边缘检测 (只用局部方差检测高频起伏/台阶边缘)
+        # 移除 slope > threshold 条件，因为平滑斜坡坡度大但可行走
+        steep_mask = local_var > self.local_var_threshold
         
-        # 5.2 深坑检测 (高度差过大)
-        pit_mask = height_map < -self.height_drop_threshold
+        # 5.2 深坑检测 (LeggedGym 语义: 正值表示坑)
+        pit_mask = height_map > self.height_drop_threshold
         
         # 5.3 身后区域掩码 (点积半平面)
         behind_mask = self.compute_behind_mask(base_lin_vel, B)
@@ -373,7 +384,7 @@ class TerrainSafetyScorer(nn.Module):
             f"z_nominal={self.z_nominal}, "
             f"sigma_dyn={sigma_dyn:.3f}, sigma_geo={sigma_geo:.3f}, "
             f"alpha={alpha:.3f}, "
-            f"thresholds=(slope={self.slope_threshold}, var={self.local_var_threshold}, "
+            f"thresholds=(var={self.local_var_threshold}, "
             f"drop={self.height_drop_threshold}, behind={self.behind_threshold}), "
             f"penalties=(behind={self.behind_penalty}, steep={self.steep_penalty}, "
             f"pit={self.pit_penalty})"

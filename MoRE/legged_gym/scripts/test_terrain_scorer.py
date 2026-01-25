@@ -57,6 +57,10 @@ def create_step_up_terrain(
 ) -> torch.Tensor:
     """创建连续上升台阶地形 (前方多阶抬高)
     
+    符号语义 (与 LeggedGym 一致):
+    - 正值 = 地面更低（坑）
+    - 负值 = 地面更高（凸起/台阶）
+    
     Args:
         step_height: 每阶台阶的高度
         num_steps: 台阶数量
@@ -66,7 +70,8 @@ def create_step_up_terrain(
     segment_len = grid_h // (num_steps + 1)
     for i in range(num_steps):
         start_idx = segment_len * (i + 1)
-        height_map[:, start_idx:, :] = step_height * (i + 1)
+        # 台阶抬高 → 负值
+        height_map[:, start_idx:, :] = -step_height * (i + 1)
     return height_map
 
 
@@ -79,6 +84,10 @@ def create_step_down_terrain(
 ) -> torch.Tensor:
     """创建连续下降台阶地形 (前方多阶降低)
     
+    符号语义 (与 LeggedGym 一致):
+    - 正值 = 地面更低（坑/下台阶）
+    - 负值 = 地面更高（凸起）
+    
     Args:
         step_depth: 每阶台阶的深度
         num_steps: 台阶数量
@@ -88,7 +97,8 @@ def create_step_down_terrain(
     segment_len = grid_h // (num_steps + 1)
     for i in range(num_steps):
         start_idx = segment_len * (i + 1)
-        height_map[:, start_idx:, :] = -step_depth * (i + 1)
+        # 台阶降低 → 正值
+        height_map[:, start_idx:, :] = step_depth * (i + 1)
     return height_map
 
 
@@ -100,11 +110,16 @@ def create_pit_terrain(
     pit_start: float = 0.4,
     pit_end: float = 0.7
 ) -> torch.Tensor:
-    """创建深坑地形 (中间区域有深坑)"""
+    """创建深坑地形 (中间区域有深坑)
+    
+    符号语义 (与 LeggedGym 一致):
+    - 正值 = 地面更低（坑）
+    """
     height_map = torch.zeros(batch_size, grid_h, grid_w)
     start_idx = int(grid_h * pit_start)
     end_idx = int(grid_h * pit_end)
-    height_map[:, start_idx:end_idx, :] = -pit_depth
+    # 坑 → 正值
+    height_map[:, start_idx:end_idx, :] = pit_depth
     return height_map
 
 
@@ -114,10 +129,14 @@ def create_slope_terrain(
     batch_size: int = 1,
     max_height: float = 0.3
 ) -> torch.Tensor:
-    """创建斜坡地形 (从后向前线性上升)"""
+    """创建斜坡地形 (从后向前线性上升)
+    
+    符号语义 (与 LeggedGym 一致):
+    - 负值 = 地面更高（上坡）
+    """
     height_map = torch.zeros(batch_size, grid_h, grid_w)
-    # 线性斜坡
-    slope = torch.linspace(0, max_height, grid_h).view(1, grid_h, 1)
+    # 线性斜坡（上坡 → 负值）
+    slope = torch.linspace(0, -max_height, grid_h).view(1, grid_h, 1)
     height_map = slope.expand(batch_size, grid_h, grid_w)
     return height_map
 
@@ -133,8 +152,9 @@ def create_stepping_stones_terrain(
 ) -> torch.Tensor:
     """创建踏脚石地形 (交替的石块和间隙)
     
-    模拟实际训练中的 stepping stones 地形。
-    石块为 0 高度，间隙为负高度（深坑）。
+    符号语义 (与 LeggedGym 一致):
+    - 正值 = 地面更低（间隙/坑）
+    - 0 = 石块（与机器人站立位置同高）
     
     Args:
         stone_height: 石块高度（相对基准）
@@ -151,9 +171,9 @@ def create_stepping_stones_terrain(
             i_in_pattern = i % pattern_size
             j_in_pattern = j % pattern_size
             
-            # 如果在间隙区域
+            # 如果在间隙区域 → 正值（坑）
             if i_in_pattern >= stone_size or j_in_pattern >= stone_size:
-                height_map[:, i, j] = -gap_depth
+                height_map[:, i, j] = gap_depth
             else:
                 height_map[:, i, j] = stone_height
     
@@ -168,12 +188,17 @@ def create_gap_terrain(
     gap_width: int = 2,
     gap_position: float = 0.5
 ) -> torch.Tensor:
-    """创建间隙地形 (窄而深的缝隙)"""
+    """创建间隙地形 (窄而深的缝隙)
+    
+    符号语义 (与 LeggedGym 一致):
+    - 正值 = 地面更低（间隙）
+    """
     height_map = torch.zeros(batch_size, grid_h, grid_w)
     center_idx = int(grid_h * gap_position)
     start_idx = max(0, center_idx - gap_width // 2)
     end_idx = min(grid_h, center_idx + gap_width // 2 + 1)
-    height_map[:, start_idx:end_idx, :] = -gap_depth
+    # 间隙 → 正值
+    height_map[:, start_idx:end_idx, :] = gap_depth
     return height_map
 
 
@@ -256,20 +281,20 @@ def visualize_scorer_output(
     
     # ===== Row 1: 基础信息 =====
     
-    # 1. Height Map
+    # 1. Height Map (LeggedGym 语义: 正值=坑, 负值=凸起)
     ax = axes[0, 0]
-    im = ax.imshow(height_map[sample_idx].detach().cpu().numpy(), **imshow_kwargs, cmap='terrain')
-    ax.set_title('Height Map')
+    im = ax.imshow(height_map[sample_idx].detach().cpu().numpy(), **imshow_kwargs, cmap='terrain_r')
+    ax.set_title('Height Map\n(+:pit, -:bump)')
     ax.set_xlabel('Y (m) ← Left | Right →')
     ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
-    plt.colorbar(im, ax=ax, label='Height (m)')
+    plt.colorbar(im, ax=ax, label='Height diff (m)')
     
     # 2. Slope (归一化坡度)
     ax = axes[0, 1]
     slope = debug_info['slope'][sample_idx].detach().cpu().numpy()
     im = ax.imshow(slope, **imshow_kwargs, cmap='hot')
-    ax.set_title(f'Slope (tan θ)\nthreshold={0.5}')
+    ax.set_title(f'Slope (tan θ)\n(for S_geo, no threshold)')
     ax.set_xlabel('Y (m)')
     ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
@@ -279,7 +304,7 @@ def visualize_scorer_output(
     ax = axes[0, 2]
     local_var = debug_info['local_var'][sample_idx].detach().cpu().numpy()
     im = ax.imshow(local_var, **imshow_kwargs, cmap='hot')
-    ax.set_title(f'Local Variance\nthreshold={0.02}')
+    ax.set_title(f'Local Variance\nthreshold=0.01')
     ax.set_xlabel('Y (m)')
     ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
@@ -320,11 +345,11 @@ def visualize_scorer_output(
     ax.legend(loc='upper right')
     plt.colorbar(im, ax=ax, label='Score')
     
-    # 7. Steep Mask (陡坡 + 局部方差)
+    # 7. Steep Mask (只用局部方差检测边缘)
     ax = axes[1, 2]
     steep_mask = debug_info['steep_mask'][sample_idx].detach().cpu().numpy().astype(float)
     im = ax.imshow(steep_mask, **imshow_kwargs, cmap='Reds')
-    ax.set_title('Steep Mask\n(slope > thresh OR var > thresh)')
+    ax.set_title('Edge Mask\n(local_var > threshold)')
     ax.set_xlabel('Y (m)')
     ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
@@ -347,7 +372,7 @@ def visualize_scorer_output(
     ax = axes[2, 0]
     pit_mask = debug_info['pit_mask'][sample_idx].detach().cpu().numpy().astype(float)
     im = ax.imshow(pit_mask, **imshow_kwargs, cmap='Purples')
-    ax.set_title('Pit Mask\n(height < -threshold)')
+    ax.set_title('Pit Mask\n(height > drop_threshold)')
     ax.set_xlabel('Y (m)')
     ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
@@ -472,15 +497,15 @@ def test_pit_detection(scorer: TerrainSafetyScorer):
     print("Test: Pit Detection (Soft Penalty)")
     print("="*60)
     
-    # 创建深坑地形
+    # 创建深坑地形（LeggedGym 语义：正值 = 坑）
     height_map = create_pit_terrain(pit_depth=0.5)
     base_lin_vel = torch.zeros(1, 3)
     
     bias, debug_info = scorer(height_map, base_lin_vel, return_debug_info=True)
     
-    # 检查深坑区域是否被标记
+    # 检查深坑区域是否被标记（正值 > threshold = 坑）
     pit_mask = debug_info['pit_mask']
-    pit_region = height_map < -scorer.height_drop_threshold
+    pit_region = height_map > scorer.height_drop_threshold
     
     assert torch.all(pit_mask[pit_region]), "Pit area should be masked"
     
@@ -733,27 +758,30 @@ def run_visual_tests(scorer: TerrainSafetyScorer, save_dir: Optional[str] = None
 def main():
     """主测试函数"""
     print("="*60)
-    print("TerrainSafetyScorer Test Suite (Updated)")
+    print("TerrainSafetyScorer Test Suite")
     print("="*60)
+    print("\n符号语义 (与 LeggedGym 管线一致):")
+    print("  height_map = base_z - base_height - terrain_z")
+    print("  正值 = 地面更低（坑）")
+    print("  负值 = 地面更高（凸起/台阶）")
     
     # 创建打分器（使用更新后的参数）
     scorer = TerrainSafetyScorer(
         grid_h=17,
         grid_w=11,
         z_nominal=0.75,
-        slope_threshold=0.5,           # 原 roughness_threshold
-        local_var_threshold=0.02,      # 新增
+        local_var_threshold=0.01,      # 局部方差阈值（用于边缘检测）
         height_drop_threshold=0.3,
         behind_threshold=0.3,
         behind_vel_threshold=0.1,
-        behind_penalty=-3.0,           # 新增：身后区域轻惩罚
-        steep_penalty=-8.0,            # 新增：陡坡中等惩罚
-        pit_penalty=-12.0,             # 新增：深坑重惩罚
+        behind_penalty=-3.0,           # 身后区域轻惩罚
+        steep_penalty=-8.0,            # 边缘中等惩罚
+        pit_penalty=-12.0,             # 深坑重惩罚
         learnable_sigma=True,
         init_sigma_dyn=0.3,
-        init_sigma_geo=0.1,
-        learnable_alpha=True,          # 新增
-        init_alpha=1.0,                # 新增
+        init_sigma_geo=0.2,
+        learnable_alpha=True,
+        init_alpha=1.0,
     )
     
     print(f"\nScorer Configuration:")
