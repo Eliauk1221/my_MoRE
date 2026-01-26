@@ -44,7 +44,6 @@ def draw_attention_points(env, attention_weights, terrain_xyz):
     
     # 简化：直接用机体位置 + 局部坐标（忽略旋转，或使用 yaw 旋转）
     # 这里为了简化，只考虑 yaw 旋转
-    from isaacgym.torch_utils import quat_apply_yaw
     points_world_xy = points_body[:, :2]  # 使用局部 xy
     
     # 计算 yaw 角
