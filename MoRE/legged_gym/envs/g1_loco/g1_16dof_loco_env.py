@@ -283,28 +283,39 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
     def _update_terrain_attention_data(self):
         """
         更新地形注意力所需的数据:
-        - terrain_xyz: [num_envs, 187, 3] 机体坐标系下的采样点坐标
-        - height_map: [num_envs, grid_h, grid_w] 高度图
+        - terrain_xyz: [num_envs, 187, 3] 机体坐标系下的采样点坐标（归一化后）
+        - height_map: [num_envs, grid_h, grid_w] 高度图（归一化后）
+        
+        归一化策略（保持 x/y/z 尺度一致，都在 [-1, 1] 范围）：
+        - x: 除以采样范围 (0.8) 归一化到 [-1, 1]
+        - y: 除以采样范围 (0.5) 归一化到 [-1, 1]
+        - z (height): clip(-1, 1)，不乘 scale，保持与 x/y 相同尺度
+        
+        注意: 这与 privileged_obs 中的 heights 处理不同（privileged_obs 会乘 scale=5.0）
+        原因: attention 的 K/V 中 xyz 拼接在一起，需要保持尺度一致，避免 z 主导注意力
         """
         grid_h = self.cfg.terrain_attention.grid_h
         grid_w = self.cfg.terrain_attention.grid_w
         
-        # height_points 是在机体坐标系下的采样点 (x, y, 0)
-        # 我们需要在机体坐标系下保持 x, y，并添加采样到的高度 z
+        # 计算相对高度（与 privileged_obs 使用相同的公式）
+        # heights = robot_z - base_height - terrain_z
+        heights_raw = self.root_states[:, 2].unsqueeze(1) - self.cfg.normalization.base_height - self.measured_heights
         
-        # 获取采样到的高度（相对于机体高度的差值）
-        # measured_heights 在 post_physics_step 中由父类更新
-        heights_relative = self.root_states[:, 2].unsqueeze(1) - self.measured_heights  # [num_envs, 187]
+        # ===== 归一化处理：只 clip，不乘 scale =====
+        # 保持 z 与 x/y 相同的尺度范围 [-1, 1]
+        heights_normalized = torch.clip(heights_raw, -1., 1.)
         
-        # 构建完整的 terrain_xyz
-        # x, y 来自 height_points (机体坐标系)
-        # z 是采样到的相对高度
-        self.terrain_xyz[:, :, 0] = self.height_points[:, :, 0]  # x
-        self.terrain_xyz[:, :, 1] = self.height_points[:, :, 1]  # y
-        self.terrain_xyz[:, :, 2] = heights_relative - self.cfg.normalization.base_height  # z (相对于基准高度)
+        # 获取采样范围（从配置中获取）
+        x_range = max(abs(self.cfg.terrain.measured_points_x[0]), abs(self.cfg.terrain.measured_points_x[-1]))  # 0.8
+        y_range = max(abs(self.cfg.terrain.measured_points_y[0]), abs(self.cfg.terrain.measured_points_y[-1]))  # 0.5
         
-        # 构建 height_map [num_envs, grid_h, grid_w]
-        self.height_map = self.terrain_xyz[:, :, 2].reshape(self.num_envs, grid_h, grid_w)
+        # 构建归一化的 terrain_xyz，x/y/z 都在 [-1, 1] 范围
+        self.terrain_xyz[:, :, 0] = self.height_points[:, :, 0] / x_range  # x: [-0.8, 0.8] -> [-1, 1]
+        self.terrain_xyz[:, :, 1] = self.height_points[:, :, 1] / y_range  # y: [-0.5, 0.5] -> [-1, 1]
+        self.terrain_xyz[:, :, 2] = heights_normalized  # z: [-1, 1]
+        
+        # 构建 height_map [num_envs, grid_h, grid_w]，与 terrain_xyz[:, :, 2] 保持一致
+        self.height_map = heights_normalized.reshape(self.num_envs, grid_h, grid_w)
 
     def compute_reward(self):
         """ Compute rewards
