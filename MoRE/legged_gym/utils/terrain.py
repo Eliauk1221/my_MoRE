@@ -157,7 +157,7 @@ class Terrain:
                                     stone_size=0.5 - 0.15*difficulty, 
                                     stone_distance=0.08 + 0.3*difficulty,
                                     pad_height=0)
-            self.add_roughness(terrain)
+            # 不添加表面粗糙度，依赖域随机化提供鲁棒性
         elif choice < self.proportions[1]:
             # parkour 地形（从 extreme-parkour 迁移）
             idx = 1
@@ -176,7 +176,7 @@ class Terrain:
                             last_incline_height=last_incline_height,
                             pad_height=0,
                             pit_depth=[0.2, 1])
-            self.add_roughness(terrain)
+            # 不添加表面粗糙度，依赖域随机化提供鲁棒性
         elif choice < self.proportions[2]:
             idx = 2
             parkour_pit_terrain(terrain,

@@ -206,9 +206,16 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         self.reset_buf |= (self._get_base_heights() < 0.4)
 
         if self.cfg.terrain.mesh_type == "trimesh":
+            # Y 偏移终止：应用到所有地形，防止机器人横向偏移过大
             offset_y = torch.abs(self.root_states[:, 1] - self.origin_y)
-            only_forward_env = torch.logical_and(self.env_class != 0, self.env_class != 1)
-            self.reset_buf |= torch.logical_and(only_forward_env, offset_y>1.0)
+            self.reset_buf |= (offset_y > 1.0)
+            
+            # 绝对高度终止：对 stepping_stones (env_class=0) 和 parkour (env_class=1) 地形
+            # 检测机器人是否掉入坑中（绝对高度低于起始平台高度 + 阈值）
+            fall_into_pit_env = torch.logical_or(self.env_class == 0, self.env_class == 1)
+            fall_threshold = 0.4  # 机器人绝对高度不应低于 env_origin_z + 0.4m
+            fell_into_pit = self.root_states[:, 2] < (self.env_origins[:, 2] + fall_threshold)
+            self.reset_buf |= torch.logical_and(fall_into_pit_env, fell_into_pit)
         
         self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
         self.reset_buf |= self.time_out_buf
