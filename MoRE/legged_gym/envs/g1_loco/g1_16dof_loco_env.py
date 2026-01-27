@@ -296,14 +296,21 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         """
         grid_h = self.cfg.terrain_attention.grid_h
         grid_w = self.cfg.terrain_attention.grid_w
+        num_points = grid_h * grid_w  # 187
         
-        # 计算相对高度（与 privileged_obs 使用相同的公式）
-        # heights = robot_z - base_height - terrain_z
-        heights_raw = self.root_states[:, 2].unsqueeze(1) - self.cfg.normalization.base_height - self.measured_heights
-        
-        # ===== 归一化处理：只 clip，不乘 scale =====
-        # 保持 z 与 x/y 相同的尺度范围 [-1, 1]
-        heights_normalized = torch.clip(heights_raw, -1., 1.)
+        # 安全检查：measured_heights 在第一次调用时可能还未初始化（初始值为 0）
+        # 只有在 _post_physics_step_callback 之后才会被正确更新
+        if not isinstance(self.measured_heights, torch.Tensor) or self.measured_heights.dim() == 0:
+            # 使用零值作为占位符
+            heights_normalized = torch.zeros(self.num_envs, num_points, device=self.device)
+        else:
+            # 计算相对高度（与 privileged_obs 使用相同的公式）
+            # heights = robot_z - base_height - terrain_z
+            heights_raw = self.root_states[:, 2].unsqueeze(1) - self.cfg.normalization.base_height - self.measured_heights
+            
+            # ===== 归一化处理：只 clip，不乘 scale =====
+            # 保持 z 与 x/y 相同的尺度范围 [-1, 1]
+            heights_normalized = torch.clip(heights_raw, -1., 1.)
         
         # 获取采样范围（从配置中获取）
         x_range = max(abs(self.cfg.terrain.measured_points_x[0]), abs(self.cfg.terrain.measured_points_x[-1]))  # 0.8
