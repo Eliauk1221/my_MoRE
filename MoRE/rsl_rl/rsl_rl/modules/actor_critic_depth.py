@@ -41,6 +41,7 @@ class TerrainAttentionEncoder(nn.Module):
     - 上路: 5x5 CNN 提取几何特征（高度差、梯度等）
     - 下路: 原始 (x,y,z) 坐标直接使用
     - MHA 内部处理 K/V 投影，只需手动投影 Q
+    - Pre-LN + 残差结构（GPT-2/3、LLaMA 等现代模型使用）
     """
     def __init__(self, 
                  grid_h=17, 
@@ -70,6 +71,10 @@ class TerrainAttentionEncoder(nn.Module):
         # ===== Query 投影 (obs_dim → hidden_dim) =====
         self.q_proj = nn.Linear(obs_dim, hidden_dim)
         
+        # ===== Pre-LN: 在 Attention 之前对 Q 和 K/V 分别归一化 =====
+        self.q_norm = nn.LayerNorm(hidden_dim)   # Query 归一化
+        self.kv_norm = nn.LayerNorm(hidden_dim)  # Key/Value 归一化
+        
         # ===== 多头注意力 (MHA内部处理K/V投影) =====
         self.multihead_attn = nn.MultiheadAttention(
             embed_dim=hidden_dim,
@@ -94,35 +99,58 @@ class TerrainAttentionEncoder(nn.Module):
             
         Returns:
             terrain_feature: [B, output_dim] 注意力加权后的地形特征
+            
+        Pre-LN 数据流:
+            obs ──► q_proj ──► Q ──────────────────────────────┐ (干净残差)
+                               │                               │
+                               ▼                               │
+                            q_norm (LayerNorm)                 │
+                               │                               │
+                               ▼                               │
+            terrain ──► CNN+xyz ──► kv_input ──► kv_norm       │
+                                                  │            │
+                                                  ▼            │
+                              MultiheadAttention(Q', K', V')   │
+                                                  │            │
+                                                  ▼            ▼
+                                            attn_output ──► Add ──► output_proj ──► terrain_feature
         """
         B = height_map.shape[0]
         
-        # 上路: CNN 提取几何特征
+        # ===== 上路: CNN 提取几何特征 =====
         h = height_map.unsqueeze(1)  # [B, 1, 17, 11]
         cnn_feat = self.height_cnn(h)  # [B, hidden-3, 17, 11]
         cnn_feat = cnn_feat.permute(0, 2, 3, 1)  # [B, 17, 11, hidden-3]
         cnn_feat = cnn_feat.reshape(B, self.num_points, -1)  # [B, 187, hidden-3]
         
-        # 下路: 直接使用原始坐标 xyz
+        # ===== 下路: 直接使用原始坐标 xyz =====
         xyz = terrain_xyz  # [B, 187, 3]
         
-        # 拼接: CNN几何特征 + xyz位置坐标
+        # ===== 拼接: CNN几何特征 + xyz位置坐标 =====
         kv_input = torch.cat([cnn_feat, xyz], dim=-1)  # [B, 187, hidden]
         
-        # Query 投影
+        # ===== Query 投影 =====
         Q = self.q_proj(obs).unsqueeze(1)  # [B, 1, hidden]
         
-        # 多头交叉注意力 (MHA内部投影K和V)
+        # ===== Pre-LN: 在 Attention 之前归一化 =====
+        Q_normed = self.q_norm(Q)           # [B, 1, hidden] - Query 归一化
+        kv_normed = self.kv_norm(kv_input)  # [B, 187, hidden] - K/V 归一化
+        
+        # ===== 多头交叉注意力 (使用归一化后的 Q, K, V) =====
         attn_output, attn_weights = self.multihead_attn(
-            query=Q,
-            key=kv_input,
-            value=kv_input
+            query=Q_normed,
+            key=kv_normed,
+            value=kv_normed
         )  # attn_output: [B, 1, hidden], attn_weights: [B, 1, 187]
         
         # 保存注意力权重用于可视化
         self.last_attention_weights = attn_weights.squeeze(1).detach()  # [B, 187]
         
-        # 输出投影
+        # ===== 干净残差连接 (Pre-LN 核心: 残差不经过 LayerNorm) =====
+        # output = x + Attention(LayerNorm(x))
+        attn_output = attn_output + Q  # [B, 1, hidden] - 直接加原始 Q，不经过 LN
+        
+        # ===== 输出投影 =====
         terrain_feature = self.output_proj(attn_output.squeeze(1))  # [B, output_dim]
         
         return terrain_feature
