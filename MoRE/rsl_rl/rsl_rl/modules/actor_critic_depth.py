@@ -233,6 +233,8 @@ class ActorCriticDepth(nn.Module):
                         terrain_attn_hidden_dim=128,
                         terrain_attn_num_heads=8,
                         terrain_attn_output_dim=64,
+                        # ===== 消融实验开关 =====
+                        include_depth_in_actor=True,  # 是否在 actor 输入中包含 depth_feature
                         # ===== Critic 地形高度编码器参数 =====
                         critic_terrain_encoder_dims=[128],  # MLP 隐藏层维度
                         critic_terrain_latent_dim=64,       # 输出特征维度
@@ -245,6 +247,7 @@ class ActorCriticDepth(nn.Module):
         self.his_latent_dim = his_latent_dim
         self.max_grad_norm = max_grad_norm
         self.use_terrain_attention = use_terrain_attention
+        self.include_depth_in_actor = include_depth_in_actor
         
         # ===== Critic 地形高度编码器（Asymmetric Critic）=====
         # 从 privileged_obs 最后 187 维提取 heights 并编码
@@ -289,7 +292,13 @@ class ActorCriticDepth(nn.Module):
         else:
             self.terrain_attention = None
 
-        mlp_input_dim_a = num_actor_obs + his_latent_dim + depth_backbone.output_dim + terrain_attn_dim
+        # Actor 输入维度: obs + his_feature + (depth_feature if include) + (terrain_feature if attention)
+        depth_dim = depth_backbone.output_dim if include_depth_in_actor else 0
+        mlp_input_dim_a = num_actor_obs + his_latent_dim + depth_dim + terrain_attn_dim
+        
+        if not include_depth_in_actor:
+            print(f"[Ablation] depth_feature EXCLUDED from actor input (include_depth_in_actor=False)")
+        
         # Critic 输入: critic_obs（不含heights） + his_feature + terrain_heights_feature
         # 注意: critic_obs 包含 heights (187维)，我们把它单独编码，所以要减去 187
         mlp_input_dim_c = (num_critic_obs - self.num_terrain_heights) + his_latent_dim + self.critic_terrain_latent_dim if use_terrain_attention else num_critic_obs + his_latent_dim
@@ -372,14 +381,21 @@ class ActorCriticDepth(nn.Module):
         history = history.flatten(1)
         his_feature = self.history_encoder(history)
         
+        # depth_feature 始终计算（可能 Critic 或其他地方需要），但根据开关决定是否加入 actor 输入
         depth_feature = self.depth_encoder(depth)
+        
+        # 构建 actor 输入（根据消融开关）
+        actor_input_parts = [observations, his_feature]
+        
+        if self.include_depth_in_actor:
+            actor_input_parts.append(depth_feature)
         
         # 地形注意力特征 (可选)
         if self.use_terrain_attention and height_map is not None and terrain_xyz is not None:
             terrain_feature = self.terrain_attention(height_map, terrain_xyz, observations)
-            actor_input = torch.cat((observations, his_feature, depth_feature, terrain_feature), dim=-1)
-        else:
-            actor_input = torch.cat((observations, his_feature, depth_feature), dim=-1)
+            actor_input_parts.append(terrain_feature)
+        
+        actor_input = torch.cat(actor_input_parts, dim=-1)
 
         self.update_distribution(actor_input)
         return self.distribution.sample()
@@ -393,12 +409,18 @@ class ActorCriticDepth(nn.Module):
         his_feature = self.history_encoder(history)
         depth_feature = self.depth_encoder(depth)
         
+        # 构建 actor 输入（根据消融开关）
+        actor_input_parts = [observations, his_feature]
+        
+        if self.include_depth_in_actor:
+            actor_input_parts.append(depth_feature)
+        
         # 地形注意力特征 (可选)
         if self.use_terrain_attention and height_map is not None and terrain_xyz is not None:
             terrain_feature = self.terrain_attention(height_map, terrain_xyz, observations)
-            actor_input = torch.cat((observations, his_feature, depth_feature, terrain_feature), dim=-1)
-        else:
-            actor_input = torch.cat((observations, his_feature, depth_feature), dim=-1)
+            actor_input_parts.append(terrain_feature)
+        
+        actor_input = torch.cat(actor_input_parts, dim=-1)
             
         actions_mean = self.actor(actor_input)
         return actions_mean

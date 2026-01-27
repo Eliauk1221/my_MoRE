@@ -109,6 +109,9 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         hidden_dim = 128       # 注意力隐藏维度 (需能被 num_heads 整除)
         num_heads = 8          # 多头注意力头数
         output_dim = 64        # 输出特征维度
+        
+        # ===== 消融实验开关 =====
+        include_depth_in_actor = True   # 是否在 actor 输入中包含 depth_feature（用于消融实验）
 
     class depth(LeggedRobotCfg.depth):
         use_camera = False
@@ -316,6 +319,9 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         terrain_attn_hidden_dim = 128
         terrain_attn_num_heads = 8
         terrain_attn_output_dim = 64
+        
+        # ===== 消融实验开关 (需与 terrain_attention 配置一致) =====
+        include_depth_in_actor = True    # 是否在 actor 输入中包含 depth_feature
 
     class algorithm( LeggedRobotCfgPPO.algorithm ):
         use_amp = False
