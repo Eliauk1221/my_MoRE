@@ -130,6 +130,25 @@ class AMPOnPolicyRunnerMulti:
             terrain_attn_grid_h = self.env.cfg.terrain_attention.grid_h
             terrain_attn_grid_w = self.env.cfg.terrain_attention.grid_w
         
+        # ===== β 退火配置（物理引导偏置） =====
+        self.use_safety_bias = False
+        self.safety_bias_beta_init = 1.0
+        self.safety_bias_anneal_steps = 30000
+        self.safety_bias_schedule = "linear"
+        self.safety_bias_exp_tau = 10000
+        
+        if hasattr(self.env.cfg, 'terrain_attention'):
+            ta_cfg = self.env.cfg.terrain_attention
+            self.use_safety_bias = getattr(ta_cfg, 'use_safety_bias', False)
+            self.safety_bias_beta_init = getattr(ta_cfg, 'safety_bias_beta_init', 1.0)
+            self.safety_bias_anneal_steps = getattr(ta_cfg, 'safety_bias_anneal_steps', 30000)
+            self.safety_bias_schedule = getattr(ta_cfg, 'safety_bias_schedule', 'linear')
+            self.safety_bias_exp_tau = getattr(ta_cfg, 'safety_bias_exp_tau', 10000)
+        
+        if self.use_safety_bias:
+            print(f"[SafetyBias] Enabled: beta_init={self.safety_bias_beta_init}, "
+                  f"anneal_steps={self.safety_bias_anneal_steps}, schedule={self.safety_bias_schedule}")
+        
         self.alg.init_storage(self.env.num_envs, 
                               self.num_steps_per_env, 
                               [num_actor_obs], 
@@ -150,6 +169,38 @@ class AMPOnPolicyRunnerMulti:
         self.current_learning_iteration = 0
 
         _, _ = self.env.reset()
+    
+    def compute_attn_bias_beta(self, current_iter: int) -> float:
+        """
+        计算当前迭代的注意力偏置强度 β
+        
+        Args:
+            current_iter: 当前迭代次数
+            
+        Returns:
+            beta: 当前的 β 值 (0.0 ~ beta_init)
+        """
+        if not self.use_safety_bias:
+            return 0.0
+        
+        if self.safety_bias_anneal_steps <= 0:
+            # 不退火，保持初始值
+            return self.safety_bias_beta_init
+        
+        progress = min(1.0, current_iter / self.safety_bias_anneal_steps)
+        
+        if self.safety_bias_schedule == "linear":
+            # 线性退火: β(t) = β_init * (1 - t/T)
+            beta = self.safety_bias_beta_init * (1.0 - progress)
+        elif self.safety_bias_schedule == "exponential":
+            # 指数退火: β(t) = β_init * exp(-t/τ)
+            import math
+            beta = self.safety_bias_beta_init * math.exp(-current_iter / self.safety_bias_exp_tau)
+        else:
+            # 默认线性
+            beta = self.safety_bias_beta_init * (1.0 - progress)
+        
+        return max(0.0, beta)
     
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         # initialize writer
@@ -194,6 +245,10 @@ class AMPOnPolicyRunnerMulti:
 
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
+            
+            # ===== 计算当前的 β 值（物理引导偏置强度） =====
+            attn_bias_beta = self.compute_attn_bias_beta(it)
+            
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
@@ -210,6 +265,10 @@ class AMPOnPolicyRunnerMulti:
                             'height_map': self.env.height_map.clone().to(self.device),
                             'terrain_xyz': self.env.terrain_xyz.clone().to(self.device)
                         }
+                        # 添加物理引导偏置所需数据
+                        if self.use_safety_bias:
+                            terrain_data['base_lin_vel'] = self.env.base_lin_vel.clone().to(self.device)
+                            terrain_data['attn_bias_beta'] = attn_bias_beta
 
                     actions = self.alg.act(obs, critic_obs, history, terrain_data=terrain_data)
 
@@ -348,6 +407,12 @@ class AMPOnPolicyRunnerMulti:
                 num_points = attn_weights.shape[-1]
                 front_weight = attn_weights[:, :num_points//2].sum(dim=-1).mean()
                 self.writer.add_scalar('Attention/front_region_weight', front_weight.item(), locs['it'])
+        
+        # ===== 物理引导偏置指标 =====
+        if self.use_safety_bias:
+            # 记录当前 β 值
+            self.writer.add_scalar('SafetyBias/beta', locs['attn_bias_beta'], locs['it'])
+            
         if len(locs['rewbuffer']) > 0:
             self.writer.add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), locs['it'])
             self.writer.add_scalar('Train/mean_disc_reward', statistics.mean(locs['discrewbuffer']), locs['it'])

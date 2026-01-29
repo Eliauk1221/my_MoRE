@@ -134,16 +134,22 @@ class AMPPPOMulti:
         # ===== 解析地形注意力数据 =====
         height_map = None
         terrain_xyz = None
+        base_lin_vel = None
+        attn_bias_beta = 1.0
         if terrain_data is not None:
             height_map = terrain_data.get('height_map')
             terrain_xyz = terrain_data.get('terrain_xyz')
+            # 物理引导偏置所需数据
+            base_lin_vel = terrain_data.get('base_lin_vel')
+            attn_bias_beta = terrain_data.get('attn_bias_beta', 1.0)
         
         # Compute the actions and values
         if isinstance(obs, tuple):
             aug_obs, depth_image, aug_critic_obs = obs[0].detach(), obs[1].detach(), critic_obs.detach()
             self.transition.actions = self.actor_critic.act(
                 aug_obs, history, depth_image[:, :2, ...],
-                height_map=height_map, terrain_xyz=terrain_xyz
+                height_map=height_map, terrain_xyz=terrain_xyz,
+                base_lin_vel=base_lin_vel, attn_bias_beta=attn_bias_beta
             ).detach()
             self.transition.observations = obs[0]
             self.transition.depth_image = obs[1]
@@ -151,7 +157,8 @@ class AMPPPOMulti:
             aug_obs, aug_critic_obs = obs.detach(), critic_obs.detach()
             self.transition.actions = self.actor_critic.act(
                 aug_obs, history,
-                height_map=height_map, terrain_xyz=terrain_xyz
+                height_map=height_map, terrain_xyz=terrain_xyz,
+                base_lin_vel=base_lin_vel, attn_bias_beta=attn_bias_beta
             ).detach()
             self.transition.observations = obs
         
