@@ -45,6 +45,7 @@ from rsl_rl.env import VecEnv
 from rsl_rl.algorithms.amp_discriminator_multi import AMPDiscriminatorMulti
 from legged_gym.datasets.motion_loader_g1 import G1_AMPLoader
 from legged_gym.utils.utils import Normalizer
+from rsl_rl.utils.terrain_visualizer import visualize_training_sample
 
 class AMPOnPolicyRunnerMulti:
 
@@ -148,6 +149,20 @@ class AMPOnPolicyRunnerMulti:
         if self.use_safety_bias:
             print(f"[SafetyBias] Enabled: beta_init={self.safety_bias_beta_init}, "
                   f"anneal_steps={self.safety_bias_anneal_steps}, schedule={self.safety_bias_schedule}")
+        
+        # ===== 训练可视化配置 =====
+        self.viz_enabled = False
+        self.viz_interval = 500
+        self.viz_num_samples = 2
+        
+        if hasattr(self.env.cfg, 'terrain_attention'):
+            ta_cfg = self.env.cfg.terrain_attention
+            self.viz_enabled = getattr(ta_cfg, 'viz_enabled', False)
+            self.viz_interval = getattr(ta_cfg, 'viz_interval', 500)
+            self.viz_num_samples = getattr(ta_cfg, 'viz_num_samples', 2)
+        
+        if self.viz_enabled:
+            print(f"[TrainViz] Enabled: interval={self.viz_interval}, num_samples={self.viz_num_samples}")
         
         self.alg.init_storage(self.env.num_envs, 
                               self.num_steps_per_env, 
@@ -387,6 +402,23 @@ class AMPOnPolicyRunnerMulti:
                 self.log(locals())
             if it % self.save_interval == 0:
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+            
+            # ===== 训练可视化 =====
+            if self.viz_enabled and it % self.viz_interval == 0 and self.use_terrain_attention:
+                try:
+                    viz_save_dir = os.path.join(self.log_dir, 'visualizations')
+                    visualize_training_sample(
+                        env=self.env,
+                        actor_critic=self.alg.actor_critic,
+                        iteration=it,
+                        beta=attn_bias_beta,
+                        save_dir=viz_save_dir,
+                        sample_indices=None,  # 自动选择
+                        terrain_names=self.terrain_names,
+                    )
+                except Exception as e:
+                    print(f"[TrainViz] Warning: visualization failed at iter {it}: {e}")
+            
             ep_infos.clear()
         
         self.current_learning_iteration += num_learning_iterations

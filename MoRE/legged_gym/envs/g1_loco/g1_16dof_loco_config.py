@@ -119,6 +119,11 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         safety_bias_anneal_steps = 30000 # β 退火步数（设为 0 则不退火）
         safety_bias_schedule = "linear"  # 退火类型: "linear" 或 "exponential"
         safety_bias_exp_tau = 10000      # 指数退火的时间常数 τ（仅 schedule="exponential" 时生效）
+        
+        # ===== 训练可视化配置 =====
+        viz_enabled = False              # 是否启用训练可视化
+        viz_interval = 500               # 可视化间隔（每 N 轮保存一次）
+        viz_num_samples = 2              # 每次可视化的采样数量
 
     class depth(LeggedRobotCfg.depth):
         use_camera = False
