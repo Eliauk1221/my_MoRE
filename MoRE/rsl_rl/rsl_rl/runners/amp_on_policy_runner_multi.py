@@ -167,6 +167,13 @@ class AMPOnPolicyRunnerMulti:
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
+        
+        # ===== 地形指标相关 =====
+        # 地形类型名称 (与 terrain_dict 顺序一致)
+        self.terrain_names = ['stepping_stones', 'parkour', 'pit', 'gap', 'stair']
+        self.num_terrain_types = len(self.terrain_names)
+        # 获取地形长度用于计算 traverse rate
+        self.terrain_length = getattr(self.env.cfg.terrain, 'terrain_length', 14.0)
 
         _, _ = self.env.reset()
     
@@ -230,6 +237,12 @@ class AMPOnPolicyRunnerMulti:
         discrewbuffer = deque(maxlen=100)
         step_discrewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
+        
+        # ===== 按地形类型细分的指标 buffer =====
+        # traverse_rate: 行进距离 / 地形长度
+        # success: 是否成功完成（超时但未跌倒）
+        traverse_buffers = {name: deque(maxlen=50) for name in self.terrain_names}
+        success_buffers = {name: deque(maxlen=50) for name in self.terrain_names}
 
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_disc_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
@@ -324,6 +337,35 @@ class AMPOnPolicyRunnerMulti:
                         
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         
+                        # ===== 按地形类型记录 Traverse Rate 和 Success Rate =====
+                        if len(new_ids) > 0 and hasattr(self.env, 'env_class') and hasattr(self.env, 'env_origins'):
+                            done_env_ids = new_ids[:, 0]
+                            
+                            # 获取结束时的地形类型
+                            terrain_types = self.env.env_class[done_env_ids].long().cpu().numpy()
+                            
+                            # 计算行进距离 (从起点到当前位置的 x 方向距离)
+                            current_pos = self.env.root_states[done_env_ids, :2].cpu()
+                            origin_pos = self.env.env_origins[done_env_ids, :2].cpu()
+                            distance_traveled = torch.norm(current_pos - origin_pos, dim=1).numpy()
+                            
+                            # 计算 traverse rate
+                            traverse_rates = distance_traveled / self.terrain_length
+                            
+                            # 判断是否成功 (超时而非跌倒)
+                            time_out = self.env.time_out_buf[done_env_ids].cpu().numpy()
+                            reset_buf = self.env.reset_buf[done_env_ids].cpu().numpy()
+                            # 成功 = 超时 (如果 reset 仅由 timeout 触发，则认为成功)
+                            # 注意: reset_buf 包含 time_out_buf，所以需要检查 episode_length
+                            is_success = (cur_episode_length[done_env_ids].cpu().numpy() >= self.env.max_episode_length - 1)
+                            
+                            # 按地形类型分类记录
+                            for idx, (t_type, t_rate, success) in enumerate(zip(terrain_types, traverse_rates, is_success)):
+                                if 0 <= t_type < self.num_terrain_types:
+                                    terrain_name = self.terrain_names[int(t_type)]
+                                    traverse_buffers[terrain_name].append(t_rate)
+                                    success_buffers[terrain_name].append(float(success))
+                        
                         cur_reward_sum[new_ids] = 0
                         cur_disc_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
@@ -412,6 +454,55 @@ class AMPOnPolicyRunnerMulti:
         if self.use_safety_bias:
             # 记录当前 β 值
             self.writer.add_scalar('SafetyBias/beta', locs['attn_bias_beta'], locs['it'])
+            
+            # ===== Attention-Bias Alignment 和 Safe Region Focus =====
+            if self.use_terrain_attention and hasattr(self.alg.actor_critic, 'terrain_attention'):
+                terrain_attn = self.alg.actor_critic.terrain_attention
+                if terrain_attn is not None and terrain_attn.last_attention_weights is not None:
+                    attn_weights = terrain_attn.last_attention_weights  # [B, 187]
+                    
+                    # 获取偏置
+                    attn_bias = getattr(terrain_attn, 'last_attn_bias', None)
+                    if attn_bias is not None:
+                        # Attention-Bias Alignment: 注意力权重与归一化偏置的余弦相似度
+                        # 将 bias 转换为概率分布进行比较
+                        import torch.nn.functional as F
+                        bias_softmax = F.softmax(attn_bias, dim=-1)  # [B, 187]
+                        
+                        # 余弦相似度
+                        alignment = F.cosine_similarity(attn_weights, bias_softmax, dim=-1).mean()
+                        self.writer.add_scalar('SafetyBias/attention_bias_alignment', alignment.item(), locs['it'])
+                        
+                        # Safe Region Focus: 注意力在安全区域（bias > median）的权重占比
+                        bias_median = attn_bias.median(dim=-1, keepdim=True).values
+                        safe_mask = (attn_bias > bias_median).float()  # [B, 187]
+                        safe_focus = (attn_weights * safe_mask).sum(dim=-1).mean()
+                        self.writer.add_scalar('SafetyBias/safe_region_focus', safe_focus.item(), locs['it'])
+        
+        # ===== 按地形类型的 Traverse Rate 和 Success Rate =====
+        if 'traverse_buffers' in locs and 'success_buffers' in locs:
+            traverse_buffers = locs['traverse_buffers']
+            success_buffers = locs['success_buffers']
+            
+            total_traverse = []
+            total_success = []
+            
+            for terrain_name in self.terrain_names:
+                if len(traverse_buffers[terrain_name]) > 0:
+                    mean_traverse = statistics.mean(traverse_buffers[terrain_name])
+                    self.writer.add_scalar(f'Terrain/{terrain_name}/traverse_rate', mean_traverse, locs['it'])
+                    total_traverse.extend(traverse_buffers[terrain_name])
+                    
+                if len(success_buffers[terrain_name]) > 0:
+                    mean_success = statistics.mean(success_buffers[terrain_name])
+                    self.writer.add_scalar(f'Terrain/{terrain_name}/success_rate', mean_success, locs['it'])
+                    total_success.extend(success_buffers[terrain_name])
+            
+            # 总体指标
+            if len(total_traverse) > 0:
+                self.writer.add_scalar('Terrain/overall/traverse_rate', statistics.mean(total_traverse), locs['it'])
+            if len(total_success) > 0:
+                self.writer.add_scalar('Terrain/overall/success_rate', statistics.mean(total_success), locs['it'])
             
         if len(locs['rewbuffer']) > 0:
             self.writer.add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), locs['it'])
