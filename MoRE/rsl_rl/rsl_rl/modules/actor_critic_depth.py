@@ -34,6 +34,8 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
+from rsl_rl.modules.terrain_safety_scorer import TerrainSafetyScorer
+
 
 class TerrainAttentionEncoder(nn.Module):
     """
@@ -90,12 +92,14 @@ class TerrainAttentionEncoder(nn.Module):
         # 存储注意力权重用于可视化和监控
         self.last_attention_weights = None
         
-    def forward(self, height_map, terrain_xyz, obs):
+    def forward(self, height_map, terrain_xyz, obs, attn_bias=None):
         """
         Args:
             height_map: [B, 17, 11] 高度图
             terrain_xyz: [B, 187, 3] 每个采样点的 (x,y,z) 坐标（机体坐标系）
             obs: [B, obs_dim] 本体感知观测
+            attn_bias: [B, 187] 可选的注意力偏置（来自 TerrainSafetyScorer）
+                       正值增加对应位置的注意力，负值减少
             
         Returns:
             terrain_feature: [B, output_dim] 注意力加权后的地形特征
@@ -110,7 +114,7 @@ class TerrainAttentionEncoder(nn.Module):
             terrain ──► CNN+xyz ──► kv_input ──► kv_norm       │
                                                   │            │
                                                   ▼            │
-                              MultiheadAttention(Q', K', V')   │
+                    attn_bias ──► MultiheadAttention(Q', K', V', mask=bias)
                                                   │            │
                                                   ▼            ▼
                                             attn_output ──► Add ──► output_proj ──► terrain_feature
@@ -136,15 +140,27 @@ class TerrainAttentionEncoder(nn.Module):
         Q_normed = self.q_norm(Q)           # [B, 1, hidden] - Query 归一化
         kv_normed = self.kv_norm(kv_input)  # [B, 187, hidden] - K/V 归一化
         
+        # ===== 准备注意力掩码 (物理引导偏置) =====
+        # attn_mask 形状: (B, 1, 187) - 加性偏置，在 softmax 前加到注意力分数上
+        # 正值增加注意力，负值减少注意力
+        attn_mask = None
+        if attn_bias is not None:
+            # attn_bias: [B, 187] -> [B, 1, 187]
+            attn_mask = attn_bias.unsqueeze(1)
+        
         # ===== 多头交叉注意力 (使用归一化后的 Q, K, V) =====
         attn_output, attn_weights = self.multihead_attn(
             query=Q_normed,
             key=kv_normed,
-            value=kv_normed
+            value=kv_normed,
+            attn_mask=attn_mask
         )  # attn_output: [B, 1, hidden], attn_weights: [B, 1, 187]
         
         # 保存注意力权重用于可视化
         self.last_attention_weights = attn_weights.squeeze(1).detach()  # [B, 187]
+        
+        # 保存偏置用于指标计算
+        self.last_attn_bias = attn_bias.detach() if attn_bias is not None else None
         
         # ===== 干净残差连接 (Pre-LN 核心: 残差不经过 LayerNorm) =====
         # output = x + Attention(LayerNorm(x))
@@ -235,6 +251,8 @@ class ActorCriticDepth(nn.Module):
                         terrain_attn_output_dim=64,
                         # ===== 消融实验开关 =====
                         include_depth_in_actor=True,  # 是否在 actor 输入中包含 depth_feature
+                        # ===== 物理引导偏置 =====
+                        use_safety_bias=False,        # 是否使用 TerrainSafetyScorer 偏置
                         # ===== Critic 地形高度编码器参数 =====
                         critic_terrain_encoder_dims=[128],  # MLP 隐藏层维度
                         critic_terrain_latent_dim=64,       # 输出特征维度
@@ -248,6 +266,7 @@ class ActorCriticDepth(nn.Module):
         self.max_grad_norm = max_grad_norm
         self.use_terrain_attention = use_terrain_attention
         self.include_depth_in_actor = include_depth_in_actor
+        self.use_safety_bias = use_safety_bias
         
         # ===== Critic 地形高度编码器（Asymmetric Critic）=====
         # 从 privileged_obs 最后 187 维提取 heights 并编码
@@ -291,6 +310,20 @@ class ActorCriticDepth(nn.Module):
                   f"heads={terrain_attn_num_heads}, output_dim={terrain_attn_output_dim}")
         else:
             self.terrain_attention = None
+        
+        # ===== 物理引导偏置打分器 =====
+        if use_safety_bias and use_terrain_attention:
+            self.terrain_safety_scorer = TerrainSafetyScorer(
+                grid_h=terrain_attn_grid_h,
+                grid_w=terrain_attn_grid_w,
+                learnable_sigma=True,
+                learnable_alpha=True,
+            )
+            print(f"TerrainSafetyScorer enabled for attention bias guidance")
+        else:
+            self.terrain_safety_scorer = None
+            if use_safety_bias and not use_terrain_attention:
+                print("[Warning] use_safety_bias=True but use_terrain_attention=False, safety bias disabled")
 
         # Actor 输入维度: obs + his_feature + (depth_feature if include) + (terrain_feature if attention)
         depth_dim = depth_backbone.output_dim if include_depth_in_actor else 0
@@ -376,8 +409,18 @@ class ActorCriticDepth(nn.Module):
         mean = self.actor(observations)
         self.distribution = Normal(mean, mean*0. + self.std)
 
-    def act(self, observations, history, depth, height_map=None, terrain_xyz=None, **kwargs):
-
+    def act(self, observations, history, depth, height_map=None, terrain_xyz=None, 
+            base_lin_vel=None, attn_bias_beta=1.0, **kwargs):
+        """
+        Args:
+            observations: [B, obs_dim] 本体感知观测
+            history: [B, history_len, history_dim] 历史观测
+            depth: [B, buffer_len, H, W] 深度图
+            height_map: [B, grid_h, grid_w] 高度图（可选）
+            terrain_xyz: [B, num_points, 3] 地形采样点坐标（可选）
+            base_lin_vel: [B, 3] 机体线速度（用于 TerrainSafetyScorer，可选）
+            attn_bias_beta: float 注意力偏置强度（由 runner 根据退火策略计算）
+        """
         history = history.flatten(1)
         his_feature = self.history_encoder(history)
         
@@ -392,7 +435,15 @@ class ActorCriticDepth(nn.Module):
         
         # 地形注意力特征 (可选)
         if self.use_terrain_attention and height_map is not None and terrain_xyz is not None:
-            terrain_feature = self.terrain_attention(height_map, terrain_xyz, observations)
+            # 计算物理引导偏置 (可选)
+            attn_bias = None
+            if self.use_safety_bias and self.terrain_safety_scorer is not None and base_lin_vel is not None:
+                # 计算 TerrainSafetyScorer 偏置
+                bias_flat = self.terrain_safety_scorer(height_map, base_lin_vel)  # [B, 187]
+                # 应用退火系数 β
+                attn_bias = attn_bias_beta * bias_flat
+            
+            terrain_feature = self.terrain_attention(height_map, terrain_xyz, observations, attn_bias=attn_bias)
             actor_input_parts.append(terrain_feature)
         
         actor_input = torch.cat(actor_input_parts, dim=-1)
@@ -403,8 +454,14 @@ class ActorCriticDepth(nn.Module):
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
-    def act_inference(self, observations, history, depth, height_map=None, terrain_xyz=None, **kwargs):
-
+    def act_inference(self, observations, history, depth, height_map=None, terrain_xyz=None,
+                       base_lin_vel=None, attn_bias_beta=1.0, **kwargs):
+        """
+        推理模式（无采样，直接返回均值动作）
+        
+        Args:
+            与 act() 相同
+        """
         history = history.flatten(1)
         his_feature = self.history_encoder(history)
         depth_feature = self.depth_encoder(depth)
@@ -417,7 +474,13 @@ class ActorCriticDepth(nn.Module):
         
         # 地形注意力特征 (可选)
         if self.use_terrain_attention and height_map is not None and terrain_xyz is not None:
-            terrain_feature = self.terrain_attention(height_map, terrain_xyz, observations)
+            # 计算物理引导偏置 (可选)
+            attn_bias = None
+            if self.use_safety_bias and self.terrain_safety_scorer is not None and base_lin_vel is not None:
+                bias_flat = self.terrain_safety_scorer(height_map, base_lin_vel)
+                attn_bias = attn_bias_beta * bias_flat
+            
+            terrain_feature = self.terrain_attention(height_map, terrain_xyz, observations, attn_bias=attn_bias)
             actor_input_parts.append(terrain_feature)
         
         actor_input = torch.cat(actor_input_parts, dim=-1)

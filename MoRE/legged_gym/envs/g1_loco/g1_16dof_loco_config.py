@@ -112,6 +112,13 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         
         # ===== 消融实验开关 =====
         include_depth_in_actor = True   # 是否在 actor 输入中包含 depth_feature（用于消融实验）
+        
+        # ===== 物理引导偏置配置 =====
+        use_safety_bias = False          # 是否使用 TerrainSafetyScorer 的偏置引导注意力
+        safety_bias_beta_init = 1.0      # β 初始值（先验强度）
+        safety_bias_anneal_steps = 30000 # β 退火步数（设为 0 则不退火）
+        safety_bias_schedule = "linear"  # 退火类型: "linear" 或 "exponential"
+        safety_bias_exp_tau = 10000      # 指数退火的时间常数 τ（仅 schedule="exponential" 时生效）
 
     class depth(LeggedRobotCfg.depth):
         use_camera = False
@@ -322,6 +329,9 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         
         # ===== 消融实验开关 (需与 terrain_attention 配置一致) =====
         include_depth_in_actor = True    # 是否在 actor 输入中包含 depth_feature
+        
+        # ===== 物理引导偏置 (需与 terrain_attention 配置一致) =====
+        use_safety_bias = False          # 是否使用 TerrainSafetyScorer 偏置
 
     class algorithm( LeggedRobotCfgPPO.algorithm ):
         use_amp = False
