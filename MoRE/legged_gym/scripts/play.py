@@ -8,16 +8,15 @@ import torch
 import numpy as np
 
 
-def draw_attention_points(env, attention_weights, terrain_xyz):
+def draw_attention_points(env, attention_weights):
     """
-    根据注意力权重绘制彩色采样点
+    根据注意力权重绘制彩色采样点（在真实地形表面上）
     - 蓝色 (0, 0, 1): 低权重
     - 红色 (1, 0, 0): 高权重
     
     Args:
         env: 环境对象
         attention_weights: [num_envs, 187] 注意力权重
-        terrain_xyz: [num_envs, 187, 3] 采样点坐标 (机体坐标系)
     """
     if env.viewer is None:
         return
@@ -26,7 +25,7 @@ def draw_attention_points(env, attention_weights, terrain_xyz):
     
     lookat_id = env.lookat_id if hasattr(env, 'lookat_id') else 0
     
-    # 获取当前环境的权重和点
+    # 获取当前环境的权重
     weights = attention_weights[lookat_id].cpu().numpy()
     # 归一化到 [0, 1]
     w_min, w_max = weights.min(), weights.max()
@@ -35,31 +34,32 @@ def draw_attention_points(env, attention_weights, terrain_xyz):
     else:
         weights_norm = np.zeros_like(weights)
     
-    # 获取世界坐标系下的点位置
-    # terrain_xyz 是机体坐标系，需要转换到世界坐标系
+    # 获取机体位置和姿态
     base_pos = env.root_states[lookat_id, :3].cpu().numpy()
     base_quat = env.root_states[lookat_id, 3:7].cpu().numpy()
     
-    points_body = terrain_xyz[lookat_id].cpu().numpy()  # [187, 3]
+    # 获取机体坐标系下的采样点 xy 坐标（未归一化的原始坐标）
+    # height_points 存储的是原始的机体坐标系下的 xy 位置
+    points_body_xy = env.height_points[lookat_id, :, :2].cpu().numpy()  # [187, 2]
     
-    # 简化：直接用机体位置 + 局部坐标（忽略旋转，或使用 yaw 旋转）
-    # 这里为了简化，只考虑 yaw 旋转
-    points_world_xy = points_body[:, :2]  # 使用局部 xy
+    # 获取真实地形高度（世界坐标系下的绝对高度）
+    # measured_heights 是 _get_heights() 返回的地形绝对高度
+    terrain_z = env.measured_heights[lookat_id].cpu().numpy()  # [187]
     
     # 计算 yaw 角
     # quat = [x, y, z, w]
     qx, qy, qz, qw = base_quat
     yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy**2 + qz**2))
     
-    # 旋转 xy
+    # 将机体坐标系的 xy 旋转到世界坐标系
     cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
-    rot_x = points_body[:, 0] * cos_yaw - points_body[:, 1] * sin_yaw
-    rot_y = points_body[:, 0] * sin_yaw + points_body[:, 1] * cos_yaw
+    rot_x = points_body_xy[:, 0] * cos_yaw - points_body_xy[:, 1] * sin_yaw
+    rot_y = points_body_xy[:, 0] * sin_yaw + points_body_xy[:, 1] * cos_yaw
     
     # 世界坐标
     world_x = base_pos[0] + rot_x
     world_y = base_pos[1] + rot_y
-    world_z = base_pos[2] + points_body[:, 2]  # z 是高度差
+    world_z = terrain_z  # 直接使用真实地形高度
     
     # 绘制每个点
     for i in range(len(weights_norm)):
@@ -159,9 +159,18 @@ def play(args):
     else:
         infos["depth"] = None
     
-    # ===== 检查是否使用地形注意力 =====
+    # ===== 检查是否使用地形注意力和物理引导偏置 =====
     use_terrain_attention = getattr(env, 'use_terrain_attention', False)
+    use_safety_bias = False
+    if hasattr(env.cfg, 'terrain_attention'):
+        use_safety_bias = getattr(env.cfg.terrain_attention, 'use_safety_bias', False)
+    
     actor_critic = ppo_runner.alg.actor_critic
+    
+    # 推理时 β=0.0（训练完成后不再需要物理先验，让模型自主决策）
+    attn_bias_beta = 0.0
+    
+    print(f"[Play] use_terrain_attention={use_terrain_attention}, use_safety_bias={use_safety_bias}, attn_bias_beta={attn_bias_beta}")
 
     for i in range(int(env.max_episode_length)):
         # get depth image
@@ -173,23 +182,31 @@ def play(args):
         # ===== 准备地形注意力数据 =====
         height_map = None
         terrain_xyz = None
+        base_lin_vel = None
+        
         if use_terrain_attention and env.height_map is not None:
             height_map = env.height_map.clone().to(env.device)
             terrain_xyz = env.terrain_xyz.clone().to(env.device)
+            
+            # 只有当 use_safety_bias=True 时才传递 base_lin_vel
+            if use_safety_bias:
+                base_lin_vel = env.base_lin_vel.clone().to(env.device)
 
         if isinstance(obs, tuple):
             actions = policy(obs[0].detach(), trajectory_history.detach(), obs[1][:, :2, ...].detach(),
-                           height_map=height_map, terrain_xyz=terrain_xyz)
+                           height_map=height_map, terrain_xyz=terrain_xyz,
+                           base_lin_vel=base_lin_vel, attn_bias_beta=attn_bias_beta)
         else:
             actions = policy(obs.detach(), trajectory_history,
-                           height_map=height_map, terrain_xyz=terrain_xyz)
+                           height_map=height_map, terrain_xyz=terrain_xyz,
+                           base_lin_vel=base_lin_vel, attn_bias_beta=attn_bias_beta)
         obs, _, _, dones, infos, *_= env.step(actions.detach())
         
         # ===== 绘制注意力可视化 =====
         if use_terrain_attention and hasattr(actor_critic, 'terrain_attention'):
             terrain_attn = actor_critic.terrain_attention
             if terrain_attn is not None and terrain_attn.last_attention_weights is not None:
-                draw_attention_points(env, terrain_attn.last_attention_weights, terrain_xyz)
+                draw_attention_points(env, terrain_attn.last_attention_weights)
 
         # process trajectory history
         env_ids = dones.nonzero(as_tuple=False).flatten()
