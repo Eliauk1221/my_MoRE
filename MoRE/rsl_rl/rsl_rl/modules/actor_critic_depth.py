@@ -253,9 +253,6 @@ class ActorCriticDepth(nn.Module):
                         include_depth_in_actor=True,  # 是否在 actor 输入中包含 depth_feature
                         # ===== 物理引导偏置 =====
                         use_safety_bias=False,        # 是否使用 TerrainSafetyScorer 偏置
-                        # ===== Critic 地形高度编码器参数 =====
-                        critic_terrain_encoder_dims=[128],  # MLP 隐藏层维度
-                        critic_terrain_latent_dim=64,       # 输出特征维度
                         **kwargs):
         if kwargs:
             print("ActorCriticEst.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()]))
@@ -267,28 +264,6 @@ class ActorCriticDepth(nn.Module):
         self.use_terrain_attention = use_terrain_attention
         self.include_depth_in_actor = include_depth_in_actor
         self.use_safety_bias = use_safety_bias
-        
-        # ===== Critic 地形高度编码器（Asymmetric Critic）=====
-        # 从 privileged_obs 最后 187 维提取 heights 并编码
-        self.num_terrain_heights = terrain_attn_grid_h * terrain_attn_grid_w  # 17 * 11 = 187
-        self.critic_terrain_latent_dim = critic_terrain_latent_dim if use_terrain_attention else 0
-        
-        if use_terrain_attention:
-            # MLP encoder: heights (187) -> hidden -> latent (64)
-            terrain_encoder_layers = []
-            terrain_encoder_layers.append(nn.Linear(self.num_terrain_heights, critic_terrain_encoder_dims[0]))
-            terrain_encoder_layers.append(activation)
-            for l in range(len(critic_terrain_encoder_dims)):
-                if l == len(critic_terrain_encoder_dims) - 1:
-                    terrain_encoder_layers.append(nn.Linear(critic_terrain_encoder_dims[l], critic_terrain_latent_dim))
-                else:
-                    terrain_encoder_layers.append(nn.Linear(critic_terrain_encoder_dims[l], critic_terrain_encoder_dims[l + 1]))
-                    terrain_encoder_layers.append(activation)
-            self.critic_terrain_encoder = nn.Sequential(*terrain_encoder_layers)
-            print(f"Critic TerrainHeightsEncoder enabled: input={self.num_terrain_heights}, "
-                  f"hidden={critic_terrain_encoder_dims}, output={critic_terrain_latent_dim}")
-        else:
-            self.critic_terrain_encoder = None
 
         # depth encoder
         depth_backbone = DepthOnlyFCBackbone58x87(output_dim=128, output_activation=activation)
@@ -332,9 +307,8 @@ class ActorCriticDepth(nn.Module):
         if not include_depth_in_actor:
             print(f"[Ablation] depth_feature EXCLUDED from actor input (include_depth_in_actor=False)")
         
-        # Critic 输入: critic_obs（不含heights） + his_feature + terrain_heights_feature
-        # 注意: critic_obs 包含 heights (187维)，我们把它单独编码，所以要减去 187
-        mlp_input_dim_c = (num_critic_obs - self.num_terrain_heights) + his_latent_dim + self.critic_terrain_latent_dim if use_terrain_attention else num_critic_obs + his_latent_dim
+        # Critic 输入: critic_obs (privileged_obs，已包含完整 heights 187维) + his_feature
+        mlp_input_dim_c = num_critic_obs + his_latent_dim
         
         # History Encoder
         encoder_layers = []
@@ -489,34 +463,9 @@ class ActorCriticDepth(nn.Module):
         return actions_mean
     
     def evaluate(self, critic_observations, history, **kwargs):
-        """
-        Critic 价值估计
-        
-        Args:
-            critic_observations: [B, num_critic_obs] 特权观测（包含 heights 在最后 187 维）
-            history: [B, history_len, history_dim] 历史观测
-            
-        Returns:
-            value: [B, 1] 状态价值估计
-        """
         history = history.flatten(1)
         his_feature = self.history_encoder(history)
-        
-        # ===== Asymmetric Critic: 对 heights 单独编码 =====
-        if self.use_terrain_attention and self.critic_terrain_encoder is not None:
-            # 从 critic_observations 中分离 heights (最后 187 维)
-            critic_obs_without_heights = critic_observations[:, :-self.num_terrain_heights]
-            heights = critic_observations[:, -self.num_terrain_heights:]
-            
-            # 编码 heights
-            terrain_feature = self.critic_terrain_encoder(heights)
-            
-            # 拼接: critic_obs (不含heights) + history_feature + terrain_feature
-            critic_input = torch.cat((critic_obs_without_heights, his_feature, terrain_feature), dim=-1)
-        else:
-            # 原始行为: 直接拼接
-            critic_input = torch.cat((critic_observations, his_feature), dim=-1)
-        
+        critic_input = torch.cat((critic_observations, his_feature), dim=-1)
         value = self.critic(critic_input)
         return value
 
