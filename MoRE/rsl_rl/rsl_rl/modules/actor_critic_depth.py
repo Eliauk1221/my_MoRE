@@ -59,6 +59,7 @@ class TerrainAttentionEncoder(nn.Module):
         self.num_points = grid_h * grid_w  # 187
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
+        self.num_heads = num_heads  # 保存用于 attn_mask 形状扩展
         
         # ===== 上路: 5x5 CNN 提取几何特征 =====
         # CNN输出维度 = hidden_dim - 3，留3维给xyz坐标
@@ -141,12 +142,14 @@ class TerrainAttentionEncoder(nn.Module):
         kv_normed = self.kv_norm(kv_input)  # [B, 187, hidden] - K/V 归一化
         
         # ===== 准备注意力掩码 (物理引导偏置) =====
-        # attn_mask 形状: (B, 1, 187) - 加性偏置，在 softmax 前加到注意力分数上
+        # PyTorch MHA 的 3D attn_mask 要求形状为 (B * num_heads, tgt_len, src_len)
         # 正值增加注意力，负值减少注意力
         attn_mask = None
         if attn_bias is not None:
-            # attn_bias: [B, 187] -> [B, 1, 187]
-            attn_mask = attn_bias.unsqueeze(1)
+            # attn_bias: [B, 187] -> [B * num_heads, 1, 187]
+            attn_mask = attn_bias.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, 187]
+            attn_mask = attn_mask.expand(-1, self.num_heads, -1, -1)  # [B, num_heads, 1, 187]
+            attn_mask = attn_mask.reshape(B * self.num_heads, 1, self.num_points)  # [B * num_heads, 1, 187]
         
         # ===== 多头交叉注意力 (使用归一化后的 Q, K, V) =====
         attn_output, attn_weights = self.multihead_attn(
