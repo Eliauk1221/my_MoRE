@@ -4,8 +4,79 @@ import isaacgym
 from isaacgym import gymapi, gymutil
 from legged_gym.envs import *
 from legged_gym.utils import  get_args, export_policy_as_jit_resi, export_policy_as_jit_depth, task_registry
+from legged_gym.utils.helpers import get_load_path
 import torch
 import numpy as np
+
+
+def infer_model_config_from_checkpoint(checkpoint_path, num_actor_obs=57, his_latent_dim=64, 
+                                        depth_dim=128, terrain_attn_dim=64):
+    """
+    从 checkpoint 中推断训练时的模型配置
+    
+    根据 actor 第一层权重的输入维度推断 use_terrain_attention 和 include_depth_in_actor
+    
+    Args:
+        checkpoint_path: checkpoint 文件路径
+        num_actor_obs: 观测维度 (默认 57)
+        his_latent_dim: 历史编码维度 (默认 64)
+        depth_dim: 深度特征维度 (默认 128)
+        terrain_attn_dim: 地形注意力输出维度 (默认 64)
+    
+    Returns:
+        dict: {'use_terrain_attention': bool, 'include_depth_in_actor': bool, 'use_safety_bias': bool}
+    """
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    
+    # 获取 actor 第一层权重的输入维度
+    actor_input_dim = checkpoint['model_state_dict']['actor.0.weight'].shape[1]
+    
+    # 计算基础维度 (obs + history)
+    base_dim = num_actor_obs + his_latent_dim  # 57 + 64 = 121
+    
+    # 可能的组合及其维度：
+    # attention=False, depth=False: base_dim = 121
+    # attention=False, depth=True:  base_dim + depth_dim = 249
+    # attention=True,  depth=False: base_dim + terrain_attn_dim = 185
+    # attention=True,  depth=True:  base_dim + depth_dim + terrain_attn_dim = 313
+    
+    remaining_dim = actor_input_dim - base_dim
+    
+    # 根据剩余维度推断配置
+    if remaining_dim == 0:
+        # 121: attention=False, depth=False
+        use_attention = False
+        include_depth = False
+    elif remaining_dim == depth_dim:
+        # 249: attention=False, depth=True
+        use_attention = False
+        include_depth = True
+    elif remaining_dim == terrain_attn_dim:
+        # 185: attention=True, depth=False
+        use_attention = True
+        include_depth = False
+    elif remaining_dim == depth_dim + terrain_attn_dim:
+        # 313: attention=True, depth=True
+        use_attention = True
+        include_depth = True
+    else:
+        # 无法识别的维度，使用默认值并警告
+        print(f"[Warning] Cannot infer config from actor_input_dim={actor_input_dim}, "
+              f"remaining_dim={remaining_dim}. Using config file defaults.")
+        return None
+    
+    # 检查是否有 terrain_safety_scorer（推断 use_safety_bias）
+    use_safety_bias = 'terrain_safety_scorer.raw_sigma_dyn' in checkpoint['model_state_dict']
+    
+    print(f"[Config Inference] actor_input_dim={actor_input_dim} -> "
+          f"use_terrain_attention={use_attention}, include_depth_in_actor={include_depth}, "
+          f"use_safety_bias={use_safety_bias}")
+    
+    return {
+        'use_terrain_attention': use_attention,
+        'include_depth_in_actor': include_depth,
+        'use_safety_bias': use_safety_bias
+    }
 
 
 def draw_attention_points(env, attention_weights):
@@ -127,6 +198,39 @@ def play(args):
                                     "gap": 1,
                                     "stair": 1,}
     env_cfg.terrain.terrain_proportions = list(env_cfg.terrain.terrain_dict.values())
+    
+    # ===== 从 checkpoint 推断训练时的模型配置 =====
+    # 在创建环境和 runner 之前，先读取 checkpoint 推断配置
+    log_root = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name)
+    resume_path = get_load_path(log_root, load_run=args.load_run, checkpoint=train_cfg.runner.checkpoint)
+    
+    # 从配置中获取维度参数（用于推断）
+    num_actor_obs = env_cfg.env.num_observations
+    his_latent_dim = getattr(train_cfg.policy, 'his_latent_dim', 64)
+    depth_dim = 128  # DepthOnlyFCBackbone58x87 的输出维度
+    terrain_attn_dim = getattr(train_cfg.policy, 'terrain_attn_output_dim', 64)
+    
+    inferred_config = infer_model_config_from_checkpoint(
+        resume_path, 
+        num_actor_obs=num_actor_obs,
+        his_latent_dim=his_latent_dim,
+        depth_dim=depth_dim,
+        terrain_attn_dim=terrain_attn_dim
+    )
+    
+    # 如果成功推断配置，覆盖配置文件的默认值
+    if inferred_config is not None:
+        # 覆盖 train_cfg.policy 中的配置
+        train_cfg.policy.use_terrain_attention = inferred_config['use_terrain_attention']
+        train_cfg.policy.include_depth_in_actor = inferred_config['include_depth_in_actor']
+        train_cfg.policy.use_safety_bias = inferred_config['use_safety_bias']
+        
+        # 覆盖 env_cfg.terrain_attention 中的配置（如果存在）
+        if hasattr(env_cfg, 'terrain_attention'):
+            env_cfg.terrain_attention.use_attention = inferred_config['use_terrain_attention']
+            env_cfg.terrain_attention.include_depth_in_actor = inferred_config['include_depth_in_actor']
+            env_cfg.terrain_attention.use_safety_bias = inferred_config['use_safety_bias']
+    
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
     obs = env.get_observations()
