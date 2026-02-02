@@ -57,6 +57,7 @@ class RolloutStorageEX:
             # 地形注意力数据
             self.height_map = None
             self.terrain_xyz = None
+            self.base_lin_vel = None  # 用于物理引导偏置
         
         def clear(self):
             self.__init__()
@@ -75,11 +76,13 @@ class RolloutStorageEX:
         # 地形注意力数据
         self.height_map = None
         self.terrain_xyz = None
+        self.base_lin_vel = None  # 用于物理引导偏置
         self.use_terrain_attention = terrain_attn_grid_h is not None and terrain_attn_grid_w is not None
         if self.use_terrain_attention:
             num_points = terrain_attn_grid_h * terrain_attn_grid_w
             self.height_map = torch.zeros(num_transitions_per_env, num_envs, terrain_attn_grid_h, terrain_attn_grid_w, device=self.device)
             self.terrain_xyz = torch.zeros(num_transitions_per_env, num_envs, num_points, 3, device=self.device)
+            self.base_lin_vel = torch.zeros(num_transitions_per_env, num_envs, 3, device=self.device)  # [T, N, 3]
 
         self.obs_shape = obs_shape
         self.privileged_obs_shape = privileged_obs_shape
@@ -141,6 +144,8 @@ class RolloutStorageEX:
         if self.use_terrain_attention and transition.height_map is not None:
             self.height_map[self.step].copy_(transition.height_map)
             self.terrain_xyz[self.step].copy_(transition.terrain_xyz)
+            if transition.base_lin_vel is not None:
+                self.base_lin_vel[self.step].copy_(transition.base_lin_vel)
         self.rewards[self.step].copy_(transition.rewards.view(-1, self.num_critics))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
         self.values[self.step].copy_(transition.values)
@@ -209,6 +214,7 @@ class RolloutStorageEX:
         # 地形注意力数据
         height_map = self.height_map.flatten(0, 1) if self.height_map is not None else None
         terrain_xyz = self.terrain_xyz.flatten(0, 1) if self.terrain_xyz is not None else None
+        base_lin_vel = self.base_lin_vel.flatten(0, 1) if self.base_lin_vel is not None else None
 
         if self.privileged_observations is not None:
             critic_observations = self.privileged_observations.flatten(0, 1)
@@ -248,9 +254,10 @@ class RolloutStorageEX:
                 # 地形注意力数据
                 height_map_batch = height_map[batch_idx] if height_map is not None else None
                 terrain_xyz_batch = terrain_xyz[batch_idx] if terrain_xyz is not None else None
+                base_lin_vel_batch = base_lin_vel[batch_idx] if base_lin_vel is not None else None
                 
                 yield obs_batch, critic_observations_batch, actions_batch, next_obs_batch, next_critic_observations_batch, history_batch, target_values_batch, advantages_batch, returns_batch, \
-                       old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None, depth_image_batch, height_map_batch, terrain_xyz_batch
+                       old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None, depth_image_batch, height_map_batch, terrain_xyz_batch, base_lin_vel_batch
 
     # for RNNs only
     def reccurent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
