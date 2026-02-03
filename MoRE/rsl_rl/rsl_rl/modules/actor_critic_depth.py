@@ -43,7 +43,7 @@ class TerrainAttentionEncoder(nn.Module):
     - 上路: 5x5 CNN 提取几何特征（高度差、梯度等）
     - 下路: 原始 (x,y,z) 坐标直接使用
     - MHA 内部处理 K/V 投影，只需手动投影 Q
-    - [已注释] Pre-LN + 残差结构（实验发现可能导致学习变慢）
+    - use_pre_ln: 可选的 Pre-LN + 残差结构（旧模型兼容）
     """
     def __init__(self, 
                  grid_h=17, 
@@ -51,7 +51,8 @@ class TerrainAttentionEncoder(nn.Module):
                  obs_dim=57,
                  hidden_dim=128,
                  num_heads=8,
-                 output_dim=64):
+                 output_dim=64,
+                 use_pre_ln=False):  # 新增参数：是否使用 Pre-LN（用于兼容旧模型）
         super().__init__()
         
         self.grid_h = grid_h
@@ -60,6 +61,7 @@ class TerrainAttentionEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.num_heads = num_heads  # 保存用于 attn_mask 形状扩展
+        self.use_pre_ln = use_pre_ln  # 保存配置
         
         # ===== 上路: 5x5 CNN 提取几何特征 =====
         # CNN输出维度 = hidden_dim - 3，留3维给xyz坐标
@@ -74,10 +76,11 @@ class TerrainAttentionEncoder(nn.Module):
         # ===== Query 投影 (obs_dim → hidden_dim) =====
         self.q_proj = nn.Linear(obs_dim, hidden_dim)
         
-        # # ===== Pre-LN: 在 Attention 之前对 Q 和 K/V 分别归一化 =====
-        # # [注释掉] 实验发现 LayerNorm 可能导致注意力学习变慢
-        # self.q_norm = nn.LayerNorm(hidden_dim)   # Query 归一化
-        # self.kv_norm = nn.LayerNorm(hidden_dim)  # Key/Value 归一化
+        # ===== Pre-LN: 在 Attention 之前对 Q 和 K/V 分别归一化 =====
+        # 仅当 use_pre_ln=True 时创建（用于兼容旧模型）
+        if use_pre_ln:
+            self.q_norm = nn.LayerNorm(hidden_dim)   # Query 归一化
+            self.kv_norm = nn.LayerNorm(hidden_dim)  # Key/Value 归一化
         
         # ===== 多头注意力 (MHA内部处理K/V投影) =====
         self.multihead_attn = nn.MultiheadAttention(
@@ -133,10 +136,13 @@ class TerrainAttentionEncoder(nn.Module):
         # ===== Query 投影 =====
         Q = self.q_proj(obs).unsqueeze(1)  # [B, 1, hidden]
         
-        # # ===== Pre-LN: 在 Attention 之前归一化 =====
-        # # [注释掉] 直接使用 Q 和 kv_input，不做 LayerNorm
-        # Q_normed = self.q_norm(Q)           # [B, 1, hidden] - Query 归一化
-        # kv_normed = self.kv_norm(kv_input)  # [B, 187, hidden] - K/V 归一化
+        # ===== Pre-LN: 在 Attention 之前归一化 (可选，用于兼容旧模型) =====
+        if self.use_pre_ln:
+            Q_input = self.q_norm(Q)           # [B, 1, hidden] - Query 归一化
+            kv_input_normed = self.kv_norm(kv_input)  # [B, 187, hidden] - K/V 归一化
+        else:
+            Q_input = Q
+            kv_input_normed = kv_input
         
         # ===== 准备注意力掩码 (物理引导偏置) =====
         # PyTorch MHA 的 3D attn_mask 要求形状为 (B * num_heads, tgt_len, src_len)
@@ -148,11 +154,11 @@ class TerrainAttentionEncoder(nn.Module):
             attn_mask = attn_mask.expand(-1, self.num_heads, -1, -1)  # [B, num_heads, 1, 187]
             attn_mask = attn_mask.reshape(B * self.num_heads, 1, self.num_points)  # [B * num_heads, 1, 187]
         
-        # ===== 多头交叉注意力 (直接使用 Q, kv_input，不做 LayerNorm) =====
+        # ===== 多头交叉注意力 =====
         attn_output, attn_weights = self.multihead_attn(
-            query=Q,         # 原: Q_normed
-            key=kv_input,    # 原: kv_normed
-            value=kv_input,  # 原: kv_normed
+            query=Q_input,
+            key=kv_input_normed,
+            value=kv_input_normed,
             attn_mask=attn_mask
         )  # attn_output: [B, 1, hidden], attn_weights: [B, 1, 187]
         
@@ -162,10 +168,11 @@ class TerrainAttentionEncoder(nn.Module):
         # 保存偏置用于指标计算
         self.last_attn_bias = attn_bias.detach() if attn_bias is not None else None
         
-        # # ===== 干净残差连接 (Pre-LN 核心: 残差不经过 LayerNorm) =====
-        # # [注释掉] 移除残差连接，让注意力输出直接用于后续计算
-        # # output = x + Attention(LayerNorm(x))
-        # attn_output = attn_output + Q  # [B, 1, hidden] - 直接加原始 Q，不经过 LN
+        # ===== 干净残差连接 (Pre-LN 核心: 残差不经过 LayerNorm) =====
+        # 仅当 use_pre_ln=True 时启用残差连接
+        if self.use_pre_ln:
+            # output = x + Attention(LayerNorm(x))
+            attn_output = attn_output + Q  # [B, 1, hidden] - 直接加原始 Q，不经过 LN
         
         # ===== 输出投影 =====
         terrain_feature = self.output_proj(attn_output.squeeze(1))  # [B, output_dim]
@@ -250,6 +257,7 @@ class ActorCriticDepth(nn.Module):
                         terrain_attn_hidden_dim=128,
                         terrain_attn_num_heads=8,
                         terrain_attn_output_dim=64,
+                        terrain_attn_use_pre_ln=False,  # 是否使用 Pre-LN（用于兼容旧模型）
                         # ===== 消融实验开关 =====
                         include_depth_in_actor=True,  # 是否在 actor 输入中包含 depth_feature
                         # ===== 物理引导偏置 =====
@@ -279,11 +287,12 @@ class ActorCriticDepth(nn.Module):
                 obs_dim=num_actor_obs,
                 hidden_dim=terrain_attn_hidden_dim,
                 num_heads=terrain_attn_num_heads,
-                output_dim=terrain_attn_output_dim
+                output_dim=terrain_attn_output_dim,
+                use_pre_ln=terrain_attn_use_pre_ln
             )
             terrain_attn_dim = terrain_attn_output_dim
             print(f"Actor TerrainAttentionEncoder enabled: grid={terrain_attn_grid_h}x{terrain_attn_grid_w}, "
-                  f"heads={terrain_attn_num_heads}, output_dim={terrain_attn_output_dim}")
+                  f"heads={terrain_attn_num_heads}, output_dim={terrain_attn_output_dim}, use_pre_ln={terrain_attn_use_pre_ln}")
         else:
             self.terrain_attention = None
         

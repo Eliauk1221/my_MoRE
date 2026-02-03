@@ -68,14 +68,18 @@ def infer_model_config_from_checkpoint(checkpoint_path, num_actor_obs=57, his_la
     # 检查是否有 terrain_safety_scorer（推断 use_safety_bias）
     use_safety_bias = 'terrain_safety_scorer.raw_sigma_dyn' in checkpoint['model_state_dict']
     
+    # 检查是否有 q_norm（推断 terrain_attn_use_pre_ln，用于兼容旧模型）
+    use_pre_ln = 'terrain_attention.q_norm.weight' in checkpoint['model_state_dict']
+    
     print(f"[Config Inference] actor_input_dim={actor_input_dim} -> "
           f"use_terrain_attention={use_attention}, include_depth_in_actor={include_depth}, "
-          f"use_safety_bias={use_safety_bias}")
+          f"use_safety_bias={use_safety_bias}, terrain_attn_use_pre_ln={use_pre_ln}")
     
     return {
         'use_terrain_attention': use_attention,
         'include_depth_in_actor': include_depth,
-        'use_safety_bias': use_safety_bias
+        'use_safety_bias': use_safety_bias,
+        'terrain_attn_use_pre_ln': use_pre_ln
     }
 
 
@@ -224,12 +228,14 @@ def play(args):
         train_cfg.policy.use_terrain_attention = inferred_config['use_terrain_attention']
         train_cfg.policy.include_depth_in_actor = inferred_config['include_depth_in_actor']
         train_cfg.policy.use_safety_bias = inferred_config['use_safety_bias']
+        train_cfg.policy.terrain_attn_use_pre_ln = inferred_config['terrain_attn_use_pre_ln']
         
         # 覆盖 env_cfg.terrain_attention 中的配置（如果存在）
         if hasattr(env_cfg, 'terrain_attention'):
             env_cfg.terrain_attention.use_attention = inferred_config['use_terrain_attention']
             env_cfg.terrain_attention.include_depth_in_actor = inferred_config['include_depth_in_actor']
             env_cfg.terrain_attention.use_safety_bias = inferred_config['use_safety_bias']
+            env_cfg.terrain_attention.use_pre_ln = inferred_config['terrain_attn_use_pre_ln']
     
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
