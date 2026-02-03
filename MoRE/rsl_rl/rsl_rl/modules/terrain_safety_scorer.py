@@ -44,16 +44,16 @@ class TerrainSafetyScorer(nn.Module):
         g: float = 9.81,
         z_nominal: float = 0.75,
         C_scaling: float = 1.0,
-        local_var_threshold: float = 0.01,
+        local_var_threshold: float = 0.03,
         height_drop_threshold: float = 0.3,
         behind_threshold: float = 0.3,
         behind_vel_threshold: float = 0.1,
-        behind_penalty: float = -3.0,
-        steep_penalty: float = -8.0,
-        pit_penalty: float = -12.0,
+        behind_penalty: float = -1.5,   # 降低：原 -3.0，防止注意力崩塌
+        steep_penalty: float = -4.0,    # 降低：原 -8.0
+        pit_penalty: float = -6.0,      # 降低：原 -12.0
         learnable_sigma: bool = True,
         init_sigma_dyn: float = 0.3,
-        init_sigma_geo: float = 0.2,
+        init_sigma_geo: float = 0.5,
         learnable_alpha: bool = True,
         init_alpha: float = 1.0,
     ):
@@ -197,18 +197,24 @@ class TerrainSafetyScorer(nn.Module):
         self,
         height_map: torch.Tensor,
         base_lin_vel: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
         """
-        计算动力学可行性分数 S_dyn (基于逐点 VHIP)
+        计算动力学可行性分数 S_dyn (方案A: 统一捕获点 + VHIP高度修正)
+        
+        物理意义:
+        1. 使用名义高度计算 唯一的 理想捕获点位置
+        2. 计算每个采样点到这个统一捕获点的距离
+        3. 根据每个点的实际高度微调: 坑 = 更难到达, 凸起 = 更容易到达
         
         Args:
             height_map: [B, grid_h, grid_w]
             base_lin_vel: [B, 3] 机体坐标系下的线速度
             
         Returns:
-            S_dyn: [B, grid_h, grid_w] 动力学分数 (负的距离平方)
-            omega: [B, grid_h, grid_w] 逐点自然频率
-            capture_offset: [B, 2, grid_h, grid_w] 理想捕获点偏移
+            S_dyn: [B, grid_h, grid_w] 动力学分数 (负的修正距离平方)
+            omega: [B, grid_h, grid_w] 逐点自然频率 (用于调试)
+            capture_point: [B, 2] 统一的理想捕获点位置
+            z_ratio: [B, grid_h, grid_w] VHIP 高度修正系数
             alpha: float 当前 alpha 值
         """
         B = height_map.shape[0]
@@ -216,37 +222,45 @@ class TerrainSafetyScorer(nn.Module):
         # ===== 可学习的 alpha 缩放因子 =====
         alpha = F.softplus(self.raw_alpha) + 1e-6
         
-        # 逐点计算有效高度 (质心到地面的高度)
-        # height_map 符号语义 (与 LeggedGym 管线一致):
-        #   height_map = base_z - base_height - terrain_z
-        #   正值 = 地面更低（坑）→ 有效高度增加
-        #   负值 = 地面更高（凸起）→ 有效高度减少
-        # 有效高度 = z_nominal + height_map
-        effective_z = self.z_nominal + height_map  # [B, H, W]
-        effective_z = effective_z.clamp(min=0.1)  # 防止除零
-        
-        # 逐点自然频率 omega = sqrt(g / z)
-        omega = torch.sqrt(self.g / effective_z)  # [B, H, W]
+        # ===== 1. 使用名义高度计算统一的捕获点 =====
+        # omega_nominal = sqrt(g / z_nominal) 是固定值
+        omega_nominal = (self.g / self.z_nominal) ** 0.5
         
         # 提取 xy 方向速度
         v_xy = base_lin_vel[:, :2]  # [B, 2]
-        v_xy = v_xy.unsqueeze(-1).unsqueeze(-1)  # [B, 2, 1, 1]
         
-        # 逐点计算理想捕获点偏移
-        # P_ideal = alpha * C_scaling * v / omega
-        omega_expanded = omega.unsqueeze(1)  # [B, 1, H, W]
-        capture_offset = alpha * self.C_scaling * v_xy / omega_expanded  # [B, 2, H, W]
+        # 统一捕获点: P_capture = alpha * C_scaling * v / omega_nominal
+        capture_point = alpha * self.C_scaling * v_xy / omega_nominal  # [B, 2]
         
-        # 动态扩展网格到当前 batch size
+        # ===== 2. 计算每个采样点到统一捕获点的基础距离 =====
+        # 扩展 grid_xy 到 batch
         grid_xy = self.grid_xy.unsqueeze(0).expand(B, -1, -1, -1)  # [B, 2, H, W]
         
-        # 计算每个网格点到其对应理想捕获点的距离平方
-        dist_sq = ((grid_xy - capture_offset) ** 2).sum(dim=1)  # [B, H, W]
+        # 扩展 capture_point 到网格形状
+        capture_point_expanded = capture_point.view(B, 2, 1, 1)  # [B, 2, 1, 1]
         
-        # 动力学分数 = 负的距离平方
-        S_dyn = -dist_sq
+        # 基础距离平方 (所有点到同一个捕获点的距离)
+        base_dist_sq = ((grid_xy - capture_point_expanded) ** 2).sum(dim=1)  # [B, H, W]
         
-        return S_dyn, omega, capture_offset, alpha.item()
+        # ===== 3. VHIP 高度修正 =====
+        # 物理意义: 坑内的点需要更大的能量/步幅才能跨越，等效于"更难到达"
+        # 有效高度 = z_nominal + height_map (正值=坑, 有效高度增加)
+        effective_z = self.z_nominal + height_map  # [B, H, W]
+        effective_z = effective_z.clamp(min=0.1)  # 防止除零
+        
+        # 高度比率: z_ratio > 1 表示坑 (更难到达), z_ratio < 1 表示凸起 (更容易到达)
+        z_ratio = (effective_z / self.z_nominal).clamp(0.5, 2.0)  # [B, H, W]
+        
+        # 修正后的距离: 坑区域距离放大, 凸起区域距离缩小
+        adjusted_dist_sq = base_dist_sq * z_ratio  # [B, H, W]
+        
+        # ===== 4. 计算逐点 omega (用于调试/可视化) =====
+        omega = torch.sqrt(self.g / effective_z)  # [B, H, W]
+        
+        # ===== 5. 动力学分数 = 负的修正距离平方 =====
+        S_dyn = -adjusted_dist_sq
+        
+        return S_dyn, omega, capture_point, z_ratio, alpha.item()
     
     def compute_behind_mask(
         self,
@@ -313,8 +327,8 @@ class TerrainSafetyScorer(nn.Module):
         # ===== 1. 几何平坦度分数 =====
         S_geo, slope, local_var = self.compute_geometric_score(height_map)
         
-        # ===== 2. 动力学可行性分数 =====
-        S_dyn, omega, capture_offset, alpha = self.compute_dynamic_score(
+        # ===== 2. 动力学可行性分数 (方案A: 统一捕获点 + VHIP修正) =====
+        S_dyn, omega, capture_point, z_ratio, alpha = self.compute_dynamic_score(
             height_map, base_lin_vel
         )
         
@@ -351,8 +365,9 @@ class TerrainSafetyScorer(nn.Module):
                 'S_geo': S_geo.detach(),                    # [B, H, W]
                 'slope': slope.detach(),                    # [B, H, W] 归一化坡度
                 'local_var': local_var.detach(),            # [B, H, W] 局部方差
-                'omega': omega.detach(),                    # [B, H, W]
-                'capture_offset': capture_offset.detach(),  # [B, 2, H, W]
+                'omega': omega.detach(),                    # [B, H, W] 逐点自然频率
+                'capture_point': capture_point.detach(),    # [B, 2] 统一捕获点位置
+                'z_ratio': z_ratio.detach(),                # [B, H, W] VHIP 高度修正系数
                 'steep_mask': steep_mask.detach(),          # [B, H, W]
                 'pit_mask': pit_mask.detach(),              # [B, H, W]
                 'behind_mask': behind_mask.detach(),        # [B, H, W]

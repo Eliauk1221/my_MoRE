@@ -259,13 +259,12 @@ def visualize_scorer_output(
         ax.axhline(y=0, color='k', linestyle='--', alpha=0.3)
         ax.axvline(x=0, color='k', linestyle='--', alpha=0.3)
     
-    def add_capture_point(ax, capture_offset):
-        """标记理想捕获点"""
-        # 捕获点偏移是相对于每个网格点的，我们取中心点的偏移作为示意
-        center_h, center_w = capture_offset.shape[1] // 2, capture_offset.shape[2] // 2
-        cp_x = capture_offset[0, center_h, center_w].item()
-        cp_y = capture_offset[1, center_h, center_w].item()
-        ax.plot(cp_y, cp_x, 'r*', markersize=15, label='Capture Point (center)')
+    def add_capture_point(ax, capture_point):
+        """标记统一的理想捕获点"""
+        # capture_point: [2] - 统一的捕获点位置
+        cp_x = capture_point[0].item()
+        cp_y = capture_point[1].item()
+        ax.plot(cp_y, cp_x, 'r*', markersize=15, label='Capture Point')
     
     def add_velocity_arrow(ax, vel):
         """标记速度方向"""
@@ -304,21 +303,21 @@ def visualize_scorer_output(
     ax = axes[0, 2]
     local_var = debug_info['local_var'][sample_idx].detach().cpu().numpy()
     im = ax.imshow(local_var, **imshow_kwargs, cmap='hot')
-    ax.set_title(f'Local Variance\nthreshold=0.01')
+    ax.set_title(f'Local Variance\nthreshold=0.03')
     ax.set_xlabel('Y (m)')
     ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
     plt.colorbar(im, ax=ax, label='Variance')
     
-    # 4. Omega (自然频率)
+    # 4. z_ratio (VHIP 高度修正系数)
     ax = axes[0, 3]
-    omega = debug_info['omega'][sample_idx].detach().cpu().numpy()
-    im = ax.imshow(omega, **imshow_kwargs, cmap='viridis')
-    ax.set_title('ω (Natural Frequency)')
+    z_ratio = debug_info['z_ratio'][sample_idx].detach().cpu().numpy()
+    im = ax.imshow(z_ratio, **imshow_kwargs, cmap='RdYlBu_r', vmin=0.5, vmax=1.5)
+    ax.set_title('z_ratio (VHIP Height Correction)\n>1: pit (harder), <1: bump (easier)')
     ax.set_xlabel('Y (m)')
     ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
-    plt.colorbar(im, ax=ax, label='ω (rad/s)')
+    plt.colorbar(im, ax=ax, label='z_ratio')
     
     # ===== Row 2: 分数和掩码 =====
     
@@ -340,7 +339,7 @@ def visualize_scorer_output(
     ax.set_xlabel('Y (m)')
     ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
-    add_capture_point(ax, debug_info['capture_offset'][sample_idx])
+    add_capture_point(ax, debug_info['capture_point'][sample_idx])
     add_velocity_arrow(ax, base_lin_vel[sample_idx])
     ax.legend(loc='upper right')
     plt.colorbar(im, ax=ax, label='Score')
@@ -399,23 +398,23 @@ def visualize_scorer_output(
     ax.set_xlabel('Y (m)')
     ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
-    add_capture_point(ax, debug_info['capture_offset'][sample_idx])
+    add_capture_point(ax, debug_info['capture_point'][sample_idx])
     add_velocity_arrow(ax, base_lin_vel[sample_idx])
     ax.legend(loc='upper right')
     plt.colorbar(im, ax=ax, label='Bias')
     
-    # 12. Softmax Attention (最终注意力分布)
+    # 12. Softmax Attention (bias-only, 仅展示偏置的相对分布)
     ax = axes[2, 3]
     bias_flat = bias_2d.flatten()
     attention = np.exp(bias_flat - bias_flat.max())  # 数值稳定的 softmax
     attention = attention / attention.sum()
     attention_2d = attention.reshape(bias_2d.shape)
     im = ax.imshow(attention_2d, **imshow_kwargs, cmap='hot')
-    ax.set_title('Softmax Attention')
+    ax.set_title('Softmax Attention (bias-only)\nfinal = softmax(QK^T/√d + bias)')
     ax.set_xlabel('Y (m)')
     ax.set_ylabel('X (m) ↑ Forward')
     add_robot_marker(ax)
-    add_capture_point(ax, debug_info['capture_offset'][sample_idx])
+    add_capture_point(ax, debug_info['capture_point'][sample_idx])
     ax.legend(loc='upper right')
     plt.colorbar(im, ax=ax, label='Attention Weight')
     
@@ -452,7 +451,8 @@ def test_dimension_alignment(scorer: TerrainSafetyScorer):
         assert debug_info['slope'].shape == (B, 17, 11), f"slope shape mismatch"
         assert debug_info['local_var'].shape == (B, 17, 11), f"local_var shape mismatch"
         assert debug_info['omega'].shape == (B, 17, 11), f"omega shape mismatch"
-        assert debug_info['capture_offset'].shape == (B, 2, 17, 11), f"capture_offset shape mismatch"
+        assert debug_info['capture_point'].shape == (B, 2), f"capture_point shape mismatch: {debug_info['capture_point'].shape}"
+        assert debug_info['z_ratio'].shape == (B, 17, 11), f"z_ratio shape mismatch"
         
         print(f"  Batch size {B}: ✓ All dimensions correct")
     
@@ -577,10 +577,10 @@ def test_behind_mask_dot_product(scorer: TerrainSafetyScorer):
     print("  [PASS] Behind mask (dot product) test passed!")
 
 
-def test_capture_point_offset(scorer: TerrainSafetyScorer):
-    """测试捕获点偏移"""
+def test_capture_point_unified(scorer: TerrainSafetyScorer):
+    """测试统一捕获点 (方案A)"""
     print("\n" + "="*60)
-    print("Test: Capture Point Offset")
+    print("Test: Unified Capture Point (Plan A)")
     print("="*60)
     
     height_map = create_flat_terrain()
@@ -597,25 +597,91 @@ def test_capture_point_offset(scorer: TerrainSafetyScorer):
     vel_side = torch.tensor([[0.0, 0.3, 0.0]])
     _, debug_side = scorer(height_map, vel_side, return_debug_info=True)
     
-    # 验证捕获点偏移方向
-    cap_zero = debug_zero['capture_offset'][0]  # [2, H, W]
-    cap_forward = debug_forward['capture_offset'][0]
-    cap_side = debug_side['capture_offset'][0]
+    # 验证捕获点位置 (现在是统一的 [2] 向量)
+    cap_zero = debug_zero['capture_point'][0]  # [2]
+    cap_forward = debug_forward['capture_point'][0]  # [2]
+    cap_side = debug_side['capture_point'][0]  # [2]
     
     # 静止时捕获点在原点附近
-    assert torch.abs(cap_zero).mean() < 0.01, "Zero velocity should have zero capture offset"
+    assert torch.abs(cap_zero).max() < 0.01, "Zero velocity should have capture point at origin"
     
     # 向前行走时捕获点向前偏移 (x 方向)
-    assert cap_forward[0].mean() > 0, "Forward velocity should have positive x capture offset"
+    assert cap_forward[0] > 0, "Forward velocity should have positive x capture point"
+    assert torch.abs(cap_forward[1]) < 0.01, "Forward velocity should have ~zero y capture point"
     
     # 向侧面行走时捕获点向侧面偏移 (y 方向)
-    assert cap_side[1].mean() > 0, "Side velocity should have positive y capture offset"
+    assert cap_side[1] > 0, "Side velocity should have positive y capture point"
+    assert torch.abs(cap_side[0]) < 0.01, "Side velocity should have ~zero x capture point"
+    
+    # 验证 z_ratio
+    z_ratio_flat = debug_forward['z_ratio'][0]
+    assert torch.allclose(z_ratio_flat, torch.ones_like(z_ratio_flat), atol=0.01), \
+        "Flat terrain should have z_ratio ≈ 1.0"
     
     print(f"  Alpha value: {debug_forward['alpha']:.3f}")
+    print(f"  Capture point (forward): ({cap_forward[0]:.3f}, {cap_forward[1]:.3f})")
+    print(f"  Capture point (side): ({cap_side[0]:.3f}, {cap_side[1]:.3f})")
     print("  Zero velocity → capture at origin: ✓")
     print("  Forward velocity → capture ahead: ✓")
     print("  Side velocity → capture to side: ✓")
-    print("  [PASS] Capture point offset test passed!")
+    print("  Flat terrain z_ratio ≈ 1.0: ✓")
+    print("  [PASS] Unified capture point test passed!")
+
+
+def test_z_ratio_correction(scorer: TerrainSafetyScorer):
+    """测试 VHIP 高度修正系数 z_ratio"""
+    print("\n" + "="*60)
+    print("Test: VHIP Height Correction (z_ratio)")
+    print("="*60)
+    
+    # 创建深坑地形
+    pit_map = create_pit_terrain(pit_depth=0.5)
+    # 创建上台阶地形
+    step_up_map = create_step_up_terrain(step_height=0.2)
+    
+    vel_forward = torch.tensor([[0.3, 0.0, 0.0]])
+    
+    _, debug_pit = scorer(pit_map, vel_forward, return_debug_info=True)
+    _, debug_step = scorer(step_up_map, vel_forward, return_debug_info=True)
+    
+    z_ratio_pit = debug_pit['z_ratio'][0]
+    z_ratio_step = debug_step['z_ratio'][0]
+    
+    # 坑区域 (height_map > 0) 应该有 z_ratio > 1
+    pit_region = pit_map[0] > 0.3
+    flat_region_pit = pit_map[0].abs() < 0.1
+    
+    z_ratio_in_pit = z_ratio_pit[pit_region].mean().item()
+    z_ratio_flat_pit = z_ratio_pit[flat_region_pit].mean().item()
+    
+    print(f"  Pit terrain:")
+    print(f"    z_ratio in pit region: {z_ratio_in_pit:.3f} (expected > 1)")
+    print(f"    z_ratio in flat region: {z_ratio_flat_pit:.3f} (expected ≈ 1)")
+    
+    assert z_ratio_in_pit > 1.0, f"z_ratio in pit should be > 1, got {z_ratio_in_pit}"
+    assert abs(z_ratio_flat_pit - 1.0) < 0.1, f"z_ratio in flat region should be ≈ 1, got {z_ratio_flat_pit}"
+    
+    # 上台阶区域 (height_map < 0) 应该有 z_ratio < 1
+    step_region = step_up_map[0] < -0.1
+    z_ratio_on_step = z_ratio_step[step_region].mean().item()
+    
+    print(f"  Step-up terrain:")
+    print(f"    z_ratio on step region: {z_ratio_on_step:.3f} (expected < 1)")
+    
+    assert z_ratio_on_step < 1.0, f"z_ratio on step should be < 1, got {z_ratio_on_step}"
+    
+    # 验证 z_ratio 对 S_dyn 的影响
+    # 坑区域的 S_dyn 应该更负（因为距离被放大）
+    S_dyn_pit = debug_pit['S_dyn'][0]
+    S_dyn_step = debug_step['S_dyn'][0]
+    
+    print(f"  S_dyn effect:")
+    print(f"    S_dyn in pit region: {S_dyn_pit[pit_region].mean().item():.3f}")
+    print(f"    S_dyn in flat region: {S_dyn_pit[flat_region_pit].mean().item():.3f}")
+    
+    print("  Pit has z_ratio > 1 (harder to reach): ✓")
+    print("  Step-up has z_ratio < 1 (easier to reach): ✓")
+    print("  [PASS] VHIP height correction test passed!")
 
 
 def test_slope_normalization(scorer: TerrainSafetyScorer):
@@ -770,16 +836,16 @@ def main():
         grid_h=17,
         grid_w=11,
         z_nominal=0.75,
-        local_var_threshold=0.01,      # 局部方差阈值（用于边缘检测）
+        local_var_threshold=0.03,      # 局部方差阈值（用于边缘检测）
         height_drop_threshold=0.3,
         behind_threshold=0.3,
         behind_vel_threshold=0.1,
-        behind_penalty=-3.0,           # 身后区域轻惩罚
-        steep_penalty=-8.0,            # 边缘中等惩罚
-        pit_penalty=-12.0,             # 深坑重惩罚
+        behind_penalty=-1.5,           # 身后区域轻惩罚
+        steep_penalty=-4.0,            # 边缘中等惩罚
+        pit_penalty=-6.0,             # 深坑重惩罚
         learnable_sigma=True,
         init_sigma_dyn=0.3,
-        init_sigma_geo=0.2,
+        init_sigma_geo=0.5,
         learnable_alpha=True,
         init_alpha=1.0,
     )
@@ -792,7 +858,8 @@ def main():
     test_device_handling(scorer)
     test_pit_detection(scorer)
     test_behind_mask_dot_product(scorer)
-    test_capture_point_offset(scorer)
+    test_capture_point_unified(scorer)
+    test_z_ratio_correction(scorer)
     test_slope_normalization(scorer)
     test_local_variance(scorer)
     test_soft_penalty_values(scorer)
