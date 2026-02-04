@@ -154,14 +154,14 @@ class Terrain:
             # stepping_stones 地形（从 extreme-parkour 迁移）
             idx = 0
             stepping_stones_terrain(terrain, 
-                                    stone_size=0.5 - 0.15*difficulty, 
+                                    stone_size=0.4 - 0.15*difficulty, 
                                     stone_distance=0.08 + 0.3*difficulty,
                                     pad_height=0)
             # 不添加表面粗糙度，依赖域随机化提供鲁棒性
         elif choice < self.proportions[1]:
             # parkour 地形（从 extreme-parkour 迁移）
             idx = 1
-            x_range = [-0.1, 0.1 + 0.3*difficulty]
+            x_range = [0.1, 0.1 + 0.3*difficulty]
             y_range = [0.2, 0.3 + 0.1*difficulty]
             stone_len = [0.9 - 0.3*difficulty, 1 - 0.2*difficulty]
             incline_height = 0.25*difficulty
@@ -213,7 +213,7 @@ class Terrain:
                 x_range=0.31,
                 y_range=[-0.01, 0.01],
                 half_valid_width=1.5,
-                step_height = 0.05 + 0.1 * difficulty,
+                step_height = 0.10 + 0.15 * difficulty,
                 pad_width=0.1,
                 pad_height=0,
                 num_groups=3,
@@ -221,7 +221,7 @@ class Terrain:
         # square terrain
         elif choice < self.proportions[5]:
             idx = 5
-            step_height = 0.1 + 0.05 * difficulty
+            step_height = 0.15 + 0.10 * difficulty
             terrain_utils.pyramid_stairs_terrain(terrain, step_width=0.31, step_height=-step_height, platform_size=3.)
         elif choice < self.proportions[6]:
             idx = 6
@@ -515,13 +515,18 @@ def stepping_stones_terrain(terrain,
     # 行数根据 terrain.length 自动计算
     num_rows = terrain.length // (stone_size + stone_distance)
 
-    # 生成石块网络
+    # 生成石块网络：y 方向只有 2 列（中轴线两侧各一列）
+    # 计算两列石柱的 y 坐标（关于中轴线对称）
+    y_positions = [
+        mid_y - stone_distance // 2 - stone_size // 2,  # 中轴线左侧
+        mid_y + stone_distance // 2 + stone_size // 2,  # 中轴线右侧
+    ]
+    
     for col in range(num_cols):
-        for row in range(num_rows):
-            # 第 col 列石块的 x 中心
-            center_x = stone_region_start + col * (stone_size + stone_distance) + stone_size // 2
-            # 第 row 行石块的 y 中心（从 y=0 开始，均匀分布）
-            center_y = row * (stone_size + stone_distance) + stone_size // 2
+        # 第 col 列石块的 x 中心
+        center_x = stone_region_start + col * (stone_size + stone_distance) + stone_size // 2
+        
+        for center_y in y_positions:
             # 填充石块区域（从石块中心开始反推边界）
             x_start = center_x - stone_size // 2
             x_end = x_start + stone_size
