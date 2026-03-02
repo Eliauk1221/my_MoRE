@@ -323,6 +323,15 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         
         # 构建 height_map [num_envs, grid_h, grid_w]，与 terrain_xyz[:, :, 2] 保持一致
         self.height_map = heights_normalized.reshape(self.num_envs, grid_h, grid_w)
+        
+        # ===== 对齐校验: terrain_xyz[...,2] 与 height_map 展平后必须一致 =====
+        if self.common_step_counter < 3:
+            max_diff = (self.terrain_xyz[:, :, 2] - self.height_map.reshape(self.num_envs, -1)).abs().max().item()
+            assert max_diff < 1e-6, (
+                f"[AlignCheck] terrain_xyz z vs height_map mismatch! max_diff={max_diff:.2e}"
+            )
+            print(f"[AlignCheck] step={self.common_step_counter}, "
+                  f"terrain_xyz[...,2] vs height_map max_diff={max_diff:.2e} -- OK")
 
     def compute_reward(self):
         """ Compute rewards
