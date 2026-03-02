@@ -279,7 +279,7 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         clearance_height_target = -0.6
         class scales:
             tracking_lin_vel = 2
-            tracking_ang_vel = 2
+            tracking_ang_vel = 0.5
 
             dof_acc = -5e-7
             dof_vel = -1e-3
@@ -300,7 +300,7 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
             no_fly = 0.25
             feet_lateral_distance = 0.5
             feet_lateral_distance_max = -1.0  # 惩罚脚间距过大
-            feet_slippage = -0.25
+            feet_slippage = -0.75
             feet_contact_force = -2.5e-4
             feet_force_rate = -2.5e-4
             feet_contact_momentum = -2.5e-4
@@ -310,6 +310,8 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
             cheat = -2
             feet_edge = -0.5
             y_offset_pen = -0.5
+            termination = -10.0
+            feet_safe_landing = 1.5
 
         feet_contact_force_range = [200. , 600.]
 
