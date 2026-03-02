@@ -464,9 +464,25 @@ class AMPOnPolicyRunnerMulti:
             if terrain_attn is not None and terrain_attn.last_attention_weights is not None:
                 attn_weights = terrain_attn.last_attention_weights  # [B, 187]
                 
-                # 注意力熵 (越低越专注)
+                # 注意力熵 (越低越专注) — 平均后权重
                 entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-8), dim=-1).mean()
-                self.writer.add_scalar('Attention/entropy', entropy.item(), locs['it'])
+                self.writer.add_scalar('Attention/entropy_avg', entropy.item(), locs['it'])
+                
+                # ===== Per-head 注意力熵 =====
+                per_head_w = getattr(terrain_attn, 'last_attention_weights_per_head', None)
+                if per_head_w is not None:
+                    # per_head_w: [B, num_heads, 187]
+                    per_head_entropy = -torch.sum(
+                        per_head_w * torch.log(per_head_w + 1e-8), dim=-1
+                    )  # [B, num_heads]
+                    head_entropy_mean = per_head_entropy.mean().item()
+                    head_entropy_std = per_head_entropy.std().item()
+                    head_entropy_min = per_head_entropy.min(dim=-1).values.mean().item()
+                    head_entropy_max = per_head_entropy.max(dim=-1).values.mean().item()
+                    self.writer.add_scalar('Attention/per_head_entropy_mean', head_entropy_mean, locs['it'])
+                    self.writer.add_scalar('Attention/per_head_entropy_std', head_entropy_std, locs['it'])
+                    self.writer.add_scalar('Attention/per_head_entropy_min', head_entropy_min, locs['it'])
+                    self.writer.add_scalar('Attention/per_head_entropy_max', head_entropy_max, locs['it'])
                 
                 # Top-10 权重占比 (越高越集中)
                 top10_values, _ = torch.topk(attn_weights, 10, dim=-1)

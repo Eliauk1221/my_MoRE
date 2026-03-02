@@ -43,7 +43,7 @@ class TerrainAttentionEncoder(nn.Module):
     - 上路: 5x5 CNN 提取几何特征（高度差、梯度等）
     - 下路: 原始 (x,y,z) 坐标直接使用
     - MHA 内部处理 K/V 投影，只需手动投影 Q
-    - use_pre_ln: 可选的 Pre-LN + 残差结构（旧模型兼容）
+    - use_pre_ln: 可选的 Pre-LN
     """
     def __init__(self, 
                  grid_h=17, 
@@ -52,7 +52,7 @@ class TerrainAttentionEncoder(nn.Module):
                  hidden_dim=128,
                  num_heads=8,
                  output_dim=64,
-                 use_pre_ln=False):  # 新增参数：是否使用 Pre-LN（用于兼容旧模型）
+                 use_pre_ln=True):  # 新增参数：是否使用 Pre-LN
         super().__init__()
         
         self.grid_h = grid_h
@@ -95,7 +95,8 @@ class TerrainAttentionEncoder(nn.Module):
         self.output_proj = nn.Linear(hidden_dim, output_dim)
         
         # 存储注意力权重用于可视化和监控
-        self.last_attention_weights = None
+        self.last_attention_weights = None       # [B, 187] 平均后权重（兼容旧代码）
+        self.last_attention_weights_per_head = None  # [B, num_heads, 187] per-head 权重
         
     def forward(self, height_map, terrain_xyz, obs, attn_bias=None):
         """
@@ -155,15 +156,18 @@ class TerrainAttentionEncoder(nn.Module):
             attn_mask = attn_mask.reshape(B * self.num_heads, 1, self.num_points)  # [B * num_heads, 1, 187]
         
         # ===== 多头交叉注意力 =====
-        attn_output, attn_weights = self.multihead_attn(
+        attn_output, attn_weights_per_head = self.multihead_attn(
             query=Q_input,
             key=kv_input_normed,
             value=kv_input_normed,
-            attn_mask=attn_mask
-        )  # attn_output: [B, 1, hidden], attn_weights: [B, 1, 187]
+            attn_mask=attn_mask,
+            average_attn_weights=False
+        )  # attn_output: [B, 1, hidden], attn_weights_per_head: [B, num_heads, 1, 187]
         
-        # 保存注意力权重用于可视化
-        self.last_attention_weights = attn_weights.squeeze(1).detach()  # [B, 187]
+        # 保存 per-head 权重: [B, num_heads, 187]
+        self.last_attention_weights_per_head = attn_weights_per_head.squeeze(2).detach()
+        # 保存平均权重（兼容旧可视化代码）: [B, 187]
+        self.last_attention_weights = self.last_attention_weights_per_head.mean(dim=1)
         
         # 保存偏置用于指标计算
         self.last_attn_bias = attn_bias.detach() if attn_bias is not None else None
