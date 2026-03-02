@@ -155,7 +155,7 @@ class Terrain:
             idx = 0
             stepping_stones_terrain(terrain, 
                                     stone_size=0.4 - 0.15*difficulty, 
-                                    stone_distance=0.08 + 0.3*difficulty,
+                                    stone_distance=0.08 + 0.4*difficulty,
                                     pad_height=0)
             # 不添加表面粗糙度，依赖域随机化提供鲁棒性
         elif choice < self.proportions[1]:
@@ -196,7 +196,7 @@ class Terrain:
                                 platform_len=2.5, 
                                 platform_height=0, 
                                 num_gaps=7,
-                                gap_size=0.05 + 0.4 * difficulty,   
+                                gap_size=0.1 + 0.4 * difficulty,   
                                 x_range=[0.75, 2], # platform x length
                                 y_range=[-0.1, 0.1],
                                 half_valid_width=1.5,
@@ -213,7 +213,7 @@ class Terrain:
                 x_range=0.31,
                 y_range=[-0.01, 0.01],
                 half_valid_width=1.5,
-                step_height = 0.10 + 0.15 * difficulty,
+                step_height = 0.20 + 0.15 * difficulty,
                 pad_width=0.1,
                 pad_height=0,
                 num_groups=3,
