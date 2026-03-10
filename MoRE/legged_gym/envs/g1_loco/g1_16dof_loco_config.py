@@ -279,7 +279,7 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         clearance_height_target = -0.6
         class scales:
             tracking_lin_vel = 2
-            tracking_ang_vel = 0.5
+            tracking_ang_vel = 1.5
 
             dof_acc = -5e-7
             dof_vel = -1e-3
@@ -300,7 +300,7 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
             no_fly = 0.25
             feet_lateral_distance = 0.5
             feet_lateral_distance_max = -1.0  # 惩罚脚间距过大
-            feet_slippage = -0.75
+            feet_slippage = -0.25
             feet_contact_force = -2.5e-4
             feet_force_rate = -2.5e-4
             feet_contact_momentum = -2.5e-4
@@ -310,14 +310,12 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
             cheat = -2
             feet_edge = -0.5
             y_offset_pen = -0.5
-            termination = -10.0
-            feet_safe_landing = 1.5
 
         feet_contact_force_range = [200. , 600.]
 
 
 class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
-    runner_class_name = 'AMPOnPolicyRunnerMulti'
+    runner_class_name = 'AMPOnPolicyRunnerMulti'  # 决定用哪个 runner
 
     class policy:
         init_noise_std = 0.8
@@ -352,8 +350,8 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
 
     class runner( LeggedRobotCfgPPO.runner ):
         num_amp_frames = 5
-        policy_class_name = "ActorCriticDepth"
-        algorithm_class_name = "AMPPPOMulti"
+        policy_class_name = "ActorCriticDepth"  # 决定用哪个 policy 网络
+        algorithm_class_name = "AMPPPOMulti"  # 决定用哪个算法
 
         use_lerp = False
         max_iterations = 50000

@@ -70,7 +70,7 @@ class AMPOnPolicyRunnerMulti:
         self.env = env
         self.obs_history_len = self.env.obs_history_len
         self.use_depth = False
-        if self.env.cfg.depth.use_camera or self.env.cfg.depth.warp_camera:
+        if self.env.cfg.depth.use_camera or self.env.cfg.depth.warp_camera:  # 如果环境配置里说要用相机深度图，或者 warp camera 开启
             self.use_depth = True
             self.depth_shape = self.env.cfg.depth.resized
 
@@ -241,8 +241,8 @@ class AMPOnPolicyRunnerMulti:
         self.alg.actor_critic.train() # switch to train mode (for dropout for example)
 
         # process trajectory history
-        self.trajectory_history = torch.zeros(size=(self.env.num_envs, self.obs_history_len, self.env.num_obs), device=self.device)
-        self.trajectory_history = torch.concat((self.trajectory_history[:, 1:], obs.unsqueeze(1)), dim=1)
+        self.trajectory_history = torch.zeros(size=(self.env.num_envs, self.obs_history_len, self.env.num_obs), device=self.device)  # 用来存每个环境最近若干步地观测历史
+        self.trajectory_history = torch.concat((self.trajectory_history[:, 1:], obs.unsqueeze(1)), dim=1)  # 将当前 obs 插入历史队列末尾，同时丢掉最旧的一帧
         if self.use_amp:
             self.amp_obs_frames = torch.zeros(size=(self.env.num_envs, self.num_amp_frames, self.env.num_amp_obs), device=self.device)
             self.amp_obs_frames = torch.concat((self.amp_obs_frames[:, 1:], amp_obs.unsqueeze(1)), dim=1)
@@ -278,19 +278,19 @@ class AMPOnPolicyRunnerMulti:
             attn_bias_beta = self.compute_attn_bias_beta(it)
             
             # Rollout
-            with torch.inference_mode():
+            with torch.inference_mode():  # 只做前向推理，不计算梯度
                 for i in range(self.num_steps_per_env):
                     history = self.trajectory_history
-                    if infos["depth"] is not None:
+                    if infos["depth"] is not None:  # 检查深度图数据是否存在
                         depth_image = infos['depth']
-                    if self.use_depth:
-                        obs = (obs, depth_image)
+                    if self.use_depth:  # 检查模型是否要用深度图
+                        obs = (obs, depth_image)  # 将原来的 obs 改为一个元组
                     
                     # ===== 获取地形注意力数据 =====
                     terrain_data = None
                     if self.use_terrain_attention:
-                        terrain_data = {
-                            'height_map': self.env.height_map.clone().to(self.device),
+                        terrain_data = {  # 开始创建一个字典
+                            'height_map': self.env.height_map.clone().to(self.device),  # .clone（） 表示复制一份新的张量
                             'terrain_xyz': self.env.terrain_xyz.clone().to(self.device)
                         }
                         # 添加物理引导偏置所需数据

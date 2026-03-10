@@ -98,10 +98,10 @@ class AMPPPOMulti:
         # PPO components
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
-        self.storage = None # initialized later
+        self.storage = None # initialized later, storage是用来存 rollout 数据的缓冲区/存储区
 
         self.optimizer = optim.AdamW(self.actor_critic.parameters(), lr=self.policy_learning_rate)
-        self.transition = RolloutStorage.Transition()
+        self.transition = RolloutStorage.Transition()  # transition指一次状态转移（一次状态转移包含一个动作、一个观测、一个奖励、一个完成标志）
 
         # PPO parameters
         self.clip_param = clip_param

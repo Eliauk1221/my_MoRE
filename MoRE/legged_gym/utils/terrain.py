@@ -161,7 +161,7 @@ class Terrain:
         elif choice < self.proportions[1]:
             # parkour 地形（从 extreme-parkour 迁移）
             idx = 1
-            x_range = [0.1, 0.1 + 0.3*difficulty]
+            x_range = [0.1, 0.2 + 0.3*difficulty]
             y_range = [0.2, 0.3 + 0.1*difficulty]
             stone_len = [0.9 - 0.3*difficulty, 1 - 0.2*difficulty]
             incline_height = 0.25*difficulty

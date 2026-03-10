@@ -322,7 +322,7 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         self.terrain_xyz[:, :, 2] = heights_normalized  # z: [-1, 1]
         
         # 构建 height_map [num_envs, grid_h, grid_w]，与 terrain_xyz[:, :, 2] 保持一致
-        self.height_map = heights_normalized.reshape(self.num_envs, grid_h, grid_w)
+        self.height_map = heights_normalized.reshape(self.num_envs, grid_h, grid_w)  # 把原本一维排列的高度点，重新排成二维矩阵
         
         # ===== 对齐校验: terrain_xyz[...,2] 与 height_map 展平后必须一致 =====
         if self.common_step_counter < 3:
