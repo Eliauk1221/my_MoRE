@@ -226,6 +226,7 @@ class AMPPPOMulti:
         mean_expert_pred = 0
         mean_agent_acc = 0
         mean_demo_acc = 0
+        mean_terrain_attn_grad_norm = 0
         
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -371,6 +372,22 @@ class AMPPPOMulti:
             # Gradient step
             self.optimizer.zero_grad()
             loss.backward()
+
+            # 记录注意力模块梯度范数，监控是否有有效训练信号流入 attention 分支
+            terrain_attn_grad_norm = 0.0
+            terrain_attn_module = getattr(self.actor_critic, 'terrain_attention', None)
+            if terrain_attn_module is not None:
+                grad_sq_sum = 0.0
+                has_grad = False
+                for p in terrain_attn_module.parameters():
+                    if p.grad is not None:
+                        g = p.grad.detach()
+                        grad_sq_sum += torch.sum(g * g).item()
+                        has_grad = True
+                if has_grad:
+                    terrain_attn_grad_norm = grad_sq_sum ** 0.5
+            mean_terrain_attn_grad_norm += terrain_attn_grad_norm
+
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
 
             if self.device != 'cuda:0':
@@ -397,8 +414,9 @@ class AMPPPOMulti:
         mean_expert_pred /= num_updates
         mean_agent_acc /= num_updates
         mean_demo_acc /= num_updates
+        mean_terrain_attn_grad_norm /= num_updates
         
         self.storage.clear()
 
         return mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss, mean_policy_pred, mean_expert_pred,  \
-                mean_agent_acc, mean_demo_acc
+                mean_agent_acc, mean_demo_acc, mean_terrain_attn_grad_norm

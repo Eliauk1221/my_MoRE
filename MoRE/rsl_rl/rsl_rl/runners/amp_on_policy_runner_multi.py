@@ -395,7 +395,8 @@ class AMPOnPolicyRunnerMulti:
                 self.alg.compute_returns(critic_obs, history)
             
             mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss, \
-            mean_policy_pred, mean_expert_pred, mean_agent_acc, mean_demo_acc = self.alg.update()
+            mean_policy_pred, mean_expert_pred, mean_agent_acc, mean_demo_acc, \
+            mean_terrain_attn_grad_norm = self.alg.update()
             stop = time.time()
             learn_time = stop - start
             if self.log_dir is not None:
@@ -457,6 +458,13 @@ class AMPOnPolicyRunnerMulti:
         self.writer.add_scalar('Perf/total_fps', fps, locs['it'])
         self.writer.add_scalar('Perf/collection time', locs['collection_time'], locs['it'])
         self.writer.add_scalar('Perf/learning_time', locs['learn_time'], locs['it'])
+        if 'mean_terrain_attn_grad_norm' in locs:
+            self.writer.add_scalar('Attention/grad_norm', locs['mean_terrain_attn_grad_norm'], locs['it'])
+        if self.use_terrain_attention and hasattr(self.env, 'height_clip_ratio') and self.env.height_clip_ratio is not None:
+            clip_ratio = self.env.height_clip_ratio
+            if isinstance(clip_ratio, torch.Tensor):
+                clip_ratio = clip_ratio.detach().item()
+            self.writer.add_scalar('Attention/height_clip_ratio', clip_ratio, locs['it'])
         
         # ===== 地形注意力指标 =====
         if self.use_terrain_attention and hasattr(self.alg.actor_critic, 'terrain_attention'):

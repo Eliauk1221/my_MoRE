@@ -59,10 +59,12 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
             grid_w = self.cfg.terrain_attention.grid_w
             self.terrain_xyz = torch.zeros(self.num_envs, grid_h * grid_w, 3, dtype=torch.float, device=self.device, requires_grad=False)
             self.height_map = torch.zeros(self.num_envs, grid_h, grid_w, dtype=torch.float, device=self.device, requires_grad=False)
+            self.height_clip_ratio = torch.tensor(0.0, device=self.device)
         else:
             self.use_terrain_attention = False
             self.terrain_xyz = None
             self.height_map = None
+            self.height_clip_ratio = None
 
     def reset_idx(self, env_ids):
         super().reset_idx(env_ids)
@@ -303,10 +305,13 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         if not isinstance(self.measured_heights, torch.Tensor) or self.measured_heights.dim() == 0:
             # 使用零值作为占位符
             heights_normalized = torch.zeros(self.num_envs, num_points, device=self.device)
+            self.height_clip_ratio = torch.tensor(0.0, device=self.device)
         else:
             # 计算相对高度（与 privileged_obs 使用相同的公式）
             # heights = robot_z - base_height - terrain_z
             heights_raw = self.root_states[:, 2].unsqueeze(1) - self.cfg.normalization.base_height - self.measured_heights
+            # 记录 clip 比例，用于诊断地形高度信息是否在输入端饱和
+            self.height_clip_ratio = ((heights_raw < -1.) | (heights_raw > 1.)).float().mean()
             
             # ===== 归一化处理：只 clip，不乘 scale =====
             # 保持 z 与 x/y 相同的尺度范围 [-1, 1]
