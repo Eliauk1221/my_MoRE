@@ -331,7 +331,7 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         terrain_attn_hidden_dim = 128
         terrain_attn_num_heads = 8
         terrain_attn_output_dim = 64
-        terrain_attn_use_pre_ln = True  # 是否使用 Pre-LN（旧模型兼容，新训练默认 False）
+        terrain_attn_use_pre_ln = False  # 是否使用 Pre-LN（旧模型兼容，新训练默认 False）
         
         # ===== 消融实验开关 (需与 terrain_attention 配置一致) =====
         include_depth_in_actor = False    # 是否在 actor 输入中包含 depth_feature
