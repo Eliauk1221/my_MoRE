@@ -279,7 +279,7 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         clearance_height_target = -0.6
         class scales:
             tracking_lin_vel = 2
-            tracking_ang_vel = 1.5
+            tracking_ang_vel = 2
 
             dof_acc = -5e-7
             dof_vel = -1e-3

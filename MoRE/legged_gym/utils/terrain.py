@@ -154,8 +154,9 @@ class Terrain:
             # stepping_stones 地形（从 extreme-parkour 迁移）
             idx = 0
             stepping_stones_terrain(terrain, 
-                                    stone_size=0.4 - 0.15*difficulty, 
-                                    stone_distance=0.08 + 0.4*difficulty,
+                                    stone_size=0.42 - 0.06*difficulty, 
+                                    pitch_x=0.50,
+                                    lane_offset=0.18,
                                     pad_height=0)
             # 不添加表面粗糙度，依赖域随机化提供鲁棒性
         elif choice < self.proportions[1]:
@@ -196,7 +197,7 @@ class Terrain:
                                 platform_len=2.5, 
                                 platform_height=0, 
                                 num_gaps=7,
-                                gap_size=0.1 + 0.4 * difficulty,   
+                                gap_size=0.05 + 0.4 * difficulty,   
                                 x_range=[0.75, 2], # platform x length
                                 y_range=[-0.1, 0.1],
                                 half_valid_width=1.5,
@@ -213,7 +214,7 @@ class Terrain:
                 x_range=0.31,
                 y_range=[-0.01, 0.01],
                 half_valid_width=1.5,
-                step_height = 0.20 + 0.15 * difficulty,
+                step_height = 0.10 + 0.15 * difficulty,
                 pad_width=0.1,
                 pad_height=0,
                 num_groups=3,
@@ -469,80 +470,67 @@ def pit_terrain(terrain, depth, platform_size=1.):
 
 def stepping_stones_terrain(terrain,
                             stone_size, 
-                            stone_distance,
-                            num_cols=8,
+                            pitch_x=0.48,
+                            lane_offset=0.18,
+                            num_cols=10,
                             platform_len=2.5,
                             platform_height=0.,
                             pit_depth=1.0,
                             pad_width=0.1,
                             pad_height=0.5):
     """
-    生成 stepping stones 地形（从 extreme-parkour 迁移，移除 goals 设置）
+    生成梅花桩地形：每个 x 位置只放一个石块，左右交替。
     
     Args:
         terrain: 地形对象
         stone_size: 石块边长 (米)
-        stone_distance: 石块间距 (米)
-        num_cols: 固定列数 (x 方向)，默认 6 列
+        pitch_x: x 方向节距 (米)，即相邻石块中心间距
+        lane_offset: 石块相对中轴线的左右偏移量 (米)
+        num_cols: 石块列数 (x 方向)
         platform_len: 起始/终点平台长度 (米)
         platform_height: 平台高度 (米)
         pit_depth: 深坑深度 (米)
         pad_width: 边缘填充宽度 (米)
         pad_height: 边缘填充高度 (米)
     """
-    # 将整个地形填充为深坑
     terrain.height_field_raw[:] = -round(pit_depth / terrain.vertical_scale)
     
-    # 将所有米制参数转换为离散单位
-    stone_size = round(stone_size / terrain.horizontal_scale)
-    stone_distance = round(stone_distance / terrain.horizontal_scale)
-    platform_len = round(platform_len / terrain.horizontal_scale)
-    platform_height = round(platform_height / terrain.vertical_scale)
-    pad_width = int(pad_width // terrain.horizontal_scale)
-    pad_height = int(pad_height // terrain.vertical_scale)
+    stone_size_px = round(stone_size / terrain.horizontal_scale)
+    pitch_x_px = round(pitch_x / terrain.horizontal_scale)
+    lane_offset_px = round(lane_offset / terrain.horizontal_scale)
+    platform_len_px = round(platform_len / terrain.horizontal_scale)
+    platform_height_px = round(platform_height / terrain.vertical_scale)
+    pad_width_px = int(pad_width // terrain.horizontal_scale)
+    pad_height_px = int(pad_height // terrain.vertical_scale)
 
-    # 计算中轴线（y 方向）
-    mid_y = terrain.length // 2 
+    mid_y = terrain.length // 2
 
-    # 生成起始平台
-    terrain.height_field_raw[0:platform_len, :] = platform_height
+    terrain.height_field_raw[0:platform_len_px, :] = platform_height_px
 
-    # 确定石块区域范围
-    stone_region_start = platform_len
-    # 根据固定列数计算石块区域结束位置
-    stone_region_end = stone_region_start + num_cols * (stone_size + stone_distance)
-    
-    # 行数根据 terrain.length 自动计算
-    num_rows = terrain.length // (stone_size + stone_distance)
+    stone_region_start = platform_len_px
 
-    # 生成石块网络：y 方向只有 2 列（中轴线两侧各一列）
-    # 计算两列石柱的 y 坐标（关于中轴线对称）
-    y_positions = [
-        mid_y - stone_distance // 2 - stone_size // 2,  # 中轴线左侧
-        mid_y + stone_distance // 2 + stone_size // 2,  # 中轴线右侧
-    ]
-    
     for col in range(num_cols):
-        # 第 col 列石块的 x 中心
-        center_x = stone_region_start + col * (stone_size + stone_distance) + stone_size // 2
-        
-        for center_y in y_positions:
-            # 填充石块区域（从石块中心开始反推边界）
-            x_start = center_x - stone_size // 2
-            x_end = x_start + stone_size
-            y_start = center_y - stone_size // 2
-            y_end = y_start + stone_size
+        center_x = stone_region_start + col * pitch_x_px + stone_size_px // 2
 
-            terrain.height_field_raw[x_start:x_end, y_start:y_end] = platform_height
+        if col % 2 == 0:
+            center_y = mid_y - lane_offset_px
+        else:
+            center_y = mid_y + lane_offset_px
 
-    # 生成终点平台（柱子区域结束后全部设为平台）
-    terrain.height_field_raw[stone_region_end:, :] = platform_height
+        x_start = center_x - stone_size_px // 2
+        x_end = x_start + stone_size_px
+        y_start = center_y - stone_size_px // 2
+        y_end = y_start + stone_size_px
 
-    # pad edges
-    terrain.height_field_raw[:, :pad_width] = pad_height
-    terrain.height_field_raw[:, -pad_width:] = pad_height
-    terrain.height_field_raw[:pad_width, :] = pad_height
-    terrain.height_field_raw[-pad_width:, :] = pad_height
+        terrain.height_field_raw[x_start:x_end, y_start:y_end] = platform_height_px
+
+    stone_region_end = stone_region_start + num_cols * pitch_x_px
+    terrain.height_field_raw[stone_region_end:, :] = platform_height_px
+
+    terrain.height_field_raw[:, :pad_width_px] = pad_height_px
+    terrain.height_field_raw[:, -pad_width_px:] = pad_height_px
+    terrain.height_field_raw[:pad_width_px, :] = pad_height_px
+    terrain.height_field_raw[-pad_width_px:, :] = pad_height_px
 
 def parkour_terrain(terrain, 
                     platform_len=2.5, 
