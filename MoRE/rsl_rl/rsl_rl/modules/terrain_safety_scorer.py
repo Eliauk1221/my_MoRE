@@ -1,12 +1,14 @@
 """
-TerrainSafetyScorer: 物理引导的地形安全打分模块
+TerrainSafetyScorer: 纯物理先验的地形安全打分模块（无可学习参数）
 
-基于 FastStair VHIP 模型和几何平坦度分析，为地形采样点生成注意力偏置。
+输出 softmax 概率分布，用作 attention 的 KL 监督目标。
 
-核心功能:
-- S_geo: 几何平坦度分数（归一化中心差分坡度 + 局部方差）
-- S_dyn: 动力学可行性分数（逐点 VHIP 捕获点，可学习 alpha）
-- 分层软掩码: 陡峭/深坑/身后区域的差异化惩罚
+核心组件:
+- S_support: 支撑面积分数（3×3 局部最小二乘平面拟合，计算 RMS 残差）
+             均匀斜坡 → 残差≈0 → 高分；台阶边缘 → 残差大 → 低分
+- S_margin:  边缘裕度分数（基于 S_support 的 danger_map 做形态学腐蚀距离变换）
+             离边缘远 → 高分；贴边 → 低分
+- behind_mask: 身后区域惩罚（速度方向投影）
 
 height_map 符号语义 (与 LeggedGym 管线一致):
 - height_map = base_z - base_height - terrain_z
@@ -22,14 +24,17 @@ from typing import Optional, Dict, Tuple, Union, List
 
 class TerrainSafetyScorer(nn.Module):
     """
-    物理引导的地形安全打分模块
+    纯物理先验的地形安全打分模块
+    
+    无任何可学习参数，所有计算均为固定物理规则。
+    输出 softmax 概率分布，作为 attention 的 KL 监督目标（detach 后使用）。
     
     输入:
         height_map: [B, grid_h, grid_w] 采样点相对基准高度的差值
         base_lin_vel: [B, 3] 机体坐标系下的质心线速度
         
     输出:
-        bias_map: [B, grid_h * grid_w] 未归一化的 logits
+        prior_dist: [B, grid_h * grid_w] softmax 概率分布
         debug_info (可选): 包含中间结果的字典
     """
     
@@ -41,61 +46,52 @@ class TerrainSafetyScorer(nn.Module):
         measured_points_y: Optional[List[float]] = None,
         dx: Optional[float] = None,
         dy: Optional[float] = None,
-        g: float = 9.81,
-        z_nominal: float = 0.75,
-        C_scaling: float = 1.0,
-        local_var_threshold: float = 0.03,
-        height_drop_threshold: float = 0.3,
+        # ===== 支撑面积分数参数 =====
+        support_scale: float = 0.02,
+        # ===== 边缘裕度参数 =====
+        danger_threshold: float = 0.02,
+        pit_threshold: float = 0.3,
+        max_margin_steps: int = 3,
+        # ===== 融合参数 =====
+        w_support: float = 1.0,
+        w_margin: float = 1.0,
+        temperature: float = 1.0,
+        # ===== 身后掩码参数 =====
         behind_threshold: float = 0.3,
         behind_vel_threshold: float = 0.1,
-        behind_penalty: float = -1.5,   # 降低：原 -3.0，防止注意力崩塌
-        steep_penalty: float = -4.0,    # 降低：原 -8.0
-        pit_penalty: float = -6.0,      # 降低：原 -12.0
-        learnable_sigma: bool = True,
-        init_sigma_dyn: float = 0.3,
-        init_sigma_geo: float = 0.5,
-        learnable_alpha: bool = True,
-        init_alpha: float = 1.0,
+        behind_penalty: float = -2.0,
     ):
         """
         Args:
-            grid_h: 采样网格高度 (对应 x 方向)
-            grid_w: 采样网格宽度 (对应 y 方向)
-            measured_points_x: x 方向采样点坐标列表
-            measured_points_y: y 方向采样点坐标列表
-            dx: x 方向采样间距 (米)，若为 None 则从 measured_points_x 自动计算
-            dy: y 方向采样间距 (米)，若为 None 则从 measured_points_y 自动计算
-            g: 重力加速度
-            z_nominal: 名义站立高度 (G1 约 0.75m)
-            C_scaling: 捕获点基础缩放系数
-            local_var_threshold: 局部方差阈值 (用于检测碎石/台阶边缘的高频起伏)
-            height_drop_threshold: 深坑检测阈值 (米，正值表示坑深)
-            behind_threshold: 身后区域掩码阈值 (米，相对速度方向的投影距离)
-            behind_vel_threshold: 触发身后掩码的最小速度 (m/s)
-            behind_penalty: 身后区域惩罚值 (轻，不优先)
-            steep_penalty: 陡坡/边缘惩罚值 (中等风险)
-            pit_penalty: 深坑惩罚值 (灾难性风险)
-            learnable_sigma: 是否学习温度参数
-            init_sigma_dyn: 动力学温度初始值
-            init_sigma_geo: 几何温度初始值
-            learnable_alpha: 是否学习捕获点缩放因子
-            init_alpha: 捕获点缩放因子初始值
+            grid_h, grid_w: 采样网格尺寸
+            measured_points_x/y: 采样点坐标列表
+            dx, dy: 采样间距（若 None 则从坐标自动计算）
+            support_scale: S_support 归一化尺度 (meter)。
+                           exp(-residual/scale) 将 RMS 残差映射到 [0,1]
+            danger_threshold: 平面拟合 RMS 残差超过此值 → 标记为危险点
+            pit_threshold: 深坑检测阈值 (meter，正值表示坑深)
+            max_margin_steps: 形态学腐蚀最大步数，决定裕度的最大感知范围
+            w_support, w_margin: S_support 与 S_margin 的融合权重
+            temperature: softmax 温度，越小分布越尖锐
+            behind_threshold: 身后区域掩码的投影距离阈值
+            behind_vel_threshold: 触发身后掩码的最小速度
+            behind_penalty: 身后区域的 logit 惩罚值
         """
         super().__init__()
         
         self.grid_h = grid_h
         self.grid_w = grid_w
         self.num_points = grid_h * grid_w
-        self.g = g
-        self.z_nominal = z_nominal
-        self.C_scaling = C_scaling
-        self.local_var_threshold = local_var_threshold
-        self.height_drop_threshold = height_drop_threshold
+        self.support_scale = support_scale
+        self.danger_threshold = danger_threshold
+        self.pit_threshold = pit_threshold
+        self.max_margin_steps = max_margin_steps
+        self.w_support = w_support
+        self.w_margin = w_margin
+        self.temperature = temperature
         self.behind_threshold = behind_threshold
         self.behind_vel_threshold = behind_vel_threshold
         self.behind_penalty = behind_penalty
-        self.steep_penalty = steep_penalty
-        self.pit_penalty = pit_penalty
         
         # ===== 默认采样点坐标 (G1 配置) =====
         if measured_points_x is None:
@@ -104,9 +100,8 @@ class TerrainSafetyScorer(nn.Module):
         if measured_points_y is None:
             measured_points_y = [-0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3, 0.4, 0.5]
         
-        # ===== 计算采样间距 (用于归一化梯度) =====
+        # ===== 计算采样间距 =====
         if dx is None:
-            # 从采样点坐标自动计算间距
             dx = (measured_points_x[-1] - measured_points_x[0]) / (len(measured_points_x) - 1)
         if dy is None:
             dy = (measured_points_y[-1] - measured_points_y[0]) / (len(measured_points_y) - 1)
@@ -114,196 +109,147 @@ class TerrainSafetyScorer(nn.Module):
         self.dx = dx
         self.dy = dy
         
-        # ===== 生成 xy 坐标网格 (register_buffer 自动管理 device) =====
+        # ===== 生成 xy 坐标网格 (用于 behind_mask) =====
         x = torch.tensor(measured_points_x, dtype=torch.float32)
         y = torch.tensor(measured_points_y, dtype=torch.float32)
-        xx, yy = torch.meshgrid(x, y, indexing='ij')  # [grid_h, grid_w]
+        xx, yy = torch.meshgrid(x, y, indexing='ij')
         grid_xy = torch.stack([xx, yy], dim=0)  # [2, grid_h, grid_w]
         self.register_buffer('grid_xy', grid_xy)
         
-        # ===== 可学习温度参数 (使用 softplus 保证正值) =====
-        # 初始化: softplus(x) ≈ x when x > 0, 所以用 inverse softplus
-        init_raw_dyn = self._inverse_softplus(init_sigma_dyn)
-        init_raw_geo = self._inverse_softplus(init_sigma_geo)
-        
-        if learnable_sigma:
-            self.raw_sigma_dyn = nn.Parameter(torch.tensor(init_raw_dyn))
-            self.raw_sigma_geo = nn.Parameter(torch.tensor(init_raw_geo))
-        else:
-            self.register_buffer('raw_sigma_dyn', torch.tensor(init_raw_dyn))
-            self.register_buffer('raw_sigma_geo', torch.tensor(init_raw_geo))
-        
-        # ===== 可学习捕获点缩放因子 =====
-        init_raw_alpha = self._inverse_softplus(init_alpha)
-        
-        if learnable_alpha:
-            self.raw_alpha = nn.Parameter(torch.tensor(init_raw_alpha))
-        else:
-            self.register_buffer('raw_alpha', torch.tensor(init_raw_alpha))
+        # ===== 预计算平面拟合卷积核 =====
+        self._register_plane_fit_kernels(dx, dy)
     
-    @staticmethod
-    def _inverse_softplus(y: float, beta: float = 1.0) -> float:
-        """计算 softplus 的逆函数: x = log(exp(y) - 1)"""
-        if y > 20:  # 避免数值溢出
-            return y
-        return torch.log(torch.exp(torch.tensor(y)) - 1).item()
-    
-    def compute_geometric_score(
-        self, 
-        height_map: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _register_plane_fit_kernels(self, dx: float, dy: float):
         """
-        计算几何平坦度分数 S_geo
+        预计算 3×3 局部最小二乘平面拟合所需的固定卷积核。
         
-        使用归一化中心差分计算坡度，以及 3x3 局部方差检测高频起伏。
+        对于中心对称的 3×3 正则网格，设计矩阵 X = [x, y, 1]，
+        其法方程 X^T X 为对角阵，残差方差有封闭解析公式:
+            var = (1/9)[Σz² − (Σxz)²/(6dx²) − (Σyz)²/(6dy²) − (Σz)²/9]
+        
+        三个卷积核分别计算 Σ(x_i·z_i)、Σ(y_i·z_i)、Σz_i。
+        """
+        # 计算 Σ(x_i · z_i) 的核：每行乘以对应的 x 偏移量
+        x_kernel = torch.tensor([
+            [-dx, -dx, -dx],
+            [  0,   0,   0],
+            [ dx,  dx,  dx]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+        
+        # 计算 Σ(y_i · z_i) 的核：每列乘以对应的 y 偏移量
+        y_kernel = torch.tensor([
+            [-dy,  0,  dy],
+            [-dy,  0,  dy],
+            [-dy,  0,  dy]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+        
+        # 计算 Σz_i 的核
+        ones_kernel = torch.ones(1, 1, 3, 3, dtype=torch.float32)
+        
+        self.register_buffer('x_kernel', x_kernel)
+        self.register_buffer('y_kernel', y_kernel)
+        self.register_buffer('ones_kernel', ones_kernel)
+        
+        self.inv_6dx2 = 1.0 / (6.0 * dx * dx)
+        self.inv_6dy2 = 1.0 / (6.0 * dy * dy)
+    
+    @torch.no_grad()
+    def _compute_plane_residual(self, height_map: torch.Tensor) -> torch.Tensor:
+        """
+        计算 3×3 窗口内局部平面拟合的 RMS 残差。
+        
+        物理含义：残差反映窗口内地面偏离平面的程度。
+        - 平坦地面 / 均匀斜坡 → 完美拟合 → 残差 ≈ 0
+        - 台阶边缘 / 缝隙边缘 → 拟合困难 → 残差大
+        
+        推导（利用正则网格对称性 Σx=Σy=Σxy=0）:
+            residual_var = (1/9)[Σz² − (Σxz)²/(6dx²) − (Σyz)²/(6dy²) − (Σz)²/9]
         
         Args:
             height_map: [B, grid_h, grid_w]
-            
         Returns:
-            S_geo: [B, grid_h, grid_w] 几何分数 (负的坡度)
-            slope: [B, grid_h, grid_w] 归一化坡度 (tan(θ))
-            local_var: [B, grid_h, grid_w] 局部方差
+            residual_rms: [B, grid_h, grid_w] RMS 残差 (meter)
         """
-        # 添加通道维度: [B, 1, H, W]
-        h = height_map.unsqueeze(1)
+        h = height_map.unsqueeze(1)  # [B, 1, H, W]
+        h_pad = F.pad(h, (1, 1, 1, 1), mode='replicate')
         
-        # ===== 归一化中心差分 (replicate padding) =====
-        # padding 顺序: (left, right, top, bottom)
-        h_pad = F.pad(h, (1, 1, 1, 1), mode='replicate')  # [B, 1, H+2, W+2]
+        sum_z  = F.conv2d(h_pad, self.ones_kernel)       # Σz_i      [B, 1, H, W]
+        sum_z2 = F.conv2d(h_pad ** 2, self.ones_kernel)   # Σz_i²
+        sum_xz = F.conv2d(h_pad, self.x_kernel)           # Σ(x_i·z_i)
+        sum_yz = F.conv2d(h_pad, self.y_kernel)           # Σ(y_i·z_i)
         
-        # 中心差分计算梯度，除以采样间距得到真实坡度
-        dh_dx = (h_pad[:, :, 2:, 1:-1] - h_pad[:, :, :-2, 1:-1]) / (2 * self.dx)  # [B, 1, H, W]
-        dh_dy = (h_pad[:, :, 1:-1, 2:] - h_pad[:, :, 1:-1, :-2]) / (2 * self.dy)  # [B, 1, H, W]
+        residual_var = (1.0 / 9.0) * (
+            sum_z2
+            - sum_xz ** 2 * self.inv_6dx2
+            - sum_yz ** 2 * self.inv_6dy2
+            - sum_z ** 2 / 9.0
+        )
+        residual_var = residual_var.clamp(min=0)  # 数值保护
         
-        # 坡度幅值 (tan(θ))
-        slope = torch.sqrt(dh_dx ** 2 + dh_dy ** 2 + 1e-8).squeeze(1)  # [B, H, W]
-        
-        # ===== 3x3 局部方差 (replicate padding，避免边界伪高方差) =====
-        # 使用 replicate padding 计算局部均值
-        local_mean = F.avg_pool2d(h_pad, kernel_size=3, stride=1, padding=0)  # [B, 1, H, W]
-        
-        # 计算 (h - local_mean)^2，需要重新 pad
-        h_centered = h - local_mean
-        h_centered_pad = F.pad(h_centered, (1, 1, 1, 1), mode='replicate')
-        local_var = F.avg_pool2d(h_centered_pad ** 2, kernel_size=3, stride=1, padding=0).squeeze(1)  # [B, H, W]
-        
-        # 几何分数 = 负的坡度
-        S_geo = -slope
-        
-        return S_geo, slope, local_var
+        return torch.sqrt(residual_var + 1e-8).squeeze(1)  # [B, H, W]
     
-    def compute_dynamic_score(
-        self,
-        height_map: torch.Tensor,
-        base_lin_vel: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    @torch.no_grad()
+    def _compute_margin(self, danger_mask: torch.Tensor) -> torch.Tensor:
         """
-        计算动力学可行性分数 S_dyn (方案A: 统一捕获点 + VHIP高度修正)
+        基于形态学腐蚀计算到最近危险区域的 Chebyshev 距离。
         
-        物理意义:
-        1. 使用名义高度计算 唯一的 理想捕获点位置
-        2. 计算每个采样点到这个统一捕获点的距离
-        3. 根据每个点的实际高度微调: 坑 = 更难到达, 凸起 = 更容易到达
+        每轮腐蚀将安全区域向内收缩一个像素（3×3 min pooling）。
+        某点存活的轮数 = 到最近危险点的距离。
+        
+        使用 replicate padding 避免网格边界被误判为危险区域。
         
         Args:
-            height_map: [B, grid_h, grid_w]
-            base_lin_vel: [B, 3] 机体坐标系下的线速度
-            
+            danger_mask: [B, grid_h, grid_w] bool, True = 危险
         Returns:
-            S_dyn: [B, grid_h, grid_w] 动力学分数 (负的修正距离平方)
-            omega: [B, grid_h, grid_w] 逐点自然频率 (用于调试)
-            capture_point: [B, 2] 统一的理想捕获点位置
-            z_ratio: [B, grid_h, grid_w] VHIP 高度修正系数
-            alpha: float 当前 alpha 值
+            S_margin: [B, grid_h, grid_w] 归一化裕度分数 [0, 1]
+                      1 = 远离边缘（存活所有腐蚀轮次）
+                      0 = 在危险点上或紧邻危险点
         """
-        B = height_map.shape[0]
+        safe = (~danger_mask).float().unsqueeze(1)  # [B, 1, H, W]
+        margin = torch.zeros_like(safe)
         
-        # ===== 可学习的 alpha 缩放因子 =====
-        alpha = F.softplus(self.raw_alpha) + 1e-6
+        for _ in range(self.max_margin_steps):
+            margin += safe
+            # min pooling (= erosion): 3×3 邻域中有任一 0 → 输出 0
+            safe_pad = F.pad(safe, (1, 1, 1, 1), mode='replicate')
+            safe = -F.max_pool2d(-safe_pad, 3, 1, 0)
         
-        # ===== 1. 使用名义高度计算统一的捕获点 =====
-        # omega_nominal = sqrt(g / z_nominal) 是固定值
-        omega_nominal = (self.g / self.z_nominal) ** 0.5
-        
-        # 提取 xy 方向速度
-        v_xy = base_lin_vel[:, :2]  # [B, 2]
-        
-        # 统一捕获点: P_capture = alpha * C_scaling * v / omega_nominal
-        capture_point = alpha * self.C_scaling * v_xy / omega_nominal  # [B, 2]
-        
-        # ===== 2. 计算每个采样点到统一捕获点的基础距离 =====
-        # 扩展 grid_xy 到 batch
-        grid_xy = self.grid_xy.unsqueeze(0).expand(B, -1, -1, -1)  # [B, 2, H, W]
-        
-        # 扩展 capture_point 到网格形状
-        capture_point_expanded = capture_point.view(B, 2, 1, 1)  # [B, 2, 1, 1]
-        
-        # 基础距离平方 (所有点到同一个捕获点的距离)
-        base_dist_sq = ((grid_xy - capture_point_expanded) ** 2).sum(dim=1)  # [B, H, W]
-        
-        # ===== 3. VHIP 高度修正 =====
-        # 物理意义: 坑内的点需要更大的能量/步幅才能跨越，等效于"更难到达"
-        # 有效高度 = z_nominal + height_map (正值=坑, 有效高度增加)
-        effective_z = self.z_nominal + height_map  # [B, H, W]
-        effective_z = effective_z.clamp(min=0.1)  # 防止除零
-        
-        # 高度比率: z_ratio > 1 表示坑 (更难到达), z_ratio < 1 表示凸起 (更容易到达)
-        z_ratio = (effective_z / self.z_nominal).clamp(0.5, 2.0)  # [B, H, W]
-        
-        # 修正后的距离: 坑区域距离放大, 凸起区域距离缩小
-        adjusted_dist_sq = base_dist_sq * z_ratio  # [B, H, W]
-        
-        # ===== 4. 计算逐点 omega (用于调试/可视化) =====
-        omega = torch.sqrt(self.g / effective_z)  # [B, H, W]
-        
-        # ===== 5. 动力学分数 = 负的修正距离平方 =====
-        S_dyn = -adjusted_dist_sq
-        
-        return S_dyn, omega, capture_point, z_ratio, alpha.item()
+        return (margin / self.max_margin_steps).squeeze(1)  # [B, H, W]
     
+    @torch.no_grad()
     def compute_behind_mask(
         self,
         base_lin_vel: torch.Tensor,
         B: int
     ) -> torch.Tensor:
         """
-        计算身后区域掩码 (点积半平面)
-        
-        使用速度方向的投影判断，而非轴对齐判断。
+        计算身后区域掩码（速度方向的点积半平面判断）。
         
         Args:
             base_lin_vel: [B, 3] 机体坐标系下的线速度
             B: batch size
-            
         Returns:
-            behind_mask: [B, grid_h, grid_w] 身后区域布尔掩码
+            behind_mask: [B, grid_h, grid_w] bool
         """
-        # 动态扩展网格
         grid_xy = self.grid_xy.unsqueeze(0).expand(B, -1, -1, -1)  # [B, 2, H, W]
-        grid_x = grid_xy[:, 0, :, :]  # [B, H, W]
-        grid_y = grid_xy[:, 1, :, :]  # [B, H, W]
+        grid_x = grid_xy[:, 0, :, :]
+        grid_y = grid_xy[:, 1, :, :]
         
-        v_x = base_lin_vel[:, 0].view(B, 1, 1)  # [B, 1, 1]
-        v_y = base_lin_vel[:, 1].view(B, 1, 1)  # [B, 1, 1]
+        v_x = base_lin_vel[:, 0].view(B, 1, 1)
+        v_y = base_lin_vel[:, 1].view(B, 1, 1)
         
-        # 计算速度方向的单位向量
-        v_norm = torch.sqrt(v_x ** 2 + v_y ** 2 + 1e-8)  # [B, 1, 1]
-        moving_mask = v_norm > self.behind_vel_threshold  # [B, 1, 1]
+        v_norm = torch.sqrt(v_x ** 2 + v_y ** 2 + 1e-8)
+        moving_mask = v_norm > self.behind_vel_threshold
         
-        # 防止除零
         v_norm_safe = v_norm.clamp(min=1e-6)
-        v_hat_x = v_x / v_norm_safe  # [B, 1, 1]
-        v_hat_y = v_y / v_norm_safe  # [B, 1, 1]
+        v_hat_x = v_x / v_norm_safe
+        v_hat_y = v_y / v_norm_safe
         
-        # 每个点在速度方向上的投影
-        proj = grid_x * v_hat_x + grid_y * v_hat_y  # [B, H, W]
+        proj = grid_x * v_hat_x + grid_y * v_hat_y
         
-        # 身后区域 = 正在移动 & 投影 < -threshold
-        behind_mask = moving_mask & (proj < -self.behind_threshold)
-        
-        return behind_mask
+        return moving_mask & (proj < -self.behind_threshold)
     
+    @torch.no_grad()
     def forward(
         self,
         height_map: torch.Tensor,
@@ -311,96 +257,73 @@ class TerrainSafetyScorer(nn.Module):
         return_debug_info: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict]]:
         """
-        计算地形安全偏置
+        计算地形安全先验分布。
+        
+        流程:
+            1. 平面拟合残差 → S_support (exp 归一化到 [0,1])
+            2. 残差 + 深坑 → danger_map → 形态学腐蚀 → S_margin [0,1]
+            3. 身后掩码 → behind_penalty
+            4. 加权融合 → softmax → prior_dist
         
         Args:
-            height_map: [B, grid_h, grid_w] 采样点高度图
-            base_lin_vel: [B, 3] 机体坐标系下的线速度
-            return_debug_info: 是否返回调试信息
+            height_map: [B, grid_h, grid_w]
+            base_lin_vel: [B, 3]
+            return_debug_info: 是否返回中间结果
             
         Returns:
-            bias_map: [B, num_points] 未归一化的注意力偏置
-            debug_info (可选): 包含中间结果的字典
+            prior_dist: [B, num_points] softmax 概率分布
+            debug_info (可选): 中间结果字典
         """
         B = height_map.shape[0]
         
-        # ===== 1. 几何平坦度分数 =====
-        S_geo, slope, local_var = self.compute_geometric_score(height_map)
+        # ===== 1. 平面拟合残差 =====
+        residual_rms = self._compute_plane_residual(height_map)  # [B, H, W]
         
-        # ===== 2. 动力学可行性分数 (方案A: 统一捕获点 + VHIP修正) =====
-        S_dyn, omega, capture_point, z_ratio, alpha = self.compute_dynamic_score(
-            height_map, base_lin_vel
+        # ===== 2. 支撑面积分数 =====
+        S_support = torch.exp(-residual_rms / self.support_scale)  # [B, H, W], ∈ [0, 1]
+        
+        # ===== 3. 危险区域检测 =====
+        danger_mask = (
+            (residual_rms > self.danger_threshold) |  # 平面拟合残差过大
+            (height_map > self.pit_threshold)          # 深坑
         )
         
-        # ===== 3. 温度参数 (softplus 保证正值) =====
-        sigma_dyn = F.softplus(self.raw_sigma_dyn) + 1e-6
-        sigma_geo = F.softplus(self.raw_sigma_geo) + 1e-6
+        # ===== 4. 边缘裕度分数 =====
+        S_margin = self._compute_margin(danger_mask)  # [B, H, W], ∈ [0, 1]
         
-        # ===== 4. 融合分数 =====
-        bias = S_dyn / (2 * sigma_dyn ** 2) + S_geo / (sigma_geo ** 2)
-        
-        # ===== 5. 分层软掩码 (差异化惩罚) =====
-        # 5.1 边缘检测 (只用局部方差检测高频起伏/台阶边缘)
-        # 移除 slope > threshold 条件，因为平滑斜坡坡度大但可行走
-        steep_mask = local_var > self.local_var_threshold
-        
-        # 5.2 深坑检测 (LeggedGym 语义: 正值表示坑)
-        pit_mask = height_map > self.height_drop_threshold
-        
-        # 5.3 身后区域掩码 (点积半平面)
+        # ===== 5. 身后掩码 =====
         behind_mask = self.compute_behind_mask(base_lin_vel, B)
         
-        # ===== 6. 应用分层惩罚 (从 bias 中减去) =====
-        # 注意：掩码可能重叠，惩罚会累加
-        bias = bias + behind_mask.float() * self.behind_penalty
-        bias = bias + steep_mask.float() * self.steep_penalty
-        bias = bias + pit_mask.float() * self.pit_penalty
+        # ===== 6. 加权融合 =====
+        logits = self.w_support * S_support + self.w_margin * S_margin
+        logits = logits + behind_mask.float() * self.behind_penalty
         
-        # ===== 7. 展平输出 =====
-        bias_flat = bias.view(B, -1)  # [B, num_points]
+        # ===== 7. softmax → 概率分布 =====
+        prior_dist = F.softmax(logits.view(B, -1) / self.temperature, dim=-1)
         
         if return_debug_info:
             debug_info = {
-                'S_dyn': S_dyn.detach(),                    # [B, H, W]
-                'S_geo': S_geo.detach(),                    # [B, H, W]
-                'slope': slope.detach(),                    # [B, H, W] 归一化坡度
-                'local_var': local_var.detach(),            # [B, H, W] 局部方差
-                'omega': omega.detach(),                    # [B, H, W] 逐点自然频率
-                'capture_point': capture_point.detach(),    # [B, 2] 统一捕获点位置
-                'z_ratio': z_ratio.detach(),                # [B, H, W] VHIP 高度修正系数
-                'steep_mask': steep_mask.detach(),          # [B, H, W]
-                'pit_mask': pit_mask.detach(),              # [B, H, W]
-                'behind_mask': behind_mask.detach(),        # [B, H, W]
-                'sigma_dyn': sigma_dyn.detach().item(),
-                'sigma_geo': sigma_geo.detach().item(),
-                'alpha': alpha,                             # 当前 alpha 值
-                'bias_2d': bias.detach(),                   # [B, H, W] 融合后的偏置
+                'residual_rms': residual_rms.detach(),   # [B, H, W] 平面拟合残差
+                'S_support': S_support.detach(),         # [B, H, W] 支撑面积分数
+                'danger_mask': danger_mask.detach(),     # [B, H, W] 危险区域掩码
+                'S_margin': S_margin.detach(),           # [B, H, W] 边缘裕度分数
+                'behind_mask': behind_mask.detach(),     # [B, H, W] 身后掩码
+                'logits_2d': logits.detach(),            # [B, H, W] 融合后 logits
+                'prior_dist': prior_dist.detach(),       # [B, num_points] 概率分布
             }
-            return bias_flat, debug_info
+            return prior_dist, debug_info
         
-        return bias_flat
-    
-    def get_sigma_values(self) -> Tuple[float, float]:
-        """获取当前温度参数值"""
-        sigma_dyn = (F.softplus(self.raw_sigma_dyn) + 1e-6).item()
-        sigma_geo = (F.softplus(self.raw_sigma_geo) + 1e-6).item()
-        return sigma_dyn, sigma_geo
-    
-    def get_alpha_value(self) -> float:
-        """获取当前 alpha 缩放因子值"""
-        return (F.softplus(self.raw_alpha) + 1e-6).item()
+        return prior_dist
     
     def extra_repr(self) -> str:
-        sigma_dyn, sigma_geo = self.get_sigma_values()
-        alpha = self.get_alpha_value()
         return (
             f"grid={self.grid_h}x{self.grid_w}, "
             f"dx={self.dx:.3f}, dy={self.dy:.3f}, "
-            f"z_nominal={self.z_nominal}, "
-            f"sigma_dyn={sigma_dyn:.3f}, sigma_geo={sigma_geo:.3f}, "
-            f"alpha={alpha:.3f}, "
-            f"thresholds=(var={self.local_var_threshold}, "
-            f"drop={self.height_drop_threshold}, behind={self.behind_threshold}), "
-            f"penalties=(behind={self.behind_penalty}, steep={self.steep_penalty}, "
-            f"pit={self.pit_penalty})"
+            f"support_scale={self.support_scale}, "
+            f"danger_threshold={self.danger_threshold}, "
+            f"pit_threshold={self.pit_threshold}, "
+            f"max_margin_steps={self.max_margin_steps}, "
+            f"w_support={self.w_support}, w_margin={self.w_margin}, "
+            f"temperature={self.temperature}, "
+            f"behind_penalty={self.behind_penalty}"
         )
