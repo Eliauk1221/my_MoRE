@@ -61,6 +61,8 @@ class TerrainSafetyScorer(nn.Module):
         behind_threshold: float = 0.3,
         behind_vel_threshold: float = 0.1,
         behind_penalty: float = -2.0,
+        # ===== Label Smoothing =====
+        label_smooth: float = 0.05,
     ):
         """
         Args:
@@ -78,6 +80,10 @@ class TerrainSafetyScorer(nn.Module):
             behind_threshold: 身后区域掩码的投影距离阈值
             behind_vel_threshold: 触发身后掩码的最小速度
             behind_penalty: 身后区域的 logit 惩罚值
+            label_smooth: label smoothing 系数 ε ∈ [0, 1)。
+                          p_smooth = (1-ε)·p_sharp + ε·uniform。
+                          确保所有点概率非零，改善 KL 梯度覆盖。
+                          ε=0 退化为无平滑（原始尖锐分布）。
         """
         super().__init__()
         
@@ -95,6 +101,7 @@ class TerrainSafetyScorer(nn.Module):
         self.behind_threshold = behind_threshold
         self.behind_vel_threshold = behind_vel_threshold
         self.behind_penalty = behind_penalty
+        self.label_smooth = label_smooth
         
         # ===== 默认采样点坐标 (G1 配置) =====
         if measured_points_x is None:
@@ -266,7 +273,7 @@ class TerrainSafetyScorer(nn.Module):
             1. 平面拟合残差 → S_support (exp 归一化到 [0,1])
             2. 残差 + 深坑 → danger_map → 形态学腐蚀 → S_margin [0,1]
             3. 身后掩码 → behind_penalty
-            4. 加权融合 → softmax → prior_dist
+            4. 加权融合 → softmax → label smoothing → prior_dist
         
         Args:
             height_map: [B, grid_h, grid_w]
@@ -308,6 +315,11 @@ class TerrainSafetyScorer(nn.Module):
         # ===== 7. softmax → 概率分布 =====
         prior_dist = F.softmax(logits.view(B, -1) / self.temperature, dim=-1)
         
+        # ===== 8. Label Smoothing =====
+        if self.label_smooth > 0:
+            uniform = 1.0 / self.num_points
+            prior_dist = (1.0 - self.label_smooth) * prior_dist + self.label_smooth * uniform
+        
         if return_debug_info:
             debug_info = {
                 'residual_rms': residual_rms.detach(),   # [B, H, W] 平面拟合残差
@@ -333,5 +345,6 @@ class TerrainSafetyScorer(nn.Module):
             f"w_support={self.w_support}, w_margin={self.w_margin}, "
             f"temperature={self.temperature}, "
             f"danger_penalty={self.danger_penalty}, "
-            f"behind_penalty={self.behind_penalty}"
+            f"behind_penalty={self.behind_penalty}, "
+            f"label_smooth={self.label_smooth}"
         )

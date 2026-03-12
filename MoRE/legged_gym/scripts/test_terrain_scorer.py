@@ -438,7 +438,7 @@ def visualize_scorer_output(
     ax = axes[1, 3]
     prior = data['prior_dist'].reshape(GRID_H, GRID_W) if data['prior_dist'].ndim == 1 else data['prior_dist']
     im = ax.imshow(prior, **kw, cmap='hot')
-    ax.set_title('Prior Distribution\n(softmax)')
+    ax.set_title('Prior Distribution\n(softmax + label smooth)')
     mark(ax); plt.colorbar(im, ax=ax, label='prob')
 
     for row in axes:
@@ -639,6 +639,65 @@ def test_pit_detection(scorer: TerrainSafetyScorer):
     print("  [PASS]")
 
 
+def test_label_smoothing():
+    """Label smoothing: 验证平滑后概率性质 + 与无平滑版本的对比"""
+    print("\n" + "=" * 60)
+    print("Test: Label Smoothing")
+    print("=" * 60)
+
+    scorer_sharp = TerrainSafetyScorer(
+        grid_h=GRID_H, grid_w=GRID_W,
+        measured_points_x=MEASURED_POINTS_X,
+        measured_points_y=MEASURED_POINTS_Y,
+        label_smooth=0.0,
+    )
+    scorer_smooth = TerrainSafetyScorer(
+        grid_h=GRID_H, grid_w=GRID_W,
+        measured_points_x=MEASURED_POINTS_X,
+        measured_points_y=MEASURED_POINTS_Y,
+        label_smooth=0.05,
+    )
+
+    hm = torch.zeros(1, GRID_H, GRID_W)
+    hm[0, 6:11, :] = 0.5  # 深坑
+    vel = torch.tensor([[0.5, 0.0, 0.0]])
+
+    p_sharp = scorer_sharp(hm, vel)
+    p_smooth = scorer_smooth(hm, vel)
+
+    N = GRID_H * GRID_W
+
+    # 1) 归一性
+    assert torch.allclose(p_smooth.sum(dim=-1), torch.ones(1), atol=1e-5), \
+        "smoothed prior sum != 1"
+
+    # 2) 全部 > 0
+    min_prob = p_smooth.min().item()
+    expected_floor = 0.05 / N
+    assert min_prob >= expected_floor * 0.9, \
+        f"min prob {min_prob:.6f} < expected floor {expected_floor:.6f}"
+
+    # 3) 安全区域仍显著高于危险区域
+    p_smooth_2d = p_smooth.view(1, GRID_H, GRID_W)
+    safe_mean = p_smooth_2d[0, 12:16, :].mean().item()
+    pit_mean = p_smooth_2d[0, 6:11, :].mean().item()
+    ratio = safe_mean / (pit_mean + 1e-10)
+    assert ratio > 5, f"safe/danger ratio ({ratio:.1f}) should be > 5"
+
+    # 4) 排序一致: sharp 和 smooth 的 argmax 相同
+    assert p_sharp.argmax() == p_smooth.argmax(), "argmax changed after smoothing"
+
+    # 5) sharp 中存在极小概率 → smooth 中被提升
+    sharp_min = p_sharp.min().item()
+    assert min_prob > sharp_min, "smoothing should raise minimum probability"
+
+    print(f"  sum=1: OK")
+    print(f"  min prob: sharp={sharp_min:.6f} → smooth={min_prob:.6f} (floor≈{expected_floor:.6f})")
+    print(f"  safe/danger per-point ratio: {ratio:.1f}x")
+    print(f"  argmax preserved: OK")
+    print("  [PASS]")
+
+
 # ==================== 真实地形可视化测试 ====================
 
 def run_visual_tests(scorer: TerrainSafetyScorer, save_dir: str):
@@ -756,6 +815,7 @@ def run_visual_tests(scorer: TerrainSafetyScorer, save_dir: str):
         print(f"    S_support:  [{dbg['S_support'].min():.3f}, {dbg['S_support'].max():.3f}]")
         print(f"    S_margin:   [{dbg['S_margin'].min():.3f}, {dbg['S_margin'].max():.3f}]")
         print(f"    danger_ratio: {dbg['danger_mask'].float().mean():.1%}")
+        print(f"    prior: min={prior.min():.6f}, max={prior.max():.6f}")
         print(f"    prior entropy: {-(prior * torch.log(prior + 1e-8)).sum():.2f} "
               f"(uniform={np.log(GRID_H * GRID_W):.2f})")
 
@@ -797,6 +857,7 @@ def main():
     test_step_edge(scorer)
     test_behind_mask(scorer)
     test_pit_detection(scorer)
+    test_label_smoothing()
 
     print("\n" + "=" * 60)
     print("All Unit Tests Passed!")
