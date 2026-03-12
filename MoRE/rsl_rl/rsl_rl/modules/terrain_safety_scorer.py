@@ -56,7 +56,8 @@ class TerrainSafetyScorer(nn.Module):
         w_support: float = 1.0,
         w_margin: float = 1.0,
         temperature: float = 1.0,
-        # ===== 身后掩码参数 =====
+        # ===== 惩罚参数 =====
+        danger_penalty: float = -3.0,
         behind_threshold: float = 0.3,
         behind_vel_threshold: float = 0.1,
         behind_penalty: float = -2.0,
@@ -73,6 +74,7 @@ class TerrainSafetyScorer(nn.Module):
             max_margin_steps: 形态学腐蚀最大步数，决定裕度的最大感知范围
             w_support, w_margin: S_support 与 S_margin 的融合权重
             temperature: softmax 温度，越小分布越尖锐
+            danger_penalty: 危险区域的 logit 惩罚值（确保坑底等区域获得极低概率）
             behind_threshold: 身后区域掩码的投影距离阈值
             behind_vel_threshold: 触发身后掩码的最小速度
             behind_penalty: 身后区域的 logit 惩罚值
@@ -89,6 +91,7 @@ class TerrainSafetyScorer(nn.Module):
         self.w_support = w_support
         self.w_margin = w_margin
         self.temperature = temperature
+        self.danger_penalty = danger_penalty
         self.behind_threshold = behind_threshold
         self.behind_vel_threshold = behind_vel_threshold
         self.behind_penalty = behind_penalty
@@ -295,7 +298,11 @@ class TerrainSafetyScorer(nn.Module):
         behind_mask = self.compute_behind_mask(base_lin_vel, B)
         
         # ===== 6. 加权融合 =====
-        logits = self.w_support * S_support + self.w_margin * S_margin
+        # danger 区域抹零 S_support（消除"平坑高分"假象：坑底虽平但不可踩）
+        safe_float = (~danger_mask).float()
+        logits = self.w_support * S_support * safe_float + self.w_margin * S_margin
+        # 为 danger 区域施加显式惩罚（拉开安全/危险区的 logit 差距）
+        logits = logits + danger_mask.float() * self.danger_penalty
         logits = logits + behind_mask.float() * self.behind_penalty
         
         # ===== 7. softmax → 概率分布 =====
@@ -325,5 +332,6 @@ class TerrainSafetyScorer(nn.Module):
             f"max_margin_steps={self.max_margin_steps}, "
             f"w_support={self.w_support}, w_margin={self.w_margin}, "
             f"temperature={self.temperature}, "
+            f"danger_penalty={self.danger_penalty}, "
             f"behind_penalty={self.behind_penalty}"
         )
