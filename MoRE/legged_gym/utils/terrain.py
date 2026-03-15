@@ -596,7 +596,7 @@ def parkour_terrain(terrain,
     incline_height = round(incline_height / terrain.vertical_scale)
     last_incline_height = round(last_incline_height / terrain.vertical_scale)
 
-    dis_x = platform_len - np.random.randint(dis_x_min, dis_x_max) + stone_len // 2
+    dis_x = platform_len - stone_len // 2
     left_right_flag = np.random.randint(0, 2)
     dis_z = 0
     
@@ -614,7 +614,9 @@ def parkour_terrain(terrain,
 
         left_right_flag = 1 - left_right_flag
     
-    final_platform_start = dis_x + last_stone_len // 2 + round(0.05 // terrain.horizontal_scale)
+    gap_x_min = round(x_range[0] / terrain.horizontal_scale)
+    gap_x_max = max(round(x_range[1] / terrain.horizontal_scale), gap_x_min + 1)
+    final_platform_start = dis_x + last_stone_len // 2 + np.random.randint(gap_x_min, gap_x_max)
     terrain.height_field_raw[final_platform_start:, :] = platform_height
     
     # pad edges
