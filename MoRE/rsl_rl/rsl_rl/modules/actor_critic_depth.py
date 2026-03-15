@@ -267,6 +267,7 @@ class ActorCriticDepth(nn.Module):
                         terrain_attn_use_pre_ln=False,  # 是否使用 Pre-LN（用于兼容旧模型）
                         # ===== 消融实验开关 =====
                         include_depth_in_actor=True,  # 是否在 actor 输入中包含 depth_feature
+                        terrain_attn_query_with_history=True,  # 注意力 Query 是否包含历史特征
                         # ===== 物理引导偏置 =====
                         use_safety_bias=False,        # 是否使用 TerrainSafetyScorer 偏置
                         **kwargs):
@@ -280,6 +281,7 @@ class ActorCriticDepth(nn.Module):
         self.use_terrain_attention = use_terrain_attention
         self.include_depth_in_actor = include_depth_in_actor
         self.use_safety_bias = use_safety_bias
+        self.terrain_attn_query_with_history = terrain_attn_query_with_history
 
         # depth encoder
         depth_backbone = DepthOnlyFCBackbone58x87(output_dim=128, output_activation=activation)
@@ -288,7 +290,10 @@ class ActorCriticDepth(nn.Module):
         # ===== 地形注意力编码器 (Actor 用) =====
         terrain_attn_dim = 0
         if use_terrain_attention:
-            terrain_attn_query_dim = num_actor_obs + his_latent_dim
+            if terrain_attn_query_with_history:
+                terrain_attn_query_dim = num_actor_obs + his_latent_dim
+            else:
+                terrain_attn_query_dim = num_actor_obs
             self.terrain_attention = TerrainAttentionEncoder(
                 grid_h=terrain_attn_grid_h,
                 grid_w=terrain_attn_grid_w,
@@ -301,7 +306,8 @@ class ActorCriticDepth(nn.Module):
             terrain_attn_dim = terrain_attn_output_dim
             print(f"Actor TerrainAttentionEncoder enabled: grid={terrain_attn_grid_h}x{terrain_attn_grid_w}, "
                   f"heads={terrain_attn_num_heads}, output_dim={terrain_attn_output_dim}, "
-                  f"query_dim={terrain_attn_query_dim}, use_pre_ln={terrain_attn_use_pre_ln}")
+                  f"query_dim={terrain_attn_query_dim}, query_with_history={terrain_attn_query_with_history}, "
+                  f"use_pre_ln={terrain_attn_use_pre_ln}")
         else:
             self.terrain_attention = None
         
@@ -428,13 +434,14 @@ class ActorCriticDepth(nn.Module):
         
         # 地形注意力特征 (可选)
         if self.use_terrain_attention and height_map is not None and terrain_xyz is not None:
-            query_context = torch.cat([observations, his_feature], dim=-1)
+            if self.terrain_attn_query_with_history:
+                query_context = torch.cat([observations, his_feature], dim=-1)
+            else:
+                query_context = observations
             # 计算物理引导偏置 (可选)
             attn_bias = None
             if self.use_safety_bias and self.terrain_safety_scorer is not None and base_lin_vel is not None:
-                # 计算 TerrainSafetyScorer 偏置
                 bias_flat = self.terrain_safety_scorer(height_map, base_lin_vel)  # [B, 187]
-                # 应用退火系数 β
                 attn_bias = attn_bias_beta * bias_flat
             
             terrain_feature = self.terrain_attention(height_map, terrain_xyz, query_context, attn_bias=attn_bias)
@@ -468,7 +475,10 @@ class ActorCriticDepth(nn.Module):
         
         # 地形注意力特征 (可选)
         if self.use_terrain_attention and height_map is not None and terrain_xyz is not None:
-            query_context = torch.cat([observations, his_feature], dim=-1)
+            if self.terrain_attn_query_with_history:
+                query_context = torch.cat([observations, his_feature], dim=-1)
+            else:
+                query_context = observations
             # 计算物理引导偏置 (可选)
             attn_bias = None
             if self.use_safety_bias and self.terrain_safety_scorer is not None and base_lin_vel is not None:
