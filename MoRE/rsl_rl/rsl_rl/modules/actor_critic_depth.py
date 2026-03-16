@@ -42,8 +42,8 @@ class TerrainAttentionEncoder(nn.Module):
     双路地形特征提取 + 多头交叉注意力
     - 上路: 5x5 CNN 提取几何特征（高度差、梯度等）
     - 下路: 原始 (x,y,z) 坐标直接使用
-    - MHA 内部处理 K/V 投影，只需手动投影 Q
-    - use_pre_ln: 可选的 Pre-LN
+    - MHA 内部处理 K/V 投影，q_proj 仅做维度对齐 (query_dim → hidden_dim)
+    - use_pre_ln: 可选，在 Attention 之前对 Q/KV 做 LayerNorm
     """
     def __init__(self, 
                  grid_h=17, 
@@ -80,10 +80,10 @@ class TerrainAttentionEncoder(nn.Module):
         self.q_proj = nn.Linear(self.query_dim, hidden_dim)
         
         # ===== Pre-LN: 在 Attention 之前对 Q 和 K/V 分别归一化 =====
-        # 仅当 use_pre_ln=True 时创建（用于兼容旧模型）
+        # 修正 CNN(ReLU, ≥0) 与 xyz([-1,1]) 拼接后的尺度不对称
         if use_pre_ln:
-            self.q_norm = nn.LayerNorm(hidden_dim)   # Query 归一化
-            self.kv_norm = nn.LayerNorm(hidden_dim)  # Key/Value 归一化
+            self.q_norm = nn.LayerNorm(hidden_dim)
+            self.kv_norm = nn.LayerNorm(hidden_dim)
         
         # ===== 多头注意力 (MHA内部处理K/V投影) =====
         self.multihead_attn = nn.MultiheadAttention(
@@ -112,14 +112,14 @@ class TerrainAttentionEncoder(nn.Module):
         Returns:
             terrain_feature: [B, output_dim] 注意力加权后的地形特征
             
-        简化数据流:
-            query_context ──► q_proj ──► Q ───────────────────────┐
-                                                                   │
-            terrain ──► CNN+xyz ──► kv_input ─────────────────────┤
-                                                                   │
-                                          MultiheadAttention(Q, K, V)
-                                                  │
-                                                  ▼
+        数据流 (use_pre_ln=True 时 Q/KV 经过 LayerNorm):
+            query_context ──► q_proj ──► [LN] ──► Q ──────────────┐
+                                                                  │
+            terrain ──► CNN+xyz ──► kv_input ──► [LN] ──► K,V ────┤
+                                                                  │
+                                                    MultiheadAttention(Q, K, V)
+                                                                  │
+                                                                  ▼
                                             attn_output ──► output_proj ──► terrain_feature
         """
         B = height_map.shape[0]
@@ -161,12 +161,6 @@ class TerrainAttentionEncoder(nn.Module):
         self.last_attention_weights = self.last_attention_weights_per_head.mean(dim=1)
         # 保留计算图的平均权重，供 KL loss 回传梯度
         self.last_attention_weights_raw = attn_weights_per_head.squeeze(2).mean(dim=1)  # [B, 187]
-        
-        # ===== 干净残差连接 (Pre-LN 核心: 残差不经过 LayerNorm) =====
-        # 仅当 use_pre_ln=True 时启用残差连接
-        if self.use_pre_ln:
-            # output = x + Attention(LayerNorm(x))
-            attn_output = attn_output + Q  # [B, 1, hidden] - 直接加原始 Q，不经过 LN
         
         # ===== 输出投影 =====
         terrain_feature = self.output_proj(attn_output.squeeze(1))  # [B, output_dim]
@@ -251,7 +245,7 @@ class ActorCriticDepth(nn.Module):
                         terrain_attn_hidden_dim=128,
                         terrain_attn_num_heads=8,
                         terrain_attn_output_dim=64,
-                        terrain_attn_use_pre_ln=False,  # 是否使用 Pre-LN（用于兼容旧模型）
+                        terrain_attn_use_pre_ln=True,   # Pre-LN: 对 Q/KV 做 LayerNorm
                         # ===== 消融实验开关 =====
                         include_depth_in_actor=True,  # 是否在 actor 输入中包含 depth_feature
                         terrain_attn_query_with_history=True,  # 注意力 Query 是否包含历史特征
