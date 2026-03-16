@@ -135,13 +135,10 @@ class AMPPPOMulti:
         height_map = None
         terrain_xyz = None
         base_lin_vel = None
-        attn_bias_beta = 1.0
         if terrain_data is not None:
             height_map = terrain_data.get('height_map')
             terrain_xyz = terrain_data.get('terrain_xyz')
-            # 物理引导偏置所需数据
             base_lin_vel = terrain_data.get('base_lin_vel')
-            attn_bias_beta = terrain_data.get('attn_bias_beta', 1.0)
         
         # Compute the actions and values
         if isinstance(obs, tuple):
@@ -149,7 +146,7 @@ class AMPPPOMulti:
             self.transition.actions = self.actor_critic.act(
                 aug_obs, history, depth_image[:, :2, ...],
                 height_map=height_map, terrain_xyz=terrain_xyz,
-                base_lin_vel=base_lin_vel, attn_bias_beta=attn_bias_beta
+                base_lin_vel=base_lin_vel
             ).detach()
             self.transition.observations = obs[0]
             self.transition.depth_image = obs[1]
@@ -158,7 +155,7 @@ class AMPPPOMulti:
             self.transition.actions = self.actor_critic.act(
                 aug_obs, history,
                 height_map=height_map, terrain_xyz=terrain_xyz,
-                base_lin_vel=base_lin_vel, attn_bias_beta=attn_bias_beta
+                base_lin_vel=base_lin_vel
             ).detach()
             self.transition.observations = obs
         
@@ -174,7 +171,7 @@ class AMPPPOMulti:
         # 保存地形注意力数据
         self.transition.height_map = height_map
         self.transition.terrain_xyz = terrain_xyz
-        self.transition.base_lin_vel = base_lin_vel  # 用于物理引导偏置
+        self.transition.base_lin_vel = base_lin_vel
         return self.transition.actions
     
         
@@ -217,7 +214,11 @@ class AMPPPOMulti:
         loss = bce(disc_logits, torch.ones_like(disc_logits, device=self.device))
         return loss
 
-    def update(self):
+    def update(self, attn_kl_coef=0.0):
+        """
+        Args:
+            attn_kl_coef: float, 当前有效的 KL loss 系数（由 runner 根据 anneal 策略计算）
+        """
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_amp_loss = 0
@@ -227,6 +228,7 @@ class AMPPPOMulti:
         mean_agent_acc = 0
         mean_demo_acc = 0
         mean_terrain_attn_grad_norm = 0
+        mean_terrain_kl_loss = 0
         
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -362,12 +364,18 @@ class AMPPPOMulti:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
             
+            # Terrain attention KL loss (可选)
+            terrain_kl_loss = torch.tensor(0.0, device=self.device)
+            if attn_kl_coef > 0 and height_map is not None and base_lin_vel is not None:
+                terrain_kl_loss = self.actor_critic.compute_terrain_kl_loss(height_map, base_lin_vel)
+            
             # Compute total loss.
             loss = (
                 0 * b_loss +
                 surrogate_loss +
                 self.value_loss_coef * value_loss -
-                self.entropy_coef * entropy_batch.mean())
+                self.entropy_coef * entropy_batch.mean() +
+                attn_kl_coef * terrain_kl_loss)
 
             # Gradient step
             self.optimizer.zero_grad()
@@ -377,15 +385,15 @@ class AMPPPOMulti:
             terrain_attn_grad_norm = 0.0
             terrain_attn_module = getattr(self.actor_critic, 'terrain_attention', None)
             if terrain_attn_module is not None:
-                grad_sq_sum = 0.0
+                grad_sq_sum = 0.0  # 累计所有参数梯度平方的总和
                 has_grad = False
                 for p in terrain_attn_module.parameters():
-                    if p.grad is not None:
+                    if p.grad is not None:  # 只处理那些真正有梯度的参数
                         g = p.grad.detach()
-                        grad_sq_sum += torch.sum(g * g).item()
+                        grad_sq_sum += torch.sum(g * g).item()  # .item() 将单个数字 tensor 转成普通 Python 数
                         has_grad = True
                 if has_grad:
-                    terrain_attn_grad_norm = grad_sq_sum ** 0.5
+                    terrain_attn_grad_norm = grad_sq_sum ** 0.5  # 做平方根，计算梯度范数
             mean_terrain_attn_grad_norm += terrain_attn_grad_norm
 
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
@@ -404,6 +412,7 @@ class AMPPPOMulti:
             
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
+            mean_terrain_kl_loss += terrain_kl_loss.item()
                 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
@@ -415,8 +424,9 @@ class AMPPPOMulti:
         mean_agent_acc /= num_updates
         mean_demo_acc /= num_updates
         mean_terrain_attn_grad_norm /= num_updates
+        mean_terrain_kl_loss /= num_updates
         
         self.storage.clear()
 
         return mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss, mean_policy_pred, mean_expert_pred,  \
-                mean_agent_acc, mean_demo_acc, mean_terrain_attn_grad_norm
+                mean_agent_acc, mean_demo_acc, mean_terrain_attn_grad_norm, mean_terrain_kl_loss

@@ -131,24 +131,22 @@ class AMPOnPolicyRunnerMulti:
             terrain_attn_grid_h = self.env.cfg.terrain_attention.grid_h
             terrain_attn_grid_w = self.env.cfg.terrain_attention.grid_w
         
-        # ===== β 退火配置（物理引导偏置） =====
-        self.use_safety_bias = False
-        self.safety_bias_beta_init = 1.0
-        self.safety_bias_anneal_steps = 30000
-        self.safety_bias_schedule = "linear"
-        self.safety_bias_exp_tau = 10000
+        # ===== KL 先验引导配置 =====
+        self.use_attn_kl_loss = False
+        self.attn_kl_coef = 0.1
+        self.attn_kl_anneal_start = 0
+        self.attn_kl_anneal_end = 0
         
         if hasattr(self.env.cfg, 'terrain_attention'):
             ta_cfg = self.env.cfg.terrain_attention
-            self.use_safety_bias = getattr(ta_cfg, 'use_safety_bias', False)
-            self.safety_bias_beta_init = getattr(ta_cfg, 'safety_bias_beta_init', 1.0)
-            self.safety_bias_anneal_steps = getattr(ta_cfg, 'safety_bias_anneal_steps', 30000)
-            self.safety_bias_schedule = getattr(ta_cfg, 'safety_bias_schedule', 'linear')
-            self.safety_bias_exp_tau = getattr(ta_cfg, 'safety_bias_exp_tau', 10000)
+            self.use_attn_kl_loss = getattr(ta_cfg, 'use_attn_kl_loss', False)
+            self.attn_kl_coef = getattr(ta_cfg, 'attn_kl_coef', 0.1)
+            self.attn_kl_anneal_start = getattr(ta_cfg, 'attn_kl_anneal_start', 0)
+            self.attn_kl_anneal_end = getattr(ta_cfg, 'attn_kl_anneal_end', 0)
         
-        if self.use_safety_bias:
-            print(f"[SafetyBias] Enabled: beta_init={self.safety_bias_beta_init}, "
-                  f"anneal_steps={self.safety_bias_anneal_steps}, schedule={self.safety_bias_schedule}")
+        if self.use_attn_kl_loss:
+            print(f"[AttnKL] Enabled: coef={self.attn_kl_coef}, "
+                  f"anneal_start={self.attn_kl_anneal_start}, anneal_end={self.attn_kl_anneal_end}")
         
         # ===== 训练可视化配置 =====
         self.viz_enabled = False
@@ -192,37 +190,28 @@ class AMPOnPolicyRunnerMulti:
 
         _, _ = self.env.reset()
     
-    def compute_attn_bias_beta(self, current_iter: int) -> float:
+    def compute_effective_kl_coef(self, current_iter: int) -> float:
         """
-        计算当前迭代的注意力偏置强度 β
+        计算当前迭代有效的 KL loss 系数（支持可选的线性 warmup）。
         
-        Args:
-            current_iter: 当前迭代次数
-            
-        Returns:
-            beta: 当前的 β 值 (0.0 ~ beta_init)
+        - anneal_start=0, anneal_end=0: 直接返回 attn_kl_coef（不退火）
+        - anneal_start > 0: 在该 iteration 之前返回 0
+        - anneal_end > anneal_start: 从 start 到 end 线性增长到 attn_kl_coef
         """
-        if not self.use_safety_bias:
+        if not self.use_attn_kl_loss:
+            return 0.0  # 当前 KL loss 的有效权重为 0，完全不参与总 loss
+        
+        if self.attn_kl_anneal_end <= self.attn_kl_anneal_start:
+            if current_iter < self.attn_kl_anneal_start:
+                return 0.0
+            return self.attn_kl_coef  # 如果已经不小于 anneal_start，直接返回 attn_kl_coef
+        
+        if current_iter < self.attn_kl_anneal_start:
             return 0.0
         
-        if self.safety_bias_anneal_steps <= 0:
-            # 不退火，保持初始值
-            return self.safety_bias_beta_init
-        
-        progress = min(1.0, current_iter / self.safety_bias_anneal_steps)
-        
-        if self.safety_bias_schedule == "linear":
-            # 线性退火: β(t) = β_init * (1 - t/T)
-            beta = self.safety_bias_beta_init * (1.0 - progress)
-        elif self.safety_bias_schedule == "exponential":
-            # 指数退火: β(t) = β_init * exp(-t/τ)
-            import math
-            beta = self.safety_bias_beta_init * math.exp(-current_iter / self.safety_bias_exp_tau)
-        else:
-            # 默认线性
-            beta = self.safety_bias_beta_init * (1.0 - progress)
-        
-        return max(0.0, beta)
+        progress = min(1.0, (current_iter - self.attn_kl_anneal_start) /
+                       (self.attn_kl_anneal_end - self.attn_kl_anneal_start))  # 计算当前 warmup 进度，保持在 0-1 之间
+        return self.attn_kl_coef * progress
     
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         # initialize writer
@@ -274,8 +263,8 @@ class AMPOnPolicyRunnerMulti:
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
             
-            # ===== 计算当前的 β 值（物理引导偏置强度） =====
-            attn_bias_beta = self.compute_attn_bias_beta(it)
+            # ===== 计算当前有效 KL 系数 =====
+            effective_kl_coef = self.compute_effective_kl_coef(it)
             
             # Rollout
             with torch.inference_mode():  # 只做前向推理，不计算梯度
@@ -289,14 +278,12 @@ class AMPOnPolicyRunnerMulti:
                     # ===== 获取地形注意力数据 =====
                     terrain_data = None
                     if self.use_terrain_attention:
-                        terrain_data = {  # 开始创建一个字典
-                            'height_map': self.env.height_map.clone().to(self.device),  # .clone（） 表示复制一份新的张量
-                            'terrain_xyz': self.env.terrain_xyz.clone().to(self.device)
+                        terrain_data = {
+                            'height_map': self.env.height_map.clone().to(self.device),
+                            'terrain_xyz': self.env.terrain_xyz.clone().to(self.device),
                         }
-                        # 添加物理引导偏置所需数据
-                        if self.use_safety_bias:
+                        if self.use_attn_kl_loss:
                             terrain_data['base_lin_vel'] = self.env.base_lin_vel.clone().to(self.device)
-                            terrain_data['attn_bias_beta'] = attn_bias_beta
 
                     actions = self.alg.act(obs, critic_obs, history, terrain_data=terrain_data)
 
@@ -396,7 +383,8 @@ class AMPOnPolicyRunnerMulti:
             
             mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss, \
             mean_policy_pred, mean_expert_pred, mean_agent_acc, mean_demo_acc, \
-            mean_terrain_attn_grad_norm = self.alg.update()
+            mean_terrain_attn_grad_norm, mean_terrain_kl_loss = self.alg.update(
+                attn_kl_coef=effective_kl_coef)
             stop = time.time()
             learn_time = stop - start
             if self.log_dir is not None:
@@ -412,9 +400,8 @@ class AMPOnPolicyRunnerMulti:
                         env=self.env,
                         actor_critic=self.alg.actor_critic,
                         iteration=it,
-                        beta=attn_bias_beta,
                         save_dir=viz_save_dir,
-                        sample_indices=None,  # 自动选择
+                        sample_indices=None,
                         terrain_names=self.terrain_names,
                     )
                 except Exception as e:
@@ -506,34 +493,32 @@ class AMPOnPolicyRunnerMulti:
                 front_weight = attn_weights[:, :num_points//2].sum(dim=-1).mean()
                 self.writer.add_scalar('Attention/front_region_weight', front_weight.item(), locs['it'])
         
-        # ===== 物理引导偏置指标 =====
-        if self.use_safety_bias:
-            # 记录当前 β 值
-            self.writer.add_scalar('SafetyBias/beta', locs['attn_bias_beta'], locs['it'])
+        # ===== KL 先验引导指标 =====
+        if self.use_attn_kl_loss:
+            self.writer.add_scalar('Loss/terrain_kl', locs['mean_terrain_kl_loss'], locs['it'])
+            self.writer.add_scalar('Loss/terrain_kl_weighted',
+                                   locs['effective_kl_coef'] * locs['mean_terrain_kl_loss'], locs['it'])
+            self.writer.add_scalar('Attention/kl_coef_effective', locs['effective_kl_coef'], locs['it'])
             
-            # ===== Attention-Bias Alignment 和 Safe Region Focus =====
+            # Prior-Attention 对齐指标
             if self.use_terrain_attention and hasattr(self.alg.actor_critic, 'terrain_attention'):
                 terrain_attn = self.alg.actor_critic.terrain_attention
-                if terrain_attn is not None and terrain_attn.last_attention_weights is not None:
-                    attn_weights = terrain_attn.last_attention_weights  # [B, 187]
+                scorer = getattr(self.alg.actor_critic, 'terrain_safety_scorer', None)
+                if (terrain_attn is not None and terrain_attn.last_attention_weights is not None
+                        and scorer is not None and hasattr(self.env, 'height_map') and hasattr(self.env, 'base_lin_vel')):
+                    attn_weights = terrain_attn.last_attention_weights  # [B, 187] detached
+                    with torch.no_grad():
+                        prior_dist = scorer(
+                            self.env.height_map.to(self.device),
+                            self.env.base_lin_vel.to(self.device)
+                        )  # [B, 187]
                     
-                    # 获取偏置
-                    attn_bias = getattr(terrain_attn, 'last_attn_bias', None)
-                    if attn_bias is not None:
-                        # Attention-Bias Alignment: 注意力权重与归一化偏置的余弦相似度
-                        # 将 bias 转换为概率分布进行比较
-                        import torch.nn.functional as F
-                        bias_softmax = F.softmax(attn_bias, dim=-1)  # [B, 187]
-                        
-                        # 余弦相似度
-                        alignment = F.cosine_similarity(attn_weights, bias_softmax, dim=-1).mean()
-                        self.writer.add_scalar('SafetyBias/attention_bias_alignment', alignment.item(), locs['it'])
-                        
-                        # Safe Region Focus: 注意力在安全区域（bias > median）的权重占比
-                        bias_median = attn_bias.median(dim=-1, keepdim=True).values
-                        safe_mask = (attn_bias > bias_median).float()  # [B, 187]
-                        safe_focus = (attn_weights * safe_mask).sum(dim=-1).mean()
-                        self.writer.add_scalar('SafetyBias/safe_region_focus', safe_focus.item(), locs['it'])
+                    import torch.nn.functional as F
+                    cosine = F.cosine_similarity(attn_weights, prior_dist, dim=-1).mean()
+                    self.writer.add_scalar('Attention/prior_attn_cosine', cosine.item(), locs['it'])
+                    
+                    prior_entropy = -(prior_dist * torch.log(prior_dist + 1e-8)).sum(dim=-1).mean()
+                    self.writer.add_scalar('Attention/prior_entropy', prior_entropy.item(), locs['it'])
         
         # ===== 按地形类型的 Traverse Rate 和 Success Rate =====
         if 'traverse_buffers' in locs and 'success_buffers' in locs:

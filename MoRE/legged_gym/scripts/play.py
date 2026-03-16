@@ -24,7 +24,7 @@ def infer_model_config_from_checkpoint(checkpoint_path, num_actor_obs=57, his_la
         terrain_attn_dim: 地形注意力输出维度 (默认 64)
     
     Returns:
-        dict: {'use_terrain_attention': bool, 'include_depth_in_actor': bool, 'use_safety_bias': bool}
+        dict: {'use_terrain_attention': bool, 'include_depth_in_actor': bool, ...}
     """
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
@@ -65,20 +65,20 @@ def infer_model_config_from_checkpoint(checkpoint_path, num_actor_obs=57, his_la
               f"remaining_dim={remaining_dim}. Using config file defaults.")
         return None
     
-    # 检查是否有 terrain_safety_scorer（推断 use_safety_bias）
-    use_safety_bias = 'terrain_safety_scorer.raw_sigma_dyn' in checkpoint['model_state_dict']
-    
     # 检查是否有 q_norm（推断 terrain_attn_use_pre_ln，用于兼容旧模型）
     use_pre_ln = 'terrain_attention.q_norm.weight' in checkpoint['model_state_dict']
     
+    # 推理时不需要 KL loss / scorer，设为 False
+    use_attn_kl_loss = False
+    
     print(f"[Config Inference] actor_input_dim={actor_input_dim} -> "
           f"use_terrain_attention={use_attention}, include_depth_in_actor={include_depth}, "
-          f"use_safety_bias={use_safety_bias}, terrain_attn_use_pre_ln={use_pre_ln}")
+          f"terrain_attn_use_pre_ln={use_pre_ln}")
     
     return {
         'use_terrain_attention': use_attention,
         'include_depth_in_actor': include_depth,
-        'use_safety_bias': use_safety_bias,
+        'use_attn_kl_loss': use_attn_kl_loss,
         'terrain_attn_use_pre_ln': use_pre_ln
     }
 
@@ -227,15 +227,13 @@ def play(args):
         # 覆盖 train_cfg.policy 中的配置
         train_cfg.policy.use_terrain_attention = inferred_config['use_terrain_attention']
         train_cfg.policy.include_depth_in_actor = inferred_config['include_depth_in_actor']
-        train_cfg.policy.use_safety_bias = inferred_config['use_safety_bias']
+        train_cfg.policy.use_attn_kl_loss = inferred_config['use_attn_kl_loss']
         train_cfg.policy.terrain_attn_use_pre_ln = inferred_config['terrain_attn_use_pre_ln']
         
-        # 覆盖 env_cfg.terrain_attention 中的配置（如果存在）
         if hasattr(env_cfg, 'terrain_attention'):
             env_cfg.terrain_attention.use_attention = inferred_config['use_terrain_attention']
             env_cfg.terrain_attention.include_depth_in_actor = inferred_config['include_depth_in_actor']
-            env_cfg.terrain_attention.use_safety_bias = inferred_config['use_safety_bias']
-            env_cfg.terrain_attention.use_pre_ln = inferred_config['terrain_attn_use_pre_ln']
+            env_cfg.terrain_attention.use_attn_kl_loss = inferred_config['use_attn_kl_loss']
     
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
@@ -269,18 +267,11 @@ def play(args):
     else:
         infos["depth"] = None
     
-    # ===== 检查是否使用地形注意力和物理引导偏置 =====
+    # ===== 检查是否使用地形注意力 =====
     use_terrain_attention = getattr(env, 'use_terrain_attention', False)
-    use_safety_bias = False
-    if hasattr(env.cfg, 'terrain_attention'):
-        use_safety_bias = getattr(env.cfg.terrain_attention, 'use_safety_bias', False)
-    
     actor_critic = ppo_runner.alg.actor_critic
     
-    # 推理时 β=0.0（训练完成后不再需要物理先验，让模型自主决策）
-    attn_bias_beta = 0.0
-    
-    print(f"[Play] use_terrain_attention={use_terrain_attention}, use_safety_bias={use_safety_bias}, attn_bias_beta={attn_bias_beta}")
+    print(f"[Play] use_terrain_attention={use_terrain_attention}")
 
     for i in range(int(env.max_episode_length)):
         # get depth image
@@ -289,27 +280,19 @@ def play(args):
         if env.cfg.depth.warp_camera or env.cfg.depth.use_camera:
             obs = (obs, depth_image)
         
-        # ===== 准备地形注意力数据 =====
         height_map = None
         terrain_xyz = None
-        base_lin_vel = None
         
         if use_terrain_attention and env.height_map is not None:
             height_map = env.height_map.clone().to(env.device)
             terrain_xyz = env.terrain_xyz.clone().to(env.device)
-            
-            # 只有当 use_safety_bias=True 时才传递 base_lin_vel
-            if use_safety_bias:
-                base_lin_vel = env.base_lin_vel.clone().to(env.device)
 
         if isinstance(obs, tuple):
             actions = policy(obs[0].detach(), trajectory_history.detach(), obs[1][:, :2, ...].detach(),
-                           height_map=height_map, terrain_xyz=terrain_xyz,
-                           base_lin_vel=base_lin_vel, attn_bias_beta=attn_bias_beta)
+                           height_map=height_map, terrain_xyz=terrain_xyz)
         else:
             actions = policy(obs.detach(), trajectory_history,
-                           height_map=height_map, terrain_xyz=terrain_xyz,
-                           base_lin_vel=base_lin_vel, attn_bias_beta=attn_bias_beta)
+                           height_map=height_map, terrain_xyz=terrain_xyz)
         obs, _, _, dones, infos, *_= env.step(actions.detach())
         
         # ===== 绘制注意力可视化 =====
