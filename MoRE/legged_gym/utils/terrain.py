@@ -154,9 +154,9 @@ class Terrain:
             # stepping_stones 地形（从 extreme-parkour 迁移）
             idx = 0
             stepping_stones_terrain(terrain, 
-                                    stone_size=0.63 - 0.09*difficulty, 
+                                    stone_size=0.63 - 0.06*difficulty, 
                                     pitch_x=0.70,
-                                    lane_offset=0.12,
+                                    lane_offset=0.10,
                                     pad_height=0)
             # 不添加表面粗糙度，依赖域随机化提供鲁棒性
         elif choice < self.proportions[1]:
@@ -471,7 +471,7 @@ def pit_terrain(terrain, depth, platform_size=1.):
 def stepping_stones_terrain(terrain,
                             stone_size, 
                             pitch_x=0.70,
-                            lane_offset=0.12,
+                            lane_offset=0.10,
                             num_cols=10,
                             platform_len=2.5,
                             platform_height=0.,
