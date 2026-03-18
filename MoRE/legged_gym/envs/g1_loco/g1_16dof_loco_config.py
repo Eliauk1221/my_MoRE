@@ -334,7 +334,7 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         
         # ===== 消融实验开关 (需与 terrain_attention 配置一致) =====
         include_depth_in_actor = False    # 是否在 actor 输入中包含 depth_feature
-        terrain_attn_query_with_history = True  # True: query=obs+his_feature; False: query=obs
+        terrain_attn_query_with_history = False  # True: query=obs+his_feature; False: query=obs
         
         # ===== KL 先验引导 (需与 terrain_attention 配置一致) =====
         use_attn_kl_loss = False         # 是否使用 KL 散度辅助损失引导注意力
