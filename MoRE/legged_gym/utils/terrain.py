@@ -581,8 +581,10 @@ def parkour_terrain(terrain,
     
     dis_x_min = stone_len + round(x_range[0] / terrain.horizontal_scale)
     dis_x_max = stone_len + round(x_range[1] / terrain.horizontal_scale)
+    dis_x_max = max(dis_x_max, dis_x_min + 1)
     dis_y_min = round(y_range[0] / terrain.horizontal_scale)
     dis_y_max = round(y_range[1] / terrain.horizontal_scale)
+    dis_y_max = max(dis_y_max, dis_y_min + 1)
     dis_z_min = round(z_range[0] / terrain.vertical_scale)
     dis_z_max = round(z_range[1] / terrain.vertical_scale)
 
