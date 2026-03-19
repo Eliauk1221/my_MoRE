@@ -114,7 +114,7 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         include_depth_in_actor = False   # 是否在 actor 输入中包含 depth_feature（用于消融实验）
         
         # ===== KL 先验引导配置 =====
-        use_attn_kl_loss = False         # 开关：是否使用 TerrainSafetyScorer 的 KL 散度辅助损失引导注意力
+        use_attn_kl_loss = True         # 开关：是否使用 TerrainSafetyScorer 的 KL 散度辅助损失引导注意力
         attn_kl_coef = 0.1              # λ_kl 系数（KL loss 在总损失中的权重）
         attn_kl_anneal_start = 0        # KL loss 生效起始 iteration（0 = 从头开始）
         attn_kl_anneal_end = 0          # KL loss 线性增长到全量的结束 iteration（0 = 不退火，直接全量）
@@ -337,7 +337,7 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         terrain_attn_query_with_history = False  # True: query=obs+his_feature; False: query=obs
         
         # ===== KL 先验引导 (需与 terrain_attention 配置一致) =====
-        use_attn_kl_loss = False         # 是否使用 KL 散度辅助损失引导注意力
+        use_attn_kl_loss = True         # 是否使用 KL 散度辅助损失引导注意力
 
     class algorithm( LeggedRobotCfgPPO.algorithm ):
         use_amp = False
