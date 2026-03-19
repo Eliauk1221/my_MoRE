@@ -514,7 +514,8 @@ class AMPOnPolicyRunnerMulti:
                         )  # [B, 187]
                     
                     import torch.nn.functional as F
-                    cosine = F.cosine_similarity(attn_weights, prior_dist, dim=-1).mean()
+                    n = min(attn_weights.shape[0], prior_dist.shape[0])
+                    cosine = F.cosine_similarity(attn_weights[:n], prior_dist[:n], dim=-1).mean()
                     self.writer.add_scalar('Attention/prior_attn_cosine', cosine.item(), locs['it'])
                     
                     prior_entropy = -(prior_dist * torch.log(prior_dist + 1e-8)).sum(dim=-1).mean()
