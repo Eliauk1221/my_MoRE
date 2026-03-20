@@ -229,6 +229,8 @@ class AMPPPOMulti:
         mean_demo_acc = 0
         mean_terrain_attn_grad_norm = 0
         mean_terrain_kl_loss = 0
+        mean_prior_attn_cosine = 0
+        mean_prior_entropy = 0
         
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -368,6 +370,18 @@ class AMPPPOMulti:
             terrain_kl_loss = torch.tensor(0.0, device=self.device)
             if attn_kl_coef > 0 and height_map is not None and base_lin_vel is not None:
                 terrain_kl_loss = self.actor_critic.compute_terrain_kl_loss(height_map, base_lin_vel)
+                
+                # 使用配对数据计算 prior-attn 对齐指标
+                terrain_attn_module = getattr(self.actor_critic, 'terrain_attention', None)
+                scorer = getattr(self.actor_critic, 'terrain_safety_scorer', None)
+                if terrain_attn_module is not None and scorer is not None:
+                    with torch.no_grad():
+                        attn_w = terrain_attn_module.last_attention_weights  # [B, 187]
+                        prior_d = scorer(height_map, base_lin_vel)  # [B, 187]
+                        cos_sim = torch.nn.functional.cosine_similarity(attn_w, prior_d, dim=-1).mean()
+                        p_entropy = -(prior_d * torch.log(prior_d + 1e-8)).sum(dim=-1).mean()
+                        mean_prior_attn_cosine += cos_sim.item()
+                        mean_prior_entropy += p_entropy.item()
             
             # Compute total loss.
             loss = (
@@ -425,8 +439,11 @@ class AMPPPOMulti:
         mean_demo_acc /= num_updates
         mean_terrain_attn_grad_norm /= num_updates
         mean_terrain_kl_loss /= num_updates
+        mean_prior_attn_cosine /= num_updates
+        mean_prior_entropy /= num_updates
         
         self.storage.clear()
 
         return mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss, mean_policy_pred, mean_expert_pred,  \
-                mean_agent_acc, mean_demo_acc, mean_terrain_attn_grad_norm, mean_terrain_kl_loss
+                mean_agent_acc, mean_demo_acc, mean_terrain_attn_grad_norm, mean_terrain_kl_loss, \
+                mean_prior_attn_cosine, mean_prior_entropy
