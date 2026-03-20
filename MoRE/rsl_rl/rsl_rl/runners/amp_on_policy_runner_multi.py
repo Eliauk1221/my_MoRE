@@ -383,7 +383,8 @@ class AMPOnPolicyRunnerMulti:
             
             mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss, \
             mean_policy_pred, mean_expert_pred, mean_agent_acc, mean_demo_acc, \
-            mean_terrain_attn_grad_norm, mean_terrain_kl_loss = self.alg.update(
+            mean_terrain_attn_grad_norm, mean_terrain_kl_loss, \
+            mean_prior_attn_cosine, mean_prior_entropy = self.alg.update(
                 attn_kl_coef=effective_kl_coef)
             stop = time.time()
             learn_time = stop - start
@@ -500,26 +501,9 @@ class AMPOnPolicyRunnerMulti:
                                    locs['effective_kl_coef'] * locs['mean_terrain_kl_loss'], locs['it'])
             self.writer.add_scalar('Attention/kl_coef_effective', locs['effective_kl_coef'], locs['it'])
             
-            # Prior-Attention 对齐指标
-            if self.use_terrain_attention and hasattr(self.alg.actor_critic, 'terrain_attention'):
-                terrain_attn = self.alg.actor_critic.terrain_attention
-                scorer = getattr(self.alg.actor_critic, 'terrain_safety_scorer', None)
-                if (terrain_attn is not None and terrain_attn.last_attention_weights is not None
-                        and scorer is not None and hasattr(self.env, 'height_map') and hasattr(self.env, 'base_lin_vel')):
-                    attn_weights = terrain_attn.last_attention_weights  # [B, 187] detached
-                    with torch.no_grad():
-                        prior_dist = scorer(
-                            self.env.height_map.to(self.device),
-                            self.env.base_lin_vel.to(self.device)
-                        )  # [B, 187]
-                    
-                    import torch.nn.functional as F
-                    n = min(attn_weights.shape[0], prior_dist.shape[0])
-                    cosine = F.cosine_similarity(attn_weights[:n], prior_dist[:n], dim=-1).mean()
-                    self.writer.add_scalar('Attention/prior_attn_cosine', cosine.item(), locs['it'])
-                    
-                    prior_entropy = -(prior_dist * torch.log(prior_dist + 1e-8)).sum(dim=-1).mean()
-                    self.writer.add_scalar('Attention/prior_entropy', prior_entropy.item(), locs['it'])
+            # Prior-Attention 对齐指标（来自 update() 中配对数据的累积均值）
+            self.writer.add_scalar('Attention/prior_attn_cosine', locs['mean_prior_attn_cosine'], locs['it'])
+            self.writer.add_scalar('Attention/prior_entropy', locs['mean_prior_entropy'], locs['it'])
         
         # ===== 按地形类型的 Traverse Rate 和 Success Rate =====
         if 'traverse_buffers' in locs and 'success_buffers' in locs:
