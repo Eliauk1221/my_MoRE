@@ -586,7 +586,7 @@ class AMPOnPolicyRunnerMulti:
 
     def load(self, path, load_optimizer=True):
         loaded_dict = torch.load(path, map_location=lambda storage, loc:storage.cuda(0))
-        self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
+        self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'], strict=False)
         if loaded_dict['discriminator_state_dict'] is not None:
             self.alg.discriminator.load_state_dict(loaded_dict['discriminator_state_dict'])
         if self.alg.discriminator is not None:
