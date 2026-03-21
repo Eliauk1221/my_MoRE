@@ -474,11 +474,9 @@ class ActorCriticDepth(nn.Module):
         with torch.no_grad():  # 下面缩进块里的运算不记录梯度（只是目标分布，不是要训练的东西）
             prior_dist = self.terrain_safety_scorer(height_map, base_lin_vel)  # [B, 187]
         
-        # KL(attn || prior) = Σ attn * log(attn / prior)
-        # mode-seeking: 惩罚 attn 在 prior 低概率处的概率质量，
-        # 允许 attn 聚焦于 prior 的子集（适合 stepping stones 等离散地形）
+        # KL(prior || attn) = Σ prior * log(prior / attn)
         kl = torch.sum(
-            attn_weights * (torch.log(attn_weights + 1e-8) - torch.log(prior_dist + 1e-8)),
+            prior_dist * (torch.log(prior_dist + 1e-8) - torch.log(attn_weights + 1e-8)),
             dim=-1
         )
         return kl.mean()
