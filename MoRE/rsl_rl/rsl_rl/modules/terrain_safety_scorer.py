@@ -1,19 +1,16 @@
 """
-TerrainSafetyScorer: 纯物理先验的地形安全打分模块（无可学习参数）
+TerrainSafetyScorer V2: "信息先验" 替代 "安全先验"
 
-输出 softmax 概率分布，用作 attention 的 KL 监督目标。
+核心改动:
+1. 将 danger_penalty 拆分为 edge_bonus + pit_penalty
+   - 边缘/过渡区 (高残差非深坑) → 正向权重 (信息丰富)
+   - 深坑 → 保留惩罚
+2. 新增 forward_bias: 基于 x 坐标的高斯前向偏置
+3. 调整各分量权重: 降低 support/margin, 新增 edge/forward
+4. 温和的 temperature 和 label_smooth
 
-核心组件:
-- S_support: 支撑面积分数（3×3 局部最小二乘平面拟合，计算 RMS 残差）
-             均匀斜坡 → 残差≈0 → 高分；台阶边缘 → 残差大 → 低分
-- S_margin:  边缘裕度分数（基于 S_support 的 danger_map 做形态学腐蚀距离变换）
-             离边缘远 → 高分；贴边 → 低分
-- behind_mask: 身后区域惩罚（速度方向投影）
-
-height_map 符号语义 (与 LeggedGym 管线一致):
-- height_map = base_z - base_height - terrain_z
-- 正值 = 地面更低（坑）
-- 负值 = 地面更高（凸起/台阶）
+改动位置全部在 forward() 和 __init__() 中，
+其余方法 (_compute_plane_residual, _compute_margin, compute_behind_mask) 完全不变。
 """
 
 import torch
@@ -23,20 +20,6 @@ from typing import Optional, Dict, Tuple, Union, List
 
 
 class TerrainSafetyScorer(nn.Module):
-    """
-    纯物理先验的地形安全打分模块
-    
-    无任何可学习参数，所有计算均为固定物理规则。
-    输出 softmax 概率分布，作为 attention 的 KL 监督目标（detach 后使用）。
-    
-    输入:
-        height_map: [B, grid_h, grid_w] 采样点相对基准高度的差值
-        base_lin_vel: [B, 3] 机体坐标系下的质心线速度
-        
-    输出:
-        prior_dist: [B, grid_h * grid_w] softmax 概率分布
-        debug_info (可选): 包含中间结果的字典
-    """
     
     def __init__(
         self,
@@ -52,39 +35,24 @@ class TerrainSafetyScorer(nn.Module):
         danger_threshold: float = 0.02,
         pit_threshold: float = 0.3,
         max_margin_steps: int = 3,
-        # ===== 融合参数 =====
-        w_support: float = 1.0,
-        w_margin: float = 1.0,
-        temperature: float = 1.0,
-        # ===== 惩罚参数 =====
-        danger_penalty: float = -3.0,
+        # ===== 融合参数 (V2: 调整默认值) =====
+        w_support: float = 0.3,       # V1: 1.0 → V2: 0.3 降低"平坦=好"偏见
+        w_margin: float = 0.3,        # V1: 1.0 → V2: 0.3 降低"远离边缘=好"偏见
+        w_edge: float = 0.5,          # V2 新增: 边缘/过渡区信息加分
+        w_forward: float = 0.8,       # V2 新增: 前向位置偏置
+        forward_peak: float = 0.3,    # V2 新增: 前向高斯峰值位置 (m)
+        forward_sigma: float = 0.4,   # V2 新增: 前向高斯标准差 (m)
+        temperature: float = 1.0,     # V1: 1.0, 绿色实验: 0.5 → V2: 回到 1.0
+        # ===== 惩罚参数 (V2: 只惩罚深坑) =====
+        pit_penalty: float = -3.0,    # V1 的 danger_penalty 重命名为 pit_penalty
         behind_threshold: float = 0.3,
         behind_vel_threshold: float = 0.1,
         behind_penalty: float = -2.0,
         # ===== Label Smoothing =====
-        label_smooth: float = 0.05,
+        label_smooth: float = 0.05,   # V1: 0.05, 绿色实验: 0.01 → V2: 0.05
+        # ===== 边缘显著性上限 =====
+        edge_salience_max: float = 5.0,  # clamp 上限，防止极端值
     ):
-        """
-        Args:
-            grid_h, grid_w: 采样网格尺寸
-            measured_points_x/y: 采样点坐标列表
-            dx, dy: 采样间距（若 None 则从坐标自动计算）
-            support_scale: S_support 归一化尺度 (meter)。
-                           exp(-residual/scale) 将 RMS 残差映射到 [0,1]
-            danger_threshold: 平面拟合 RMS 残差超过此值 → 标记为危险点
-            pit_threshold: 深坑检测阈值 (meter，正值表示坑深)
-            max_margin_steps: 形态学腐蚀最大步数，决定裕度的最大感知范围
-            w_support, w_margin: S_support 与 S_margin 的融合权重
-            temperature: softmax 温度，越小分布越尖锐
-            danger_penalty: 危险区域的 logit 惩罚值（确保坑底等区域获得极低概率）
-            behind_threshold: 身后区域掩码的投影距离阈值
-            behind_vel_threshold: 触发身后掩码的最小速度
-            behind_penalty: 身后区域的 logit 惩罚值
-            label_smooth: label smoothing 系数 ε ∈ [0, 1)。
-                          p_smooth = (1-ε)·p_sharp + ε·uniform。
-                          确保所有点概率非零，改善 KL 梯度覆盖。
-                          ε=0 退化为无平滑（原始尖锐分布）。
-        """
         super().__init__()
         
         self.grid_h = grid_h
@@ -96,12 +64,15 @@ class TerrainSafetyScorer(nn.Module):
         self.max_margin_steps = max_margin_steps
         self.w_support = w_support
         self.w_margin = w_margin
+        self.w_edge = w_edge
+        self.w_forward = w_forward
         self.temperature = temperature
-        self.danger_penalty = danger_penalty
+        self.pit_penalty = pit_penalty
         self.behind_threshold = behind_threshold
         self.behind_vel_threshold = behind_vel_threshold
         self.behind_penalty = behind_penalty
         self.label_smooth = label_smooth
+        self.edge_salience_max = edge_salience_max
         
         # ===== 默认采样点坐标 (G1 配置) =====
         if measured_points_x is None:
@@ -126,34 +97,28 @@ class TerrainSafetyScorer(nn.Module):
         grid_xy = torch.stack([xx, yy], dim=0)  # [2, grid_h, grid_w]
         self.register_buffer('grid_xy', grid_xy)
         
+        # ===== V2 新增: 前向位置偏置 =====
+        forward_bias = torch.exp(-(x - forward_peak)**2 / (2 * forward_sigma**2))
+        forward_bias_2d = forward_bias.unsqueeze(1).expand(-1, len(measured_points_y))
+        self.register_buffer('forward_bias', forward_bias_2d)  # [grid_h, grid_w]
+        
         # ===== 预计算平面拟合卷积核 =====
         self._register_plane_fit_kernels(dx, dy)
     
     def _register_plane_fit_kernels(self, dx: float, dy: float):
-        """
-        预计算 3×3 局部最小二乘平面拟合所需的固定卷积核。
-        
-        对于中心对称的 3×3 正则网格，设计矩阵 X = [x, y, 1]，
-        其法方程 X^T X 为对角阵，残差方差有封闭解析公式:
-            var = (1/9)[Σz² − (Σxz)²/(6dx²) − (Σyz)²/(6dy²) − (Σz)²/9]
-        
-        三个卷积核分别计算 Σ(x_i·z_i)、Σ(y_i·z_i)、Σz_i。
-        """
-        # 计算 Σ(x_i · z_i) 的核：每行乘以对应的 x 偏移量
+        """预计算 3×3 局部最小二乘平面拟合卷积核（与 V1 完全相同）"""
         x_kernel = torch.tensor([
             [-dx, -dx, -dx],
             [  0,   0,   0],
             [ dx,  dx,  dx]
         ], dtype=torch.float32).view(1, 1, 3, 3)
         
-        # 计算 Σ(y_i · z_i) 的核：每列乘以对应的 y 偏移量
         y_kernel = torch.tensor([
             [-dy,  0,  dy],
             [-dy,  0,  dy],
             [-dy,  0,  dy]
         ], dtype=torch.float32).view(1, 1, 3, 3)
         
-        # 计算 Σz_i 的核
         ones_kernel = torch.ones(1, 1, 3, 3, dtype=torch.float32)
         
         self.register_buffer('x_kernel', x_kernel)
@@ -165,28 +130,14 @@ class TerrainSafetyScorer(nn.Module):
     
     @torch.no_grad()
     def _compute_plane_residual(self, height_map: torch.Tensor) -> torch.Tensor:
-        """
-        计算 3×3 窗口内局部平面拟合的 RMS 残差。
-        
-        物理含义：残差反映窗口内地面偏离平面的程度。
-        - 平坦地面 / 均匀斜坡 → 完美拟合 → 残差 ≈ 0
-        - 台阶边缘 / 缝隙边缘 → 拟合困难 → 残差大
-        
-        推导（利用正则网格对称性 Σx=Σy=Σxy=0）:
-            residual_var = (1/9)[Σz² − (Σxz)²/(6dx²) − (Σyz)²/(6dy²) − (Σz)²/9]
-        
-        Args:
-            height_map: [B, grid_h, grid_w]
-        Returns:
-            residual_rms: [B, grid_h, grid_w] RMS 残差 (meter)
-        """
-        h = height_map.unsqueeze(1)  # [B, 1, H, W]
+        """计算 3×3 窗口内局部平面拟合的 RMS 残差（与 V1 完全相同）"""
+        h = height_map.unsqueeze(1)
         h_pad = F.pad(h, (1, 1, 1, 1), mode='replicate')
         
-        sum_z  = F.conv2d(h_pad, self.ones_kernel)       # Σz_i      [B, 1, H, W]
-        sum_z2 = F.conv2d(h_pad ** 2, self.ones_kernel)   # Σz_i²
-        sum_xz = F.conv2d(h_pad, self.x_kernel)           # Σ(x_i·z_i)
-        sum_yz = F.conv2d(h_pad, self.y_kernel)           # Σ(y_i·z_i)
+        sum_z  = F.conv2d(h_pad, self.ones_kernel)
+        sum_z2 = F.conv2d(h_pad ** 2, self.ones_kernel)
+        sum_xz = F.conv2d(h_pad, self.x_kernel)
+        sum_yz = F.conv2d(h_pad, self.y_kernel)
         
         residual_var = (1.0 / 9.0) * (
             sum_z2
@@ -194,54 +145,27 @@ class TerrainSafetyScorer(nn.Module):
             - sum_yz ** 2 * self.inv_6dy2
             - sum_z ** 2 / 9.0
         )
-        residual_var = residual_var.clamp(min=0)  # 数值保护
+        residual_var = residual_var.clamp(min=0)
         
-        return torch.sqrt(residual_var + 1e-8).squeeze(1)  # [B, H, W]
+        return torch.sqrt(residual_var + 1e-8).squeeze(1)
     
     @torch.no_grad()
     def _compute_margin(self, danger_mask: torch.Tensor) -> torch.Tensor:
-        """
-        基于形态学腐蚀计算到最近危险区域的 Chebyshev 距离。
-        
-        每轮腐蚀将安全区域向内收缩一个像素（3×3 min pooling）。
-        某点存活的轮数 = 到最近危险点的距离。
-        
-        使用 replicate padding 避免网格边界被误判为危险区域。
-        
-        Args:
-            danger_mask: [B, grid_h, grid_w] bool, True = 危险
-        Returns:
-            S_margin: [B, grid_h, grid_w] 归一化裕度分数 [0, 1]
-                      1 = 远离边缘（存活所有腐蚀轮次）
-                      0 = 在危险点上或紧邻危险点
-        """
-        safe = (~danger_mask).float().unsqueeze(1)  # [B, 1, H, W]
+        """形态学腐蚀距离变换（与 V1 完全相同）"""
+        safe = (~danger_mask).float().unsqueeze(1)
         margin = torch.zeros_like(safe)
         
         for _ in range(self.max_margin_steps):
             margin += safe
-            # min pooling (= erosion): 3×3 邻域中有任一 0 → 输出 0
             safe_pad = F.pad(safe, (1, 1, 1, 1), mode='replicate')
             safe = -F.max_pool2d(-safe_pad, 3, 1, 0)
         
-        return (margin / self.max_margin_steps).squeeze(1)  # [B, H, W]
+        return (margin / self.max_margin_steps).squeeze(1)
     
     @torch.no_grad()
-    def compute_behind_mask(
-        self,
-        base_lin_vel: torch.Tensor,
-        B: int
-    ) -> torch.Tensor:
-        """
-        计算身后区域掩码（速度方向的点积半平面判断）。
-        
-        Args:
-            base_lin_vel: [B, 3] 机体坐标系下的线速度
-            B: batch size
-        Returns:
-            behind_mask: [B, grid_h, grid_w] bool
-        """
-        grid_xy = self.grid_xy.unsqueeze(0).expand(B, -1, -1, -1)  # [B, 2, H, W]
+    def compute_behind_mask(self, base_lin_vel: torch.Tensor, B: int) -> torch.Tensor:
+        """身后区域掩码（与 V1 完全相同）"""
+        grid_xy = self.grid_xy.unsqueeze(0).expand(B, -1, -1, -1)
         grid_x = grid_xy[:, 0, :, :]
         grid_y = grid_xy[:, 1, :, :]
         
@@ -267,50 +191,51 @@ class TerrainSafetyScorer(nn.Module):
         return_debug_info: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict]]:
         """
-        计算地形安全先验分布。
+        V2 计算地形信息先验分布。
         
-        流程:
-            1. 平面拟合残差 → S_support (exp 归一化到 [0,1])
-            2. 残差 + 深坑 → danger_map → 形态学腐蚀 → S_margin [0,1]
-            3. 身后掩码 → behind_penalty
-            4. 加权融合 → softmax → label smoothing → prior_dist
-        
-        Args:
-            height_map: [B, grid_h, grid_w]
-            base_lin_vel: [B, 3]
-            return_debug_info: 是否返回中间结果
-            
-        Returns:
-            prior_dist: [B, num_points] softmax 概率分布
-            debug_info (可选): 中间结果字典
+        与 V1 的关键区别:
+        1. 边缘/过渡区获得正向权重 (edge_bonus) 而非惩罚
+        2. 只有深坑保留惩罚 (pit_penalty)
+        3. 新增前向位置偏置 (forward_bias)
+        4. 降低 support/margin 权重，突出 edge/forward
         """
         B = height_map.shape[0]
         
         # ===== 1. 平面拟合残差 =====
-        residual_rms = self._compute_plane_residual(height_map)  # [B, H, W]
+        residual_rms = self._compute_plane_residual(height_map)
         
         # ===== 2. 支撑面积分数 =====
-        S_support = torch.exp(-residual_rms / self.support_scale)  # [B, H, W], ∈ [0, 1]
+        S_support = torch.exp(-residual_rms / self.support_scale)
         
-        # ===== 3. 危险区域检测 =====
-        danger_mask = (
-            (residual_rms > self.danger_threshold) |  # 平面拟合残差过大
-            (height_map > self.pit_threshold)          # 深坑
-        )
+        # ===== 3. V2: 区分 "边缘" 和 "深坑" =====
+        is_pit = (height_map > self.pit_threshold)
+        is_edge = (residual_rms > self.danger_threshold) & ~is_pit
         
-        # ===== 4. 边缘裕度分数 =====
-        S_margin = self._compute_margin(danger_mask)  # [B, H, W], ∈ [0, 1]
+        # 边缘显著性: 残差越大 → 地形变化越剧烈 → 越需要关注
+        edge_salience = (residual_rms / self.support_scale).clamp(max=self.edge_salience_max)
+        
+        # ===== 4. 边缘裕度 (只基于 pit 做 danger_mask) =====
+        # V2: margin 只计算到深坑的距离，不把边缘也当 danger
+        S_margin = self._compute_margin(is_pit)
         
         # ===== 5. 身后掩码 =====
         behind_mask = self.compute_behind_mask(base_lin_vel, B)
         
-        # ===== 6. 加权融合 =====
-        # danger 区域抹零 S_support（消除"平坑高分"假象：坑底虽平但不可踩）
-        safe_float = (~danger_mask).float()
-        logits = self.w_support * S_support * safe_float + self.w_margin * S_margin
-        # 为 danger 区域施加显式惩罚（拉开安全/危险区的 logit 差距）
-        logits = logits + danger_mask.float() * self.danger_penalty
-        logits = logits + behind_mask.float() * self.behind_penalty
+        # ===== 6. V2: 融合 logits =====
+        logits = (
+            # 基础: 平坦区域的支撑质量 (权重降低)
+            self.w_support * S_support * (~is_pit).float()
+            # 裕度: 离深坑的距离 (权重降低)
+            + self.w_margin * S_margin
+            # V2 新增: 边缘/过渡区加分 (核心改动)
+            + self.w_edge * is_edge.float() * edge_salience
+            # V2 新增: 前向位置偏置
+            + self.w_forward * self.forward_bias.unsqueeze(0)
+            # 深坑惩罚 (只惩罚真正不可踩的区域)
+            + is_pit.float() * self.pit_penalty
+            # 身后惩罚
+            + behind_mask.float() * self.behind_penalty
+        )
         
         # ===== 7. softmax → 概率分布 =====
         prior_dist = F.softmax(logits.view(B, -1) / self.temperature, dim=-1)
@@ -322,13 +247,15 @@ class TerrainSafetyScorer(nn.Module):
         
         if return_debug_info:
             debug_info = {
-                'residual_rms': residual_rms.detach(),   # [B, H, W] 平面拟合残差
-                'S_support': S_support.detach(),         # [B, H, W] 支撑面积分数
-                'danger_mask': danger_mask.detach(),     # [B, H, W] 危险区域掩码
-                'S_margin': S_margin.detach(),           # [B, H, W] 边缘裕度分数
-                'behind_mask': behind_mask.detach(),     # [B, H, W] 身后掩码
-                'logits_2d': logits.detach(),            # [B, H, W] 融合后 logits
-                'prior_dist': prior_dist.detach(),       # [B, num_points] 概率分布
+                'residual_rms': residual_rms.detach(),
+                'S_support': S_support.detach(),
+                'is_pit': is_pit.detach(),            # V2: 替代 danger_mask
+                'is_edge': is_edge.detach(),           # V2 新增
+                'edge_salience': edge_salience.detach(),  # V2 新增
+                'S_margin': S_margin.detach(),
+                'behind_mask': behind_mask.detach(),
+                'logits_2d': logits.detach(),
+                'prior_dist': prior_dist.detach(),
             }
             return prior_dist, debug_info
         
@@ -343,8 +270,9 @@ class TerrainSafetyScorer(nn.Module):
             f"pit_threshold={self.pit_threshold}, "
             f"max_margin_steps={self.max_margin_steps}, "
             f"w_support={self.w_support}, w_margin={self.w_margin}, "
+            f"w_edge={self.w_edge}, w_forward={self.w_forward}, "
             f"temperature={self.temperature}, "
-            f"danger_penalty={self.danger_penalty}, "
+            f"pit_penalty={self.pit_penalty}, "
             f"behind_penalty={self.behind_penalty}, "
             f"label_smooth={self.label_smooth}"
         )
