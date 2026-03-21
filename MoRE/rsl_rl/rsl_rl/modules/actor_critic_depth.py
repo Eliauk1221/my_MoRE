@@ -297,8 +297,8 @@ class ActorCriticDepth(nn.Module):
             self.terrain_safety_scorer = TerrainSafetyScorer(
                 grid_h=terrain_attn_grid_h,
                 grid_w=terrain_attn_grid_w,
-                temperature=0.5,
-                label_smooth=0.01,
+                # temperature=0.5,
+                # label_smooth=0.01,
             )
             print(f"TerrainSafetyScorer enabled for KL loss guidance")
         else:
