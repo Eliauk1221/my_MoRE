@@ -131,6 +131,16 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         terminal_amp_states = self.get_amp_observations()[env_ids]
         terminal_obs, terminal_critic_obs = self.compute_observations()
+
+        if len(env_ids) > 0:
+            self.extras["terminal_root_pos_xy"] = self.root_states[env_ids, :2].clone()
+            self.extras["terminal_env_origins_xy"] = self.env_origins[env_ids, :2].clone()
+            self.extras["terminal_env_class"] = self.env_class[env_ids].clone()
+        else:
+            self.extras.pop("terminal_root_pos_xy", None)
+            self.extras.pop("terminal_env_origins_xy", None)
+            self.extras.pop("terminal_env_class", None)
+
         self.reset_idx(env_ids)
 
         self.update_depth_buffer()

@@ -340,28 +340,18 @@ class AMPOnPolicyRunnerMulti:
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         
                         # ===== 按地形类型记录 Traverse Rate 和 Success Rate =====
-                        if len(new_ids) > 0 and hasattr(self.env, 'env_class') and hasattr(self.env, 'env_origins'):
+                        if len(new_ids) > 0 and "terminal_root_pos_xy" in infos:
                             done_env_ids = new_ids[:, 0]
                             
-                            # 获取结束时的地形类型
-                            terrain_types = self.env.env_class[done_env_ids].long().cpu().numpy()
+                            terminal_pos = infos["terminal_root_pos_xy"].cpu()
+                            terminal_origins = infos["terminal_env_origins_xy"].cpu()
+                            terrain_types = infos["terminal_env_class"].long().cpu().numpy()
                             
-                            # 计算行进距离 (从起点到当前位置的 x 方向距离)
-                            current_pos = self.env.root_states[done_env_ids, :2].cpu()
-                            origin_pos = self.env.env_origins[done_env_ids, :2].cpu()
-                            distance_traveled = torch.norm(current_pos - origin_pos, dim=1).numpy()
-                            
-                            # 计算 traverse rate
+                            distance_traveled = torch.norm(terminal_pos - terminal_origins, dim=1).numpy()
                             traverse_rates = distance_traveled / self.terrain_length
                             
-                            # 判断是否成功 (超时而非跌倒)
-                            time_out = self.env.time_out_buf[done_env_ids].cpu().numpy()
-                            reset_buf = self.env.reset_buf[done_env_ids].cpu().numpy()
-                            # 成功 = 超时 (如果 reset 仅由 timeout 触发，则认为成功)
-                            # 注意: reset_buf 包含 time_out_buf，所以需要检查 episode_length
                             is_success = (cur_episode_length[done_env_ids].cpu().numpy() >= self.env.max_episode_length - 1)
                             
-                            # 按地形类型分类记录
                             for idx, (t_type, t_rate, success) in enumerate(zip(terrain_types, traverse_rates, is_success)):
                                 if 0 <= t_type < self.num_terrain_types:
                                     terrain_name = self.terrain_names[int(t_type)]
