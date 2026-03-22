@@ -112,6 +112,7 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         
         # ===== 消融实验开关 =====
         include_depth_in_actor = False   # 是否在 actor 输入中包含 depth_feature（用于消融实验）
+        terrain_attn_query_with_depth = False  # 是否将 depth_feature 拼入注意力 Query（跨模态中期融合）
         
         # ===== KL 先验引导配置 =====
         use_attn_kl_loss = True         # 开关：是否使用 TerrainSafetyScorer 的 KL 散度辅助损失引导注意力
@@ -335,6 +336,7 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         # ===== 消融实验开关 (需与 terrain_attention 配置一致) =====
         include_depth_in_actor = False    # 是否在 actor 输入中包含 depth_feature
         terrain_attn_query_with_history = False  # True: query=obs+his_feature; False: query=obs
+        terrain_attn_query_with_depth = False    # True: 将 depth_feature 拼入注意力 Query
         
         # ===== KL 先验引导 (需与 terrain_attention 配置一致) =====
         use_attn_kl_loss = True         # 是否使用 KL 散度辅助损失引导注意力

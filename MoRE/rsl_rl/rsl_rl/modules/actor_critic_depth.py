@@ -249,6 +249,7 @@ class ActorCriticDepth(nn.Module):
                         # ===== 消融实验开关 =====
                         include_depth_in_actor=True,  # 是否在 actor 输入中包含 depth_feature
                         terrain_attn_query_with_history=True,  # 注意力 Query 是否包含历史特征
+                        terrain_attn_query_with_depth=False,   # 是否将 depth_feature 拼入注意力 Query
                         # ===== KL 先验引导 =====
                         use_attn_kl_loss=False,       # 是否使用 KL 散度辅助损失引导注意力
                         **kwargs):
@@ -263,18 +264,21 @@ class ActorCriticDepth(nn.Module):
         self.include_depth_in_actor = include_depth_in_actor
         self.use_attn_kl_loss = use_attn_kl_loss
         self.terrain_attn_query_with_history = terrain_attn_query_with_history
+        self.terrain_attn_query_with_depth = terrain_attn_query_with_depth
 
         # depth encoder
         depth_backbone = DepthOnlyFCBackbone58x87(output_dim=128, output_activation=activation)
         self.depth_encoder = StackDepthEncoder(depth_backbone, buffer_len=2)
+        self.depth_feature_dim = depth_backbone.output_dim  # 128
 
         # ===== 地形注意力编码器 (Actor 用) =====
         terrain_attn_dim = 0
         if use_terrain_attention:
+            terrain_attn_query_dim = num_actor_obs
             if terrain_attn_query_with_history:
-                terrain_attn_query_dim = num_actor_obs + his_latent_dim
-            else:
-                terrain_attn_query_dim = num_actor_obs
+                terrain_attn_query_dim += his_latent_dim
+            if terrain_attn_query_with_depth:
+                terrain_attn_query_dim += self.depth_feature_dim
             self.terrain_attention = TerrainAttentionEncoder(
                 grid_h=terrain_attn_grid_h,
                 grid_w=terrain_attn_grid_w,
@@ -288,6 +292,7 @@ class ActorCriticDepth(nn.Module):
             print(f"Actor TerrainAttentionEncoder enabled: grid={terrain_attn_grid_h}x{terrain_attn_grid_w}, "
                   f"heads={terrain_attn_num_heads}, output_dim={terrain_attn_output_dim}, "
                   f"query_dim={terrain_attn_query_dim}, query_with_history={terrain_attn_query_with_history}, "
+                  f"query_with_depth={terrain_attn_query_with_depth}, "
                   f"use_pre_ln={terrain_attn_use_pre_ln}")
         else:
             self.terrain_attention = None
@@ -411,10 +416,12 @@ class ActorCriticDepth(nn.Module):
             actor_input_parts.append(depth_feature)
         
         if self.use_terrain_attention and height_map is not None and terrain_xyz is not None:
+            query_parts = [observations]
             if self.terrain_attn_query_with_history:
-                query_context = torch.cat([observations, his_feature], dim=-1)
-            else:
-                query_context = observations
+                query_parts.append(his_feature)
+            if self.terrain_attn_query_with_depth:
+                query_parts.append(depth_feature)
+            query_context = torch.cat(query_parts, dim=-1) if len(query_parts) > 1 else observations
             terrain_feature = self.terrain_attention(height_map, terrain_xyz, query_context)
             actor_input_parts.append(terrain_feature)
         
@@ -439,10 +446,12 @@ class ActorCriticDepth(nn.Module):
             actor_input_parts.append(depth_feature)
         
         if self.use_terrain_attention and height_map is not None and terrain_xyz is not None:
+            query_parts = [observations]
             if self.terrain_attn_query_with_history:
-                query_context = torch.cat([observations, his_feature], dim=-1)
-            else:
-                query_context = observations
+                query_parts.append(his_feature)
+            if self.terrain_attn_query_with_depth:
+                query_parts.append(depth_feature)
+            query_context = torch.cat(query_parts, dim=-1) if len(query_parts) > 1 else observations
             terrain_feature = self.terrain_attention(height_map, terrain_xyz, query_context)
             actor_input_parts.append(terrain_feature)
         
