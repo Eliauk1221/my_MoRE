@@ -375,11 +375,11 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         """
         super()._resample_commands(env_ids)
 
-        only_forward_env = torch.logical_and(self.env_class != 0, self.env_class != 1)
-        self.commands[only_forward_env, 3] = 0
-        self.commands[only_forward_env, 2] = 0
-        self.commands[only_forward_env, 1] = 0
-        self.commands[only_forward_env, 0] = torch.abs(self.commands[only_forward_env, 0])
+        # Apply only-forward command constraints to all terrain classes.
+        self.commands[:, 3] = 0
+        self.commands[:, 2] = 0
+        self.commands[:, 1] = 0
+        self.commands[:, 0] = torch.abs(self.commands[:, 0])
     
     #------------ reward functions----------------
     def _reward_tracking_lin_vel(self):
