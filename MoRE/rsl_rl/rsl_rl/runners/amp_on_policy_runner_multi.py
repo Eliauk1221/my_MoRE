@@ -187,6 +187,10 @@ class AMPOnPolicyRunnerMulti:
         self.num_terrain_types = len(self.terrain_names)
         # 获取地形长度用于计算 traverse rate
         self.terrain_length = getattr(self.env.cfg.terrain, 'terrain_length', 14.0)
+        # success 判定阈值（traverse_rate >= 0.9 视为"真正通关"）
+        self.success_threshold = getattr(self.env.cfg.terrain, 'success_threshold', 0.9)
+        # 阶段性里程碑阈值，用于观察训练中期进展
+        self.success_milestones = [0.5, 0.8]
 
         _, _ = self.env.reset()
     
