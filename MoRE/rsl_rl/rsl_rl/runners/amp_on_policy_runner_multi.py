@@ -350,7 +350,7 @@ class AMPOnPolicyRunnerMulti:
                         
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         
-                        # ===== 按地形类型记录 Traverse Rate 和 Success Rate =====
+                        # ===== 按地形类型记录指标 =====
                         if len(new_ids) > 0 and "terminal_root_pos_xy" in infos:
                             done_env_ids = new_ids[:, 0]
                             
@@ -358,16 +358,21 @@ class AMPOnPolicyRunnerMulti:
                             terminal_origins = infos["terminal_env_origins_xy"].cpu()
                             terrain_types = infos["terminal_env_class"].long().cpu().numpy()
                             
-                            distance_traveled = torch.norm(terminal_pos - terminal_origins, dim=1).numpy()
-                            traverse_rates = distance_traveled / self.terrain_length
+                            forward_distance = (terminal_pos[:, 0] - terminal_origins[:, 0]).clamp(min=0).numpy()
+                            traverse_rates = forward_distance / self.terrain_length
                             
-                            is_success = (cur_episode_length[done_env_ids].cpu().numpy() >= self.env.max_episode_length - 1)
+                            is_survived = (cur_episode_length[done_env_ids].cpu().numpy() >= self.env.max_episode_length - 1)
+                            is_success = (traverse_rates >= self.success_threshold)
                             
-                            for idx, (t_type, t_rate, success) in enumerate(zip(terrain_types, traverse_rates, is_success)):
+                            for idx, (t_type, t_rate, survived, success) in enumerate(
+                                    zip(terrain_types, traverse_rates, is_survived, is_success)):
                                 if 0 <= t_type < self.num_terrain_types:
                                     terrain_name = self.terrain_names[int(t_type)]
                                     traverse_buffers[terrain_name].append(t_rate)
+                                    survival_buffers[terrain_name].append(float(survived))
                                     success_buffers[terrain_name].append(float(success))
+                                    for ms in self.success_milestones:
+                                        milestone_buffers[ms][terrain_name].append(float(t_rate >= ms))
                         
                         cur_reward_sum[new_ids] = 0
                         cur_disc_reward_sum[new_ids] = 0
