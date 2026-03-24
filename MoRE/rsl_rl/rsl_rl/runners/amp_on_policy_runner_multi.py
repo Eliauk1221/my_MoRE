@@ -511,30 +511,50 @@ class AMPOnPolicyRunnerMulti:
             self.writer.add_scalar('Attention/prior_attn_cosine', locs['mean_prior_attn_cosine'], locs['it'])
             self.writer.add_scalar('Attention/prior_entropy', locs['mean_prior_entropy'], locs['it'])
         
-        # ===== 按地形类型的 Traverse Rate 和 Success Rate =====
-        if 'traverse_buffers' in locs and 'success_buffers' in locs:
+        # ===== 按地形类型的指标 =====
+        if 'traverse_buffers' in locs and 'survival_buffers' in locs:
             traverse_buffers = locs['traverse_buffers']
+            survival_buffers = locs['survival_buffers']
             success_buffers = locs['success_buffers']
+            milestone_buffers = locs['milestone_buffers']
             
             total_traverse = []
+            total_survival = []
             total_success = []
+            total_milestones = {ms: [] for ms in self.success_milestones}
             
             for terrain_name in self.terrain_names:
                 if len(traverse_buffers[terrain_name]) > 0:
                     mean_traverse = statistics.mean(traverse_buffers[terrain_name])
                     self.writer.add_scalar(f'Terrain/{terrain_name}/traverse_rate', mean_traverse, locs['it'])
                     total_traverse.extend(traverse_buffers[terrain_name])
+                
+                if len(survival_buffers[terrain_name]) > 0:
+                    mean_survival = statistics.mean(survival_buffers[terrain_name])
+                    self.writer.add_scalar(f'Terrain/{terrain_name}/survival_rate', mean_survival, locs['it'])
+                    total_survival.extend(survival_buffers[terrain_name])
                     
                 if len(success_buffers[terrain_name]) > 0:
                     mean_success = statistics.mean(success_buffers[terrain_name])
                     self.writer.add_scalar(f'Terrain/{terrain_name}/success_rate', mean_success, locs['it'])
                     total_success.extend(success_buffers[terrain_name])
+                
+                for ms in self.success_milestones:
+                    if len(milestone_buffers[ms][terrain_name]) > 0:
+                        mean_ms = statistics.mean(milestone_buffers[ms][terrain_name])
+                        self.writer.add_scalar(f'Terrain/{terrain_name}/success@{ms}', mean_ms, locs['it'])
+                        total_milestones[ms].extend(milestone_buffers[ms][terrain_name])
             
             # 总体指标
             if len(total_traverse) > 0:
                 self.writer.add_scalar('Terrain/overall/traverse_rate', statistics.mean(total_traverse), locs['it'])
+            if len(total_survival) > 0:
+                self.writer.add_scalar('Terrain/overall/survival_rate', statistics.mean(total_survival), locs['it'])
             if len(total_success) > 0:
                 self.writer.add_scalar('Terrain/overall/success_rate', statistics.mean(total_success), locs['it'])
+            for ms in self.success_milestones:
+                if len(total_milestones[ms]) > 0:
+                    self.writer.add_scalar(f'Terrain/overall/success@{ms}', statistics.mean(total_milestones[ms]), locs['it'])
             
         if len(locs['rewbuffer']) > 0:
             self.writer.add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), locs['it'])
