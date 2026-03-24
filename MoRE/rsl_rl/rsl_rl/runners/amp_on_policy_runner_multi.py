@@ -247,10 +247,17 @@ class AMPOnPolicyRunnerMulti:
         lenbuffer = deque(maxlen=100)
         
         # ===== 按地形类型细分的指标 buffer =====
-        # traverse_rate: 行进距离 / 地形长度
-        # success: 是否成功完成（超时但未跌倒）
+        # traverse_rate: 前进方向位移 / 地形长度（连续值）
+        # survival: episode 存活到 max_episode_length（未跌倒）
+        # success: traverse_rate >= success_threshold（真正通关）
+        # milestone: traverse_rate >= 阶段阈值（观察中期进展）
         traverse_buffers = {name: deque(maxlen=50) for name in self.terrain_names}
+        survival_buffers = {name: deque(maxlen=50) for name in self.terrain_names}
         success_buffers = {name: deque(maxlen=50) for name in self.terrain_names}
+        milestone_buffers = {
+            ms: {name: deque(maxlen=50) for name in self.terrain_names}
+            for ms in self.success_milestones
+        }
 
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_disc_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
