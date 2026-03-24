@@ -252,6 +252,9 @@ class ActorCriticDepth(nn.Module):
                         terrain_attn_query_with_depth=False,   # 是否将 depth_feature 拼入注意力 Query
                         # ===== KL 先验引导 =====
                         use_attn_kl_loss=False,       # 是否使用 KL 散度辅助损失引导注意力
+                        # ===== TerrainSafetyScorer 先验分量权重 =====
+                        scorer_w_support=0.3,
+                        scorer_w_margin=0.3,
                         **kwargs):
         if kwargs:
             print("ActorCriticEst.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()]))
@@ -302,10 +305,11 @@ class ActorCriticDepth(nn.Module):
             self.terrain_safety_scorer = TerrainSafetyScorer(
                 grid_h=terrain_attn_grid_h,
                 grid_w=terrain_attn_grid_w,
-                # temperature=0.5,
-                # label_smooth=0.01,
+                w_support=scorer_w_support,
+                w_margin=scorer_w_margin,
             )
-            print(f"TerrainSafetyScorer enabled for KL loss guidance")
+            print(f"TerrainSafetyScorer enabled for KL loss guidance "
+                  f"(w_support={scorer_w_support}, w_margin={scorer_w_margin})")
         else:
             self.terrain_safety_scorer = None
             if use_attn_kl_loss and not use_terrain_attention:

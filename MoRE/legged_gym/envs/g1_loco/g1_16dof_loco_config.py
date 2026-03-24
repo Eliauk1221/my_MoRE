@@ -120,6 +120,10 @@ class G1_16Dof_Loco_Cfg( LeggedRobotCfg ):
         attn_kl_anneal_start = 0        # KL loss 生效起始 iteration（0 = 从头开始）
         attn_kl_anneal_end = 0          # KL loss 线性增长到全量的结束 iteration（0 = 不退火，直接全量）
         
+        # ===== TerrainSafetyScorer 先验分量权重（消融 A2/A3 用） =====
+        scorer_w_support = 0.3           # S_support 权重，设 0 可禁用（A2 实验）
+        scorer_w_margin = 0.3            # S_margin 权重，设 0 可禁用（A3 实验）
+        
         # ===== 训练可视化配置 =====
         viz_enabled = False              # 是否启用训练可视化
         viz_interval = 500               # 可视化间隔（每 N 轮保存一次）
@@ -340,6 +344,10 @@ class G1_16Dof_Loco_CfgPPO( LeggedRobotCfgPPO ):
         
         # ===== KL 先验引导 (需与 terrain_attention 配置一致) =====
         use_attn_kl_loss = False         # 是否使用 KL 散度辅助损失引导注意力
+        
+        # ===== TerrainSafetyScorer 先验分量权重（消融 A2/A3 用） =====
+        scorer_w_support = 0.3           # S_support 权重，设 0 可禁用（A2 实验）
+        scorer_w_margin = 0.3            # S_margin 权重，设 0 可禁用（A3 实验）
 
     class algorithm( LeggedRobotCfgPPO.algorithm ):
         use_amp = False
