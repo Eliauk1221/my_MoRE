@@ -52,6 +52,9 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         self.feet_indicator_offset = torch.tensor(self.cfg.asset.feet_indicator_offset, dtype=torch.float, device=self.device, requires_grad=False)
         self.feet_indicator_pos = torch.zeros(self.num_envs, len(self.feet_indices), *self.feet_indicator_offset.shape,dtype=torch.float, device=self.device, requires_grad=False)
         
+        # ===== 速度追踪误差累积 buffer =====
+        self.lin_vel_error_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        
         # ===== 地形注意力相关 buffer =====
         if hasattr(self.cfg, 'terrain_attention') and self.cfg.terrain_attention.use_attention:
             self.use_terrain_attention = True
@@ -67,7 +70,16 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
             self.height_clip_ratio = None
 
     def reset_idx(self, env_ids):
+        if len(env_ids) > 0:
+            ep_len = self.episode_length_buf[env_ids].float().clamp(min=1)
+            mean_error = torch.mean(self.lin_vel_error_sum[env_ids] / ep_len)
+            self.lin_vel_error_sum[env_ids] = 0.
+        
         super().reset_idx(env_ids)
+        
+        if len(env_ids) > 0:
+            self.extras["episode"]["lin_vel_tracking_error"] = mean_error
+        
         self.last_actions[env_ids] = 0.
         self.last_last_actions[env_ids] = 0.
         self.last_feet_contact_force[env_ids] = 0.
@@ -124,6 +136,9 @@ class G1_16Dof_Loco_Robot(LeggedRobot):
         self.contact_filt = torch.logical_or(contact, self.last_contacts)
         self.contact_over = torch.logical_and(~contact, self.last_contacts)
         self.last_contacts = contact
+
+        # 累积原始速度追踪误差 (RMSE, m/s)
+        self.lin_vel_error_sum += torch.norm(self.commands[:, :2] - self.base_lin_vel[:, :2], dim=1)
 
         # compute observations, rewards, resets, ...
         self.check_termination()
