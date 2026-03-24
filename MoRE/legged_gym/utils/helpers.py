@@ -148,6 +148,7 @@ def get_args():
         {"name": "--num_envs", "type": int, "help": "Number of environments to create. Overrides config file if provided."},
         {"name": "--seed", "type": int, "help": "Random seed. Overrides config file if provided."},
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
+        {"name": "--exp_id", "type": str, "default": None, "help": "Experiment profile ID. Supported: M1, M2, M3, D1, B2, A2, A3."},
 
         {"name": "--mesh_terrain", "action": "store_true", "default": False, "help": "use mesh terrain"},
     ]
