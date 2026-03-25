@@ -43,7 +43,9 @@ def train_with_profile(args):
         f"use_attn_kl_loss={profile['use_attn_kl_loss']}, "
         f"lambda_kl={profile['attn_kl_coef']}, "
         f"w_support={profile['scorer_w_support']}, "
-        f"w_margin={profile['scorer_w_margin']}"
+        f"w_margin={profile['scorer_w_margin']}, "
+        f"w_edge={profile['scorer_w_edge']}, "
+        f"w_forward={profile['scorer_w_forward']}"
     )
 
     # 默认自动附加实验 ID，避免多实验日志互相覆盖

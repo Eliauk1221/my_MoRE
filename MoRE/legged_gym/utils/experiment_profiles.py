@@ -2,6 +2,17 @@ from copy import deepcopy
 
 
 # 统一实验配置（B1 与 M1 配置相同，因此不单独维护 B1）
+#
+# scorer 分量默认值（V2）:
+#   w_support=0.3, w_margin=0.3, w_edge=0.5, w_forward=0.8
+
+_SCORER_DEFAULTS = {
+    "scorer_w_support": 0.3,
+    "scorer_w_margin": 0.3,
+    "scorer_w_edge": 0.5,
+    "scorer_w_forward": 0.8,
+}
+
 EXPERIMENT_PROFILES = {
     "M1": {
         "description": "Ours full method",
@@ -11,8 +22,7 @@ EXPERIMENT_PROFILES = {
         "terrain_attn_query_with_depth": True,
         "use_attn_kl_loss": True,
         "attn_kl_coef": 0.1,
-        "scorer_w_support": 0.3,
-        "scorer_w_margin": 0.3,
+        **_SCORER_DEFAULTS,
     },
     "M2": {
         "description": "Depth encoding baseline (MoRE stage 1)",
@@ -22,8 +32,7 @@ EXPERIMENT_PROFILES = {
         "terrain_attn_query_with_depth": False,
         "use_attn_kl_loss": False,
         "attn_kl_coef": 0.1,
-        "scorer_w_support": 0.3,
-        "scorer_w_margin": 0.3,
+        **_SCORER_DEFAULTS,
     },
     "M3": {
         "description": "Attention baseline (He et al. style)",
@@ -33,8 +42,7 @@ EXPERIMENT_PROFILES = {
         "terrain_attn_query_with_depth": False,
         "use_attn_kl_loss": False,
         "attn_kl_coef": 0.1,
-        "scorer_w_support": 0.3,
-        "scorer_w_margin": 0.3,
+        **_SCORER_DEFAULTS,
     },
     "D1": {
         "description": "Ours without KL prior guidance",
@@ -44,8 +52,7 @@ EXPERIMENT_PROFILES = {
         "terrain_attn_query_with_depth": True,
         "use_attn_kl_loss": False,
         "attn_kl_coef": 0.1,
-        "scorer_w_support": 0.3,
-        "scorer_w_margin": 0.3,
+        **_SCORER_DEFAULTS,
     },
     "B2": {
         "description": "Depth as Actor input instead of Query",
@@ -55,30 +62,29 @@ EXPERIMENT_PROFILES = {
         "terrain_attn_query_with_depth": False,
         "use_attn_kl_loss": True,
         "attn_kl_coef": 0.1,
-        "scorer_w_support": 0.3,
-        "scorer_w_margin": 0.3,
+        **_SCORER_DEFAULTS,
     },
     "A2": {
-        "description": "Remove S_support component",
+        "description": "Remove forward_bias (w_forward=0)",
         "use_attention": True,
         "include_depth_in_actor": False,
         "terrain_attn_query_with_history": False,
         "terrain_attn_query_with_depth": True,
         "use_attn_kl_loss": True,
         "attn_kl_coef": 0.1,
-        "scorer_w_support": 0.0,
-        "scorer_w_margin": 0.3,
+        **_SCORER_DEFAULTS,
+        "scorer_w_forward": 0.0,
     },
     "A3": {
-        "description": "Remove S_margin component",
+        "description": "Remove edge_bonus (w_edge=0)",
         "use_attention": True,
         "include_depth_in_actor": False,
         "terrain_attn_query_with_history": False,
         "terrain_attn_query_with_depth": True,
         "use_attn_kl_loss": True,
         "attn_kl_coef": 0.1,
-        "scorer_w_support": 0.3,
-        "scorer_w_margin": 0.0,
+        **_SCORER_DEFAULTS,
+        "scorer_w_edge": 0.0,
     },
 }
 
@@ -112,6 +118,8 @@ def apply_experiment_profile(env_cfg, train_cfg, exp_id):
     env_ta.attn_kl_coef = profile["attn_kl_coef"]
     env_ta.scorer_w_support = profile["scorer_w_support"]
     env_ta.scorer_w_margin = profile["scorer_w_margin"]
+    env_ta.scorer_w_edge = profile["scorer_w_edge"]
+    env_ta.scorer_w_forward = profile["scorer_w_forward"]
 
     # policy 侧开关（ActorCriticDepth 使用）
     policy.use_terrain_attention = profile["use_attention"]
@@ -121,6 +129,8 @@ def apply_experiment_profile(env_cfg, train_cfg, exp_id):
     policy.use_attn_kl_loss = profile["use_attn_kl_loss"]
     policy.scorer_w_support = profile["scorer_w_support"]
     policy.scorer_w_margin = profile["scorer_w_margin"]
+    policy.scorer_w_edge = profile["scorer_w_edge"]
+    policy.scorer_w_forward = profile["scorer_w_forward"]
 
     profile["exp_id"] = exp_key
     return profile

@@ -255,6 +255,8 @@ class ActorCriticDepth(nn.Module):
                         # ===== TerrainSafetyScorer 先验分量权重 =====
                         scorer_w_support=0.3,
                         scorer_w_margin=0.3,
+                        scorer_w_edge=0.5,
+                        scorer_w_forward=0.8,
                         **kwargs):
         if kwargs:
             print("ActorCriticEst.__init__ got unexpected arguments, which will be ignored: " + str([key for key in kwargs.keys()]))
@@ -307,9 +309,12 @@ class ActorCriticDepth(nn.Module):
                 grid_w=terrain_attn_grid_w,
                 w_support=scorer_w_support,
                 w_margin=scorer_w_margin,
+                w_edge=scorer_w_edge,
+                w_forward=scorer_w_forward,
             )
             print(f"TerrainSafetyScorer enabled for KL loss guidance "
-                  f"(w_support={scorer_w_support}, w_margin={scorer_w_margin})")
+                  f"(w_support={scorer_w_support}, w_margin={scorer_w_margin}, "
+                  f"w_edge={scorer_w_edge}, w_forward={scorer_w_forward})")
         else:
             self.terrain_safety_scorer = None
             if use_attn_kl_loss and not use_terrain_attention:
