@@ -151,8 +151,19 @@ def play(args):
     # override some parameters for testing
     env_cfg.env.episode_length_s = 100
     env_cfg.env.num_envs = 1
-    env_cfg.terrain.num_rows = 5
-    env_cfg.terrain.num_cols = 5
+    terrain_rows = getattr(args, "terrain_rows", 5)
+    terrain_cols = getattr(args, "terrain_cols", 5)
+    if terrain_rows < 1 or terrain_cols < 1:
+        raise ValueError(
+            f"terrain_rows and terrain_cols must be >= 1, got "
+            f"terrain_rows={terrain_rows}, terrain_cols={terrain_cols}"
+        )
+    env_cfg.terrain.num_rows = terrain_rows
+    env_cfg.terrain.num_cols = terrain_cols
+    max_init_level = getattr(env_cfg.terrain, "max_init_terrain_level", terrain_rows - 1)
+    if max_init_level is None:
+        max_init_level = terrain_rows - 1
+    env_cfg.terrain.max_init_terrain_level = min(int(max_init_level), terrain_rows - 1)
     env_cfg.terrain.curriculum = False
     env_cfg.terrain.max_difficulty = True
     env_cfg.terrain.difficulty_level = 0.3
@@ -196,11 +207,29 @@ def play(args):
     env_cfg.commands.heading_command = False
     env_cfg.commands.resampling_time = 100
 
-    env_cfg.terrain.terrain_dict = {"stepping_stones": 1, 
-                                    "parkour": 1,
-                                    "pit": 1,
-                                    "gap": 1,
-                                    "stair": 1,}
+    default_terrain_dict = {
+        "stepping_stones": 1,
+        "parkour": 1,
+        "pit": 1,
+        "gap": 1,
+        "stair": 1,
+    }
+    requested_terrain = getattr(args, "terrain_type", None)
+    if requested_terrain is not None:
+        requested_terrain = requested_terrain.strip().lower()
+        if requested_terrain not in default_terrain_dict:
+            supported = ", ".join(default_terrain_dict.keys())
+            raise ValueError(
+                f"Unknown terrain_type='{args.terrain_type}'. "
+                f"Supported values: {supported}"
+            )
+        # Keep all terrain keys to avoid downstream assumptions on proportions length.
+        env_cfg.terrain.terrain_dict = {
+            name: int(name == requested_terrain) for name in default_terrain_dict
+        }
+        print(f"[Play] Using single terrain type: {requested_terrain}")
+    else:
+        env_cfg.terrain.terrain_dict = default_terrain_dict
     env_cfg.terrain.terrain_proportions = list(env_cfg.terrain.terrain_dict.values())
     
     # ===== 从 checkpoint 推断训练时的模型配置 =====

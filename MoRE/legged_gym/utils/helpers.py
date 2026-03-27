@@ -151,6 +151,9 @@ def get_args():
         {"name": "--exp_id", "type": str, "default": None, "help": "Experiment profile ID. Supported: M1, M2, M3, D1, B2, A2, A3."},
 
         {"name": "--mesh_terrain", "action": "store_true", "default": False, "help": "use mesh terrain"},
+        {"name": "--terrain_type", "type": str, "default": None, "help": "Terrain type for play visualization. Supported: stepping_stones, parkour, pit, gap, stair."},
+        {"name": "--terrain_rows", "type": int, "default": 5, "help": "Number of terrain rows for play visualization."},
+        {"name": "--terrain_cols", "type": int, "default": 5, "help": "Number of terrain cols for play visualization."},
     ]
     # parse arguments
     args = gymutil.parse_arguments(
