@@ -99,10 +99,14 @@ class BaseTask():
                 self.viewer, gymapi.KEY_X, "gait2")
             self.gym.subscribe_viewer_keyboard_event(
                 self.viewer, gymapi.KEY_C, "gait3")
+            self.gym.subscribe_viewer_keyboard_event(
+                self.viewer, gymapi.KEY_T, "toggle_attn_viz")
             
         self.free_cam = False
         self.lookat_id = 0
         self.lookat_vec = torch.tensor([-0, 2, 1], requires_grad=False, device=self.device)
+        self.attn_viz_mode = "attention"  # "attention" / "uniform" / "off"
+        self._attn_viz_modes = ["attention", "uniform", "off"]
 
     def get_observations(self):
         return self.obs_buf
@@ -177,6 +181,13 @@ class BaseTask():
                     self.free_cam = not self.free_cam
                     if self.free_cam:
                         self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
+                
+                if evt.action == "toggle_attn_viz" and evt.value > 0:
+                    idx = self._attn_viz_modes.index(self.attn_viz_mode)
+                    self.attn_viz_mode = self._attn_viz_modes[(idx + 1) % len(self._attn_viz_modes)]
+                    print(f"[Viz] Attention viz mode: {self.attn_viz_mode}")
+                    if self.attn_viz_mode == "off":
+                        self.gym.clear_lines(self.viewer)
                 
                 if evt.action == "pause" and evt.value > 0:
                     self.pause = True

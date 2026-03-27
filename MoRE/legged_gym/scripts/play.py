@@ -83,67 +83,68 @@ def infer_model_config_from_checkpoint(checkpoint_path, num_actor_obs=57, his_la
     }
 
 
+SPHERE_RADIUS = 0.025
+SPHERE_SEGMENTS = 10
+COLOR_LOW = (0.15, 0.25, 0.95)   # 柔和蓝
+COLOR_HIGH = (0.95, 0.10, 0.10)  # 鲜亮红
+COLOR_UNIFORM = (0.30, 0.55, 1.0) # 统一浅蓝
+
+
+def _compute_world_points(env):
+    """计算采样点的世界坐标（供注意力/均匀可视化共用）"""
+    lookat_id = env.lookat_id if hasattr(env, 'lookat_id') else 0
+    base_pos = env.root_states[lookat_id, :3].cpu().numpy()
+    base_quat = env.root_states[lookat_id, 3:7].cpu().numpy()
+    points_body_xy = env.height_points[lookat_id, :, :2].cpu().numpy()
+    terrain_z = env.measured_heights[lookat_id].cpu().numpy()
+
+    qx, qy, qz, qw = base_quat
+    yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy**2 + qz**2))
+    cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
+
+    world_x = base_pos[0] + points_body_xy[:, 0] * cos_yaw - points_body_xy[:, 1] * sin_yaw
+    world_y = base_pos[1] + points_body_xy[:, 0] * sin_yaw + points_body_xy[:, 1] * cos_yaw
+    world_z = terrain_z
+    return lookat_id, world_x, world_y, world_z
+
+
 def draw_attention_points(env, attention_weights):
-    """
-    根据注意力权重绘制彩色采样点（在真实地形表面上）
-    - 蓝色 (0, 0, 1): 低权重
-    - 红色 (1, 0, 0): 高权重
-    
-    Args:
-        env: 环境对象
-        attention_weights: [num_envs, 187] 注意力权重
-    """
+    """根据注意力权重绘制彩色采样点：蓝色(低权重) → 红色(高权重)"""
     if env.viewer is None:
         return
-        
     env.gym.clear_lines(env.viewer)
-    
-    lookat_id = env.lookat_id if hasattr(env, 'lookat_id') else 0
-    
-    # 获取当前环境的权重
+
+    lookat_id, world_x, world_y, world_z = _compute_world_points(env)
+
     weights = attention_weights[lookat_id].cpu().numpy()
-    # 归一化到 [0, 1]
     w_min, w_max = weights.min(), weights.max()
     if w_max - w_min > 1e-8:
         weights_norm = (weights - w_min) / (w_max - w_min)
     else:
         weights_norm = np.zeros_like(weights)
-    
-    # 获取机体位置和姿态
-    base_pos = env.root_states[lookat_id, :3].cpu().numpy()
-    base_quat = env.root_states[lookat_id, 3:7].cpu().numpy()
-    
-    # 获取机体坐标系下的采样点 xy 坐标（未归一化的原始坐标）
-    # height_points 存储的是原始的机体坐标系下的 xy 位置
-    points_body_xy = env.height_points[lookat_id, :, :2].cpu().numpy()  # [187, 2]
-    
-    # 获取真实地形高度（世界坐标系下的绝对高度）
-    # measured_heights 是 _get_heights() 返回的地形绝对高度
-    terrain_z = env.measured_heights[lookat_id].cpu().numpy()  # [187]
-    
-    # 计算 yaw 角
-    # quat = [x, y, z, w]
-    qx, qy, qz, qw = base_quat
-    yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy**2 + qz**2))
-    
-    # 将机体坐标系的 xy 旋转到世界坐标系
-    cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
-    rot_x = points_body_xy[:, 0] * cos_yaw - points_body_xy[:, 1] * sin_yaw
-    rot_y = points_body_xy[:, 0] * sin_yaw + points_body_xy[:, 1] * cos_yaw
-    
-    # 世界坐标
-    world_x = base_pos[0] + rot_x
-    world_y = base_pos[1] + rot_y
-    world_z = terrain_z  # 直接使用真实地形高度
-    
-    # 绘制每个点
+
     for i in range(len(weights_norm)):
         w = weights_norm[i]
-        # 蓝色 → 红色渐变
-        color = (w, 0.0, 1.0 - w)
-        sphere_geom = gymutil.WireframeSphereGeometry(0.02, 6, 6, None, color=color)
+        r = COLOR_LOW[0] + (COLOR_HIGH[0] - COLOR_LOW[0]) * w
+        g = COLOR_LOW[1] + (COLOR_HIGH[1] - COLOR_LOW[1]) * w
+        b = COLOR_LOW[2] + (COLOR_HIGH[2] - COLOR_LOW[2]) * w
+        sphere = gymutil.WireframeSphereGeometry(SPHERE_RADIUS, SPHERE_SEGMENTS, SPHERE_SEGMENTS, None, color=(r, g, b))
         pose = gymapi.Transform(gymapi.Vec3(world_x[i], world_y[i], world_z[i]), r=None)
-        gymutil.draw_lines(sphere_geom, env.gym, env.viewer, env.envs[lookat_id], pose)
+        gymutil.draw_lines(sphere, env.gym, env.viewer, env.envs[lookat_id], pose)
+
+
+def draw_uniform_points(env):
+    """绘制所有采样点为统一浅蓝色（无注意力引导对比图用）"""
+    if env.viewer is None:
+        return
+    env.gym.clear_lines(env.viewer)
+
+    lookat_id, world_x, world_y, world_z = _compute_world_points(env)
+    sphere = gymutil.WireframeSphereGeometry(SPHERE_RADIUS, SPHERE_SEGMENTS, SPHERE_SEGMENTS, None, color=COLOR_UNIFORM)
+
+    for i in range(len(world_x)):
+        pose = gymapi.Transform(gymapi.Vec3(world_x[i], world_y[i], world_z[i]), r=None)
+        gymutil.draw_lines(sphere, env.gym, env.viewer, env.envs[lookat_id], pose)
 
 
 def play(args):
@@ -268,6 +269,16 @@ def play(args):
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
     obs = env.get_observations()
 
+    # # 改善地形渲染：提高整体亮度，侧向光增强障碍物轮廓的明暗对比
+    # env.gym.set_light_parameters(env.sim, 0,
+    #     gymapi.Vec3(0.9, 0.9, 0.9),
+    #     gymapi.Vec3(0.55, 0.55, 0.6),
+    #     gymapi.Vec3(1.0, 1.0, -1.0))
+    # env.gym.set_light_parameters(env.sim, 1,
+    #     gymapi.Vec3(0.4, 0.4, 0.45),
+    #     gymapi.Vec3(0.0, 0.0, 0.0),
+    #     gymapi.Vec3(-0.5, -1.0, -0.8))
+
     # load policy
     train_cfg.runner.resume = True
     train_cfg.runner.zero_init = False
@@ -324,11 +335,15 @@ def play(args):
                            height_map=height_map, terrain_xyz=terrain_xyz)
         obs, _, _, dones, infos, *_= env.step(actions.detach())
         
-        # ===== 绘制注意力可视化 =====
-        if use_terrain_attention and hasattr(actor_critic, 'terrain_attention'):
-            terrain_attn = actor_critic.terrain_attention
-            if terrain_attn is not None and terrain_attn.last_attention_weights is not None:
-                draw_attention_points(env, terrain_attn.last_attention_weights)
+        # ===== 绘制注意力可视化 (按 T 键切换模式) =====
+        viz_mode = getattr(env, 'attn_viz_mode', 'attention')
+        if use_terrain_attention and viz_mode != "off":
+            if viz_mode == "uniform":
+                draw_uniform_points(env)
+            elif viz_mode == "attention" and hasattr(actor_critic, 'terrain_attention'):
+                terrain_attn = actor_critic.terrain_attention
+                if terrain_attn is not None and terrain_attn.last_attention_weights is not None:
+                    draw_attention_points(env, terrain_attn.last_attention_weights)
 
         # process trajectory history
         env_ids = dones.nonzero(as_tuple=False).flatten()
