@@ -84,7 +84,7 @@ def infer_model_config_from_checkpoint(checkpoint_path, num_actor_obs=57, his_la
 
 
 SPHERE_RADIUS = 0.025
-SPHERE_SEGMENTS = 10
+SPHERE_SEGMENTS = 20
 COLOR_LOW = (0.15, 0.25, 0.95)   # 柔和蓝
 COLOR_HIGH = (0.95, 0.10, 0.10)  # 鲜亮红
 COLOR_UNIFORM = (0.30, 0.55, 1.0) # 统一浅蓝
