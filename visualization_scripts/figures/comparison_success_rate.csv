@@ -1,0 +1,4 @@
+method,stepping_stones,parkour,gap,stair
+ours,2.63,3.23,5.36,2.49
+depth_baseline,2.18,2.64,5.31,1.89
+attn_baseline,2.89,3.34,5.16,2.74

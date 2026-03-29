@@ -55,23 +55,23 @@ def apply_style():
 # Color palette — colorblind-friendly, consistent across all figures
 # ============================================================================
 COLORS = {
-    'ours':                '#D62728',
-    'depth_baseline':      '#1F77B4',
-    'attn_baseline':       '#2CA02C',
-    'ablation_no_kl':      '#FF7F0E',
-    'ablation_depth_actor': '#9467BD',
-    'ablation_no_support': '#8C564B',
-    'ablation_no_margin':  '#E377C2',
+    'ours':                '#D62728',   # M1
+    'depth_baseline':      '#1F77B4',   # M2
+    'attn_baseline':       '#2CA02C',   # M3
+    'ablation_no_kl':      '#FF7F0E',   # D1
+    'ablation_depth_actor': '#9467BD',  # B2
+    'ablation_no_forward': '#8C564B',   # A2
+    'ablation_no_edge':    '#E377C2',   # A3
 }
 
 METHOD_NAMES = {
-    'ours':                'Ours',
-    'depth_baseline':      'Depth Encoding',
-    'attn_baseline':       'Cross-Attn (w/o prior)',
-    'ablation_no_kl':      'Ours w/o KL',
-    'ablation_depth_actor': 'Depth as Actor Input',
-    'ablation_no_support': r'Ours w/o $S_{\mathrm{support}}$',
-    'ablation_no_margin':  r'Ours w/o $S_{\mathrm{margin}}$',
+    'ours':                'Ours (M1)',
+    'depth_baseline':      'Depth Encoding (M2)',
+    'attn_baseline':       'Cross-Attn w/o prior (M3)',
+    'ablation_no_kl':      'Ours w/o KL (D1)',
+    'ablation_depth_actor': 'Depth as Actor Input (B2)',
+    'ablation_no_forward': r'Ours w/o $f_{\mathrm{forward}}$ (A2)',
+    'ablation_no_edge':    r'Ours w/o $f_{\mathrm{edge}}$ (A3)',
 }
 
 LINE_STYLES = {
@@ -80,16 +80,30 @@ LINE_STYLES = {
     'attn_baseline':       '-.',
     'ablation_no_kl':      ':',
     'ablation_depth_actor': '--',
-    'ablation_no_support': '-.',
-    'ablation_no_margin':  ':',
+    'ablation_no_forward': '-.',
+    'ablation_no_edge':    ':',
 }
 
-# Terrain type display names (English, consistent across all figures)
-TERRAIN_NAMES_DISPLAY = {
-    'alternating_slopes': 'Alternating Slopes',
-    'stair':              'Stairs',
-    'gap':                'Gaps',
+LOG_ROOT = '/home/nubot/ssd/my_MoRE/MoRE/logs/g1_16dof_loco'
+
+LOG_DIRS = {
+    'ours':                f'{LOG_ROOT}/Mar25_12-10-05_m1',
+    'depth_baseline':      f'{LOG_ROOT}/Mar25_12-11-55_m2',
+    'attn_baseline':       f'{LOG_ROOT}/Mar26_09-16-35_m3',
+    'ablation_no_kl':      f'{LOG_ROOT}/Mar24_21-01-36_d1',
+    'ablation_depth_actor': f'{LOG_ROOT}/Mar26_11-09-51_b2',
+    'ablation_no_forward': f'{LOG_ROOT}/Mar25_12-19-09_a2',
+    'ablation_no_edge':    f'{LOG_ROOT}/Mar25_12-20-26_a3',
 }
+
+TERRAIN_NAMES_DISPLAY = {
+    'stepping_stones': 'Stepping Stones',
+    'parkour':         'Tilted Ramp',
+    'gap':             'Gap',
+    'stair':           'Stair',
+}
+
+TERRAIN_ORDER = ['stepping_stones', 'parkour', 'gap', 'stair']
 
 # Grid geometry used by the height scanner
 MEASURED_POINTS_X = [

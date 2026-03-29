@@ -1,0 +1,3 @@
+method,stepping_stones,parkour,gap,stair
+ours,5.53,6.77,11.03,5.00
+ablation_no_kl,5.35,6.82,11.19,4.73

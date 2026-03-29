@@ -219,7 +219,7 @@ class Terrain:
                 pad_width=0.1,
                 pad_height=0,
                 num_groups=3,
-                middle_platform_len=1.5)
+                middle_platform_len=1.0)
         # square terrain
         elif choice < self.proportions[5]:
             idx = 5

@@ -1,0 +1,4 @@
+method,stepping_stones,parkour,gap,stair
+ours,23.47,29.46,44.76,31.88
+ablation_no_forward,24.34,30.32,44.25,33.38
+ablation_no_edge,23.95,30.11,44.91,34.96

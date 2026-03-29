@@ -2,25 +2,22 @@
 """
 Script 5: Ablation Results Comparison
 
-Two side-by-side sub-figures:
-  A (left, wider)  — Prior component ablation:
-      3 terrain types × 3 configs: Ours, w/o S_support, w/o S_margin
-  B (right, narrow) — Depth feature position:
-      3 terrain types × 2 configs: Depth in Query (Ours) vs Depth in Actor
+Three side-by-side sub-figures:
+  A — KL prior ablation: Ours vs w/o KL (D1)
+  B — Prior component ablation: Ours vs w/o forward (A2) vs w/o edge (A3)
+  C — Depth feature position: Depth in Query (Ours) vs Depth in Actor (B2)
 
 Usage:
-    python plot_ablation.py                   # uses built-in data dict
-    python plot_ablation.py --csv_a a.csv --csv_b b.csv   # from CSV
+    python plot_ablation.py --csv_a ablation_a.csv --csv_b ablation_b.csv --csv_c ablation_c.csv
 """
 
 import argparse
 import csv
-import sys
 import numpy as np
 import matplotlib.pyplot as plt
 
 from plot_utils import (
-    apply_style, COLORS, METHOD_NAMES, TERRAIN_NAMES_DISPLAY,
+    apply_style, COLORS, METHOD_NAMES, TERRAIN_NAMES_DISPLAY, TERRAIN_ORDER,
     save_figure, add_panel_label,
 )
 
@@ -28,37 +25,6 @@ from plot_utils import (
 OUTPUT_DIR = './figures'
 OUTPUT_STEM = 'ablation'
 
-TERRAIN_ORDER = ['alternating_slopes', 'stair', 'gap']
-
-# ============================================================================
-# DATA INPUT — Sub-figure A: prior component ablation
-# ============================================================================
-ABLATION_A_MEAN = {
-    # method_key: [alternating_slopes, stair, gap]
-    'ours':                [0.0, 0.0, 0.0],
-    'ablation_no_support': [0.0, 0.0, 0.0],
-    'ablation_no_margin':  [0.0, 0.0, 0.0],
-}
-
-ABLATION_A_STD = {
-    # Optional — uncomment and fill if multi-seed
-    # 'ours':                [1.0, 1.0, 1.0],
-}
-
-# ============================================================================
-# DATA INPUT — Sub-figure B: depth feature position
-# ============================================================================
-ABLATION_B_MEAN = {
-    'ours':                 [0.0, 0.0, 0.0],
-    'ablation_depth_actor': [0.0, 0.0, 0.0],
-}
-
-ABLATION_B_STD = {}
-
-
-# ============================================================================
-# Bar-chart builder (reusable for both panels)
-# ============================================================================
 
 def _draw_grouped_bars(
     ax,
@@ -102,45 +68,40 @@ def _draw_grouped_bars(
 
     terrain_labels = [TERRAIN_NAMES_DISPLAY.get(t, t) for t in terrain_order]
     ax.set_xticks(x)
-    ax.set_xticklabels(terrain_labels, fontsize=9)
+    ax.set_xticklabels(terrain_labels, fontsize=8, rotation=15, ha='right')
     ax.set_ylim(bottom=0)
 
-
-# ============================================================================
-# Main figure
-# ============================================================================
 
 def plot_ablation(
     abl_a_mean, abl_a_std,
     abl_b_mean, abl_b_std,
+    abl_c_mean, abl_c_std,
     terrain_order=None,
 ):
     if terrain_order is None:
         terrain_order = TERRAIN_ORDER
 
-    fig, (ax1, ax2) = plt.subplots(
-        1, 2, figsize=(5.5, 2.8),
-        gridspec_kw={'width_ratios': [3, 2]},
+    fig, (ax1, ax2, ax3) = plt.subplots(
+        1, 3, figsize=(8.0, 2.8),
+        gridspec_kw={'width_ratios': [2, 3, 2]},
     )
 
-    # --- Panel A ---
     _draw_grouped_bars(ax1, abl_a_mean, abl_a_std or {}, terrain_order)
     ax1.set_ylabel('Success Rate (%)')
-    ax1.legend(loc='upper right', fontsize=7)
+    ax1.legend(loc='upper right', fontsize=6)
     add_panel_label(ax1, '(a)')
 
-    # --- Panel B ---
     _draw_grouped_bars(ax2, abl_b_mean, abl_b_std or {}, terrain_order)
-    ax2.legend(loc='upper right', fontsize=7)
+    ax2.legend(loc='upper right', fontsize=6)
     add_panel_label(ax2, '(b)')
+
+    _draw_grouped_bars(ax3, abl_c_mean, abl_c_std or {}, terrain_order)
+    ax3.legend(loc='upper right', fontsize=6)
+    add_panel_label(ax3, '(c)')
 
     fig.tight_layout()
     return fig
 
-
-# ============================================================================
-# CSV loader (reused from Script 4 pattern)
-# ============================================================================
 
 def _load_csv(path: str):
     means = {}
@@ -152,14 +113,11 @@ def _load_csv(path: str):
     return means, t_keys
 
 
-# ============================================================================
-# CLI
-# ============================================================================
-
 def parse_args():
     p = argparse.ArgumentParser(description='Ablation results figure.')
-    p.add_argument('--csv_a', type=str, default=None, help='CSV for sub-fig A')
-    p.add_argument('--csv_b', type=str, default=None, help='CSV for sub-fig B')
+    p.add_argument('--csv_a', type=str, required=True, help='CSV for KL ablation')
+    p.add_argument('--csv_b', type=str, required=True, help='CSV for prior component ablation')
+    p.add_argument('--csv_c', type=str, required=True, help='CSV for depth position ablation')
     p.add_argument('--output', type=str, default=None)
     return p.parse_args()
 
@@ -168,21 +126,11 @@ def main():
     apply_style()
     args = parse_args()
 
-    if args.csv_a:
-        abl_a_mean, _ = _load_csv(args.csv_a)
-        abl_a_std = None
-    else:
-        abl_a_mean = ABLATION_A_MEAN
-        abl_a_std = ABLATION_A_STD if ABLATION_A_STD else None
+    abl_a_mean, _ = _load_csv(args.csv_a)
+    abl_b_mean, _ = _load_csv(args.csv_b)
+    abl_c_mean, _ = _load_csv(args.csv_c)
 
-    if args.csv_b:
-        abl_b_mean, _ = _load_csv(args.csv_b)
-        abl_b_std = None
-    else:
-        abl_b_mean = ABLATION_B_MEAN
-        abl_b_std = ABLATION_B_STD if ABLATION_B_STD else None
-
-    fig = plot_ablation(abl_a_mean, abl_a_std, abl_b_mean, abl_b_std)
+    fig = plot_ablation(abl_a_mean, None, abl_b_mean, None, abl_c_mean, None)
     save_figure(fig, args.output or OUTPUT_STEM, OUTPUT_DIR)
     plt.close(fig)
 
